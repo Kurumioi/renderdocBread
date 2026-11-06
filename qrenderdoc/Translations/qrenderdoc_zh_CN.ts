@@ -446,19 +446,19 @@
 <context>
     <name>AIAssistant</name>
     <message>
-        <location filename="../Windows/AI/AIAssistant.cpp" line="+10890"/>
+        <location filename="../Windows/AI/AIAssistant.cpp" line="+10929"/>
         <source>Loading Skills...</source>
         <translation>正在加载技能……</translation>
     </message>
     <message>
-        <location line="-6701"/>
-        <location line="+6755"/>
+        <location line="-6721"/>
+        <location line="+6775"/>
         <source>Skills</source>
         <translation>技能</translation>
     </message>
     <message>
-        <location line="-6750"/>
-        <location line="+6779"/>
+        <location line="-6770"/>
+        <location line="+6799"/>
         <source>MCP servers</source>
         <translation>MCP 服务器</translation>
     </message>
@@ -517,12 +517,12 @@
         <translation>参数（每行一个）</translation>
     </message>
     <message>
-        <location line="-7794"/>
+        <location line="-7814"/>
         <source>Type @ to load a Skill or MCP server for this message (@skill:&lt;id&gt;, @mcp:&lt;id&gt;).</source>
         <translation>输入 @ 可为本条消息加载技能或 MCP 服务器（@skill:&lt;id&gt;、@mcp:&lt;id&gt;）。</translation>
     </message>
     <message>
-        <location line="-3213"/>
+        <location line="-3219"/>
         <source>SKIPPED</source>
         <translation>已跳过</translation>
     </message>
@@ -568,24 +568,24 @@
     </message>
     <message>
         <location line="+32"/>
-        <location line="+7277"/>
+        <location line="+7304"/>
         <source>Status</source>
         <translation>状态</translation>
     </message>
     <message>
-        <location line="-7276"/>
-        <location line="+7276"/>
+        <location line="-7303"/>
+        <location line="+7303"/>
         <source>Check</source>
         <translation>检查</translation>
     </message>
     <message>
-        <location line="-7275"/>
-        <location line="+7275"/>
+        <location line="-7302"/>
+        <location line="+7302"/>
         <source>Detail</source>
         <translation>详细信息</translation>
     </message>
     <message>
-        <location line="-7266"/>
+        <location line="-7293"/>
         <source>Selected detail (plain text; select or copy as needed):</source>
         <translation>所选详细信息（纯文本；可按需选择或复制）：</translation>
     </message>
@@ -631,12 +631,12 @@
     </message>
     <message>
         <location line="+1"/>
-        <location line="+7238"/>
+        <location line="+7265"/>
         <source>The diagnostic command did not complete successfully.</source>
         <translation>诊断命令未成功完成。</translation>
     </message>
     <message>
-        <location line="-7234"/>
+        <location line="-7261"/>
         <source>Connection check</source>
         <translation>连接检查</translation>
     </message>
@@ -647,35 +647,35 @@
     </message>
     <message>
         <location line="+4"/>
-        <location line="+7234"/>
+        <location line="+7261"/>
         <source>One or more checks failed. Review the details.</source>
         <translation>一项或多项检查失败。请查看详细信息。</translation>
     </message>
     <message>
-        <location line="-7231"/>
-        <location line="+7233"/>
+        <location line="-7258"/>
+        <location line="+7260"/>
         <source>Checks completed with warnings or skipped items.</source>
         <translation>检查已完成，但存在警告或跳过的项目。</translation>
     </message>
     <message>
-        <location line="-7230"/>
-        <location line="+7231"/>
+        <location line="-7257"/>
+        <location line="+7258"/>
         <source>All reported checks passed.</source>
         <translation>报告的所有检查均已通过。</translation>
     </message>
     <message>
-        <location line="-7229"/>
+        <location line="-7256"/>
         <source>Diagnostic information was returned.</source>
         <translation>已返回诊断信息。</translation>
     </message>
     <message>
         <location line="+15"/>
-        <location line="+7159"/>
+        <location line="+7186"/>
         <source>Copy All Details</source>
         <translation>复制全部详细信息</translation>
     </message>
     <message>
-        <location line="-5317"/>
+        <location line="-5344"/>
         <source>OpenAI API</source>
         <comment>provider.openai.title</comment>
         <translation>OpenAI API</translation>
@@ -989,7 +989,7 @@
         <translation>请在浏览器中完成提供商授权。</translation>
     </message>
     <message>
-        <location line="+123"/>
+        <location line="+126"/>
         <source>Child Agent started: %1</source>
         <comment>task.child.started</comment>
         <translation>子 Agent 已启动：%1</translation>
@@ -1017,25 +1017,25 @@
         <translation>对话</translation>
     </message>
     <message>
-        <location filename="../Windows/AI/AIAssistant.cpp" line="+37"/>
+        <location filename="../Windows/AI/AIAssistant.cpp" line="+38"/>
         <location line="+1"/>
-        <location line="+1656"/>
+        <location line="+1658"/>
         <location line="+205"/>
         <location line="+47"/>
         <location line="+1599"/>
-        <location line="+5914"/>
+        <location line="+5936"/>
         <location line="+678"/>
         <location line="+41"/>
         <source>New conversation</source>
         <translation>新建对话</translation>
     </message>
     <message>
-        <location line="-10134"/>
+        <location line="-10158"/>
         <source>Starting...</source>
         <translation>正在启动…</translation>
     </message>
     <message>
-        <location line="+97"/>
+        <location line="+99"/>
         <location line="+2492"/>
         <source>Continue</source>
         <translation>继续</translation>
@@ -1149,12 +1149,12 @@
     </message>
     <message>
         <location line="+311"/>
-        <location line="+8037"/>
+        <location line="+8059"/>
         <source>Running</source>
         <translation>正在运行</translation>
     </message>
     <message>
-        <location line="-8023"/>
+        <location line="-8045"/>
         <source>%1 capture action(s) running</source>
         <translation>正在运行 %1 个捕获操作</translation>
     </message>
@@ -1226,13 +1226,13 @@
     <message>
         <location line="-3460"/>
         <location line="+3468"/>
-        <location line="+5588"/>
+        <location line="+5610"/>
         <location line="+267"/>
         <source>This action requires an open capture.</source>
         <translation>此操作需要打开一个捕获。</translation>
     </message>
     <message>
-        <location line="-10449"/>
+        <location line="-10477"/>
         <source>Tencent CodeBuddy / Hunyuan Subscription (ACP)</source>
         <comment>provider.codebuddy-acp.title</comment>
         <translation>腾讯 CodeBuddy / 混元订阅（ACP）</translation>
@@ -1256,7 +1256,7 @@
         <translation>请在 CodeBuddy 终端中选择“通过中国站登录”，使用拥有订阅套餐的账号完成浏览器登录流程，然后在身份验证成功后退出终端。</translation>
     </message>
     <message>
-        <location line="+219"/>
+        <location line="+222"/>
         <source>Queued</source>
         <comment>task.queued</comment>
         <translation>已排队</translation>
@@ -1268,13 +1268,13 @@
         <translation>%1</translation>
     </message>
     <message>
-        <location line="+476"/>
+        <location line="+478"/>
         <location line="+1"/>
         <source>Agent Monitor</source>
         <translation>智能体监视器</translation>
     </message>
     <message>
-        <location line="+200"/>
+        <location line="+201"/>
         <source>Add images or files</source>
         <translation>添加图片或文件</translation>
     </message>
@@ -1407,19 +1407,19 @@
     </message>
     <message>
         <location line="+35"/>
-        <location line="+135"/>
-        <location line="+2558"/>
+        <location line="+153"/>
+        <location line="+2560"/>
         <source>AI host was not found</source>
         <translation>找不到 AI 主机</translation>
     </message>
     <message>
-        <location line="-2486"/>
-        <location line="+1912"/>
+        <location line="-2487"/>
+        <location line="+1914"/>
         <source>Command timed out</source>
         <translation>命令超时</translation>
     </message>
     <message>
-        <location line="-2017"/>
+        <location line="-2022"/>
         <source>Command failed with exit code %1</source>
         <translation>命令失败，退出代码为 %1</translation>
     </message>
@@ -1429,18 +1429,18 @@
         <translation>命令意外终止</translation>
     </message>
     <message>
-        <location line="-95"/>
+        <location line="-111"/>
         <source>Command input exceeds the 16 MiB safety limit</source>
         <translation>命令输入超过 16 MiB 安全限制</translation>
     </message>
     <message>
-        <location line="+142"/>
+        <location line="+160"/>
         <location line="+7"/>
         <source>Could not send protected command input</source>
         <translation>无法发送受保护的命令输入</translation>
     </message>
     <message>
-        <location line="+239"/>
+        <location line="+242"/>
         <source>%1 | API</source>
         <translation>%1 | API</translation>
     </message>
@@ -1493,21 +1493,21 @@
     </message>
     <message>
         <location line="+1"/>
-        <location line="+2109"/>
+        <location line="+2108"/>
         <location line="+39"/>
         <location line="+32"/>
         <source>Edit...</source>
         <translation>编辑…</translation>
     </message>
     <message>
-        <location line="-2179"/>
-        <location line="+2148"/>
+        <location line="-2178"/>
+        <location line="+2147"/>
         <location line="+32"/>
         <source>Remove</source>
         <translation>移除</translation>
     </message>
     <message>
-        <location line="-2179"/>
+        <location line="-2178"/>
         <source>Set as Default</source>
         <translation>设为默认值</translation>
     </message>
@@ -1517,7 +1517,7 @@
         <translation>检查连接</translation>
     </message>
     <message>
-        <location line="-4760"/>
+        <location line="-4781"/>
         <source>Conversation selection</source>
         <translation>对话中选中的内容</translation>
     </message>
@@ -1682,13 +1682,13 @@ Size: %2 bytes</source>
         <translation>预览附件：%1</translation>
     </message>
     <message>
-        <location line="-2287"/>
+        <location line="-2293"/>
         <source>Claude Code (ACP subscription)</source>
         <comment>provider.claude-code-acp.title</comment>
         <translation>Claude Code（ACP 订阅）</translation>
     </message>
     <message>
-        <location line="+1002"/>
+        <location line="+1008"/>
         <source>A referenced file changed after it was added. Remove it and add it again.</source>
         <translation>引用的文件在添加后已发生更改。请将其移除后重新添加。</translation>
     </message>
@@ -1748,7 +1748,7 @@ Size: %2 bytes</source>
         <translation>等待中</translation>
     </message>
     <message>
-        <location line="-3961"/>
+        <location line="-3967"/>
         <source>Could not persist Bread AI conversations:</source>
         <translation>无法保存 Bread AI 对话：</translation>
     </message>
@@ -1855,6 +1855,12 @@ Size: %2 bytes</source>
     </message>
     <message>
         <location line="+15"/>
+        <source>Waiting for the model to submit frame diagram arguments</source>
+        <comment>task.frame-flow.waiting-for-arguments</comment>
+        <translation>正在等待模型提交帧流程图参数</translation>
+    </message>
+    <message>
+        <location line="+3"/>
         <source>Codex configured capabilities</source>
         <comment>task.capabilities.codex-configured</comment>
         <translation>Codex 已配置的功能</translation>
@@ -1974,7 +1980,7 @@ Size: %2 bytes</source>
         <translation>正在自检任务完成情况</translation>
     </message>
     <message>
-        <location line="+3350"/>
+        <location line="+3353"/>
         <source>step ended</source>
         <translation>本步骤已结束</translation>
     </message>
@@ -2036,7 +2042,7 @@ Size: %2 bytes</source>
         <translation>无法加载此捕获的对话历史：%1 本次会话不会写入该历史，以免丢失已保存的内容；请重新打开捕获后重试。</translation>
     </message>
     <message>
-        <location line="+804"/>
+        <location line="+825"/>
         <source>Checking the connection. Close this window to cancel.</source>
         <translation>正在检查连接，关闭此窗口可取消检查。</translation>
     </message>
@@ -2473,12 +2479,12 @@ Size: %2 bytes</source>
     </message>
     <message>
         <location line="+11"/>
-        <location line="+1911"/>
+        <location line="+1910"/>
         <source>Testing...</source>
         <translation>正在测试…</translation>
     </message>
     <message>
-        <location line="-1888"/>
+        <location line="-1887"/>
         <source>%1 responded successfully to a short test prompt. The link works.</source>
         <translation>%1 已成功响应一条测试提示，链路可用。</translation>
     </message>
@@ -2561,12 +2567,12 @@ Account: %1</source>
     <message>
         <location line="+9"/>
         <location line="+360"/>
-        <location line="+759"/>
+        <location line="+758"/>
         <source>Test Connection</source>
         <translation>测试连接</translation>
     </message>
     <message>
-        <location line="-1109"/>
+        <location line="-1108"/>
         <source>Authentication status unavailable</source>
         <translation>身份验证状态不可用</translation>
     </message>
@@ -2774,7 +2780,7 @@ Device code: %1</source>
         <translation>请输入 Agent 可执行文件和参数。</translation>
     </message>
     <message>
-        <location line="+40"/>
+        <location line="+39"/>
         <source>Could not save AI connection</source>
         <translation>无法保存 AI 连接</translation>
     </message>
@@ -2815,35 +2821,35 @@ Device code: %1</source>
         <translation>默认连接</translation>
     </message>
     <message>
-        <location line="-2431"/>
+        <location line="-2430"/>
         <source>AI Connection Check</source>
         <translation>AI 连接检查</translation>
     </message>
     <message>
-        <location line="-137"/>
-        <location line="+90"/>
+        <location line="-142"/>
+        <location line="+92"/>
         <source>Command output exceeded the safety limit</source>
         <translation>命令输出超出安全限制</translation>
     </message>
     <message>
-        <location line="+4246"/>
-        <location line="+735"/>
+        <location line="+4248"/>
+        <location line="+737"/>
         <source>Add or select an AI connection first.</source>
         <translation>请先添加或选择 AI 连接。</translation>
     </message>
     <message>
-        <location line="-722"/>
+        <location line="-724"/>
         <source>Host missing</source>
         <translation>找不到主机</translation>
     </message>
     <message>
         <location line="+6"/>
-        <location line="+2757"/>
+        <location line="+2767"/>
         <source>Chat ready</source>
         <translation>聊天就绪</translation>
     </message>
     <message>
-        <location line="-2759"/>
+        <location line="-2769"/>
         <source>Waiting for bridge</source>
         <translation>正在等待桥接</translation>
     </message>
@@ -2853,7 +2859,7 @@ Device code: %1</source>
         <translation>添加连接</translation>
     </message>
     <message>
-        <location line="+2707"/>
+        <location line="+2717"/>
         <source>Turn ended with unfinished work</source>
         <translation>本轮已结束，仍有未完成内容</translation>
     </message>
@@ -2873,7 +2879,7 @@ Device code: %1</source>
         <translation>已连接</translation>
     </message>
     <message>
-        <location line="-2343"/>
+        <location line="-2351"/>
         <location line="+157"/>
         <location line="+23"/>
         <location line="+410"/>
@@ -2925,7 +2931,7 @@ Device code: %1</source>
         <translation>捕获桥接尚未就绪。</translation>
     </message>
     <message>
-        <location line="-10678"/>
+        <location line="-10706"/>
         <source>%1 CLI detected; sign-in state is checked only after approval.</source>
         <comment>subscription.cli-detected</comment>
         <translation>已检测到 %1 CLI；仅在批准后检查登录状态。</translation>
@@ -3027,7 +3033,7 @@ Device code: %1</source>
         <translation>Codex 登录和模型目录测试成功。</translation>
     </message>
     <message>
-        <location line="+50"/>
+        <location line="+53"/>
         <source>Main Agent is analysing the request</source>
         <comment>task.main.started</comment>
         <translation>主智能体正在分析请求</translation>
@@ -3039,13 +3045,13 @@ Device code: %1</source>
         <translation>主智能体已结束本轮处理</translation>
     </message>
     <message>
-        <location line="+492"/>
+        <location line="+494"/>
         <location line="+1"/>
         <source>AI Settings</source>
         <translation>AI 设置</translation>
     </message>
     <message>
-        <location line="+11"/>
+        <location line="+12"/>
         <source>Organize Frame Rendering Flow</source>
         <translation>整理这帧渲染流程图</translation>
     </message>
@@ -3065,7 +3071,7 @@ Device code: %1</source>
         <translation>使用 @renderdoc-shader-workbench 重新整理所选着色器。遵循技能流程，更新着色器工作区中的源码和说明，包括已有的整理结果。</translation>
     </message>
     <message>
-        <location line="+1089"/>
+        <location line="+1110"/>
         <source>The connection name is for display. qrenderdoc creates an internal stable identifier automatically. Models enabled here appear beside Send in the Bread AI panel. The first connection becomes the default automatically. Use Fetch Models for an API check, or Edit then Connect/Test for a subscription check.</source>
         <translation>连接名称仅用于显示。qrenderdoc 会自动创建内部稳定标识符。在此启用的模型会显示在 Bread AI 面板的“发送”按钮旁。第一个连接会自动成为默认连接。使用“获取模型”检查 API，或先点“编辑”，再通过“连接/测试”检查订阅。</translation>
     </message>
@@ -3080,7 +3086,7 @@ Device code: %1</source>
         <translation>内置官方 CLI 已在“进程信任”中被禁用。请勾选该处可见的复选框，以允许执行内容完全一致且不可编辑的目录命令；否则请取消。</translation>
     </message>
     <message>
-        <location line="+272"/>
+        <location line="+271"/>
         <source>Remove &apos;%1&apos;? Bread AI will forget its saved API credential, session-only credential, and connection-scoped vendor state. A vendor account sign-in stored by the provider or operating system may remain.</source>
         <translation>移除“%1”？Bread AI 将清除其保存的 API 凭据、仅会话凭据以及连接范围内的提供商状态。由提供商或操作系统存储的提供商账号登录状态可能仍会保留。</translation>
     </message>
@@ -3175,7 +3181,7 @@ Device code: %1</source>
         <translation>用 discover_tool_interface 探测它，用 run_asset_tool_operation 尝试各种调用。帮助输出只是线索，不是证据：只有当一次调用在上述真实文件上产出了正确结果，该操作才算数。用 record_asset_tool_operation 把每一条记录下来，给出名称、一句话描述和带类型的 inputSchema，失败的情况记为 knownFailures。做完后告诉我它能做什么、不能做什么。</translation>
     </message>
     <message>
-        <location line="+1260"/>
+        <location line="+1262"/>
         <source>Could not begin asynchronous Bread AI context freeze:</source>
         <translation>无法开始异步 Bread AI 上下文冻结：</translation>
     </message>
@@ -3266,12 +3272,12 @@ Device code: %1</source>
     </message>
     <message>
         <location line="+16"/>
-        <location line="+1375"/>
+        <location line="+1383"/>
         <source>Thinking...</source>
         <translation>正在思考…</translation>
     </message>
     <message>
-        <location line="-1310"/>
+        <location line="-1318"/>
         <source>Adjust direction is available when this conversation has an active AI request. The message remains queued.</source>
         <translation>仅当此对话存在当前 AI 请求时才能调整方向。该消息仍处于排队状态。</translation>
     </message>
@@ -3345,18 +3351,18 @@ Additional direction from the user (re-plan and continue from the preserved cont
     </message>
     <message>
         <location line="+112"/>
-        <location line="+808"/>
+        <location line="+816"/>
         <source>The AI is waiting for an answer, but its question could not be displayed. Reply in your own words to continue.</source>
         <translation>AI 正在等待回答，但问题未能显示。请直接输入回答以继续。</translation>
     </message>
     <message>
-        <location line="-799"/>
-        <location line="+814"/>
+        <location line="-807"/>
+        <location line="+822"/>
         <source>AI result contained an invalid terminal status.</source>
         <translation>AI 结果包含无效的终止状态。</translation>
     </message>
     <message>
-        <location line="-808"/>
+        <location line="-816"/>
         <source>Bread AI task ended without a validated terminal result:</source>
         <translation>Bread AI 任务结束时未提供经过验证的最终结果：</translation>
     </message>
@@ -3428,12 +3434,12 @@ Additional direction from the user (re-plan and continue from the preserved cont
     </message>
     <message>
         <location line="+11"/>
-        <location line="+303"/>
+        <location line="+311"/>
         <source>Failed</source>
         <translation>失败</translation>
     </message>
     <message>
-        <location line="-303"/>
+        <location line="-311"/>
         <source>Completed</source>
         <translation>已完成</translation>
     </message>
@@ -3463,25 +3469,25 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>[后续推理内容见智能体监视器]</translation>
     </message>
     <message>
-        <location line="-7974"/>
+        <location line="-7996"/>
         <source>The artifact no longer exists: %1</source>
         <translation>产物已不存在：%1</translation>
     </message>
     <message>
-        <location line="+7997"/>
-        <location line="+11"/>
+        <location line="+8019"/>
+        <location line="+19"/>
         <source>Tool: %1</source>
         <translation>工具：%1</translation>
     </message>
     <message>
-        <location line="-231"/>
+        <location line="-239"/>
         <location line="+32"/>
-        <location line="+226"/>
+        <location line="+234"/>
         <source>Agent working</source>
         <translation>Agent 正在工作</translation>
     </message>
     <message>
-        <location line="-57"/>
+        <location line="-65"/>
         <source>Reasoning summary</source>
         <translation>推理摘要</translation>
     </message>
@@ -3491,7 +3497,12 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>原始推理</translation>
     </message>
     <message>
-        <location line="+71"/>
+        <location line="+31"/>
+        <source>Tool round trip: %1 ms</source>
+        <translation>工具往返耗时：%1 毫秒</translation>
+    </message>
+    <message>
+        <location line="+48"/>
         <source>%1/%2</source>
         <translation>%1/%2</translation>
     </message>
@@ -3541,7 +3552,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>已取消</translation>
     </message>
     <message>
-        <location line="-4415"/>
+        <location line="-4425"/>
         <source>New...</source>
         <translation>新建...</translation>
     </message>
@@ -4112,7 +4123,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>读取脚本随 Bread AI 一起提供；你选择的解释器只需要安装 UnityPy 包（pip install UnityPy）。</translation>
     </message>
     <message>
-        <location line="-11027"/>
+        <location line="-11053"/>
         <location line="+110"/>
         <source>Claude sign-in</source>
         <translation>Claude 登录状态</translation>
@@ -4151,42 +4162,42 @@ Additional direction from the user (re-plan and continue from the preserved cont
 <context>
     <name>AIConfiguration</name>
     <message>
-        <location filename="../Windows/AI/AIConfiguration.cpp" line="+53"/>
+        <location filename="../Windows/AI/AIConfiguration.cpp" line="+54"/>
         <source>Invalid AI connection settings: %1.</source>
         <translation>AI 连接设置无效：%1。</translation>
     </message>
     <message>
-        <location line="+233"/>
+        <location line="+252"/>
         <source>The AI configuration file could not be read. Your existing file has been preserved.</source>
         <translation>无法读取 AI 配置文件。现有文件已保留。</translation>
     </message>
     <message>
-        <location line="+9"/>
+        <location line="+14"/>
         <source>The AI configuration file is invalid or uses an unsupported format. Your existing file has been preserved.</source>
         <translation>AI 配置文件无效或使用了不支持的格式。现有文件已保留。</translation>
     </message>
     <message>
-        <location line="+83"/>
+        <location line="+87"/>
         <source>Windows Credential Manager could not be updated or read (Windows error %1).</source>
         <translation>无法更新或读取 Windows 凭据管理器（Windows 错误 %1）。</translation>
     </message>
     <message>
-        <location line="+5"/>
+        <location line="+7"/>
         <source>Secure credential storage is unavailable. Use a session-only key.</source>
         <translation>安全凭据存储不可用。请使用仅限本次会话的密钥。</translation>
     </message>
     <message>
-        <location line="+78"/>
+        <location line="+102"/>
         <source>The provider&apos;s local state is in use or cannot be removed. Close its active tasks and retry.</source>
         <translation>提供商的本地状态正在使用中或无法移除。请关闭其正在运行的任务后重试。</translation>
     </message>
     <message>
-        <location line="+30"/>
+        <location line="+35"/>
         <source>The AI configuration file is being updated or cannot be written. Retry saving the connection.</source>
         <translation>AI 配置文件正在更新或无法写入。请重试保存连接。</translation>
     </message>
     <message>
-        <location line="+169"/>
+        <location line="+196"/>
         <source>The AI configuration could not be saved. Your existing file has been preserved.</source>
         <translation>无法保存 AI 配置。现有文件已保留。</translation>
     </message>
@@ -16822,7 +16833,7 @@ Close the capture or save to another location.</source>
     </message>
     <message>
         <location/>
-        <location filename="../Windows/MainWindow.cpp" line="+658"/>
+        <location filename="../Windows/MainWindow.cpp" line="+665"/>
         <source>Open Capture with Options</source>
         <translation>使用选项打开捕获</translation>
     </message>
@@ -16832,8 +16843,13 @@ Close the capture or save to another location.</source>
         <translation>Ctrl+Shift+O</translation>
     </message>
     <message>
-        <location filename="../Windows/MainWindow.cpp" line="-455"/>
-        <location line="+1835"/>
+        <location filename="../Windows/MainWindow.cpp" line="-501"/>
+        <source>Restore Factory Layout</source>
+        <translation>恢复出厂布局</translation>
+    </message>
+    <message>
+        <location line="+46"/>
+        <location line="+1885"/>
         <location line="+119"/>
         <location line="+13"/>
         <location line="+112"/>
@@ -16842,8 +16858,8 @@ Close the capture or save to another location.</source>
         <translation>重放上下文：%1</translation>
     </message>
     <message>
-        <location line="-2241"/>
-        <location line="+1835"/>
+        <location line="-2291"/>
+        <location line="+1885"/>
         <location line="+60"/>
         <location line="+59"/>
         <location line="+125"/>
@@ -16852,7 +16868,7 @@ Close the capture or save to another location.</source>
         <translation>本地</translation>
     </message>
     <message>
-        <location line="-2157"/>
+        <location line="-2207"/>
         <source>vkconfig detected - possible incompatibility</source>
         <translation>检测到 vkconfig——可能不兼容</translation>
     </message>
@@ -16882,13 +16898,13 @@ If this program is not active check the path below for any leftover files:
     </message>
     <message>
         <location line="+105"/>
-        <location line="+1914"/>
+        <location line="+1964"/>
         <location line="+43"/>
         <source>Resolve Symbols</source>
         <translation>解析符号</translation>
     </message>
     <message>
-        <location line="-1943"/>
+        <location line="-1993"/>
         <source>Start Self-hosted Capture</source>
         <translation>开始自托管捕获</translation>
     </message>
@@ -17226,7 +17242,7 @@ Would you like to open the downloads page to reinstall?</source>
         <translation>正在检查更新...</translation>
     </message>
     <message>
-        <location line="+291"/>
+        <location line="+341"/>
         <location line="+19"/>
         <source>File not found</source>
         <translation>找不到文件</translation>
@@ -17487,7 +17503,7 @@ Would you like to open the builds list in a browser?</source>
         <translation>无法加载布局</translation>
     </message>
     <message>
-        <location line="+116"/>
+        <location line="+126"/>
         <source>%1.
 
 Please manually allow the RenderDocCmd program storage permissions on your device to ensure correct functionality.</source>
@@ -22766,7 +22782,7 @@ The project folder and every local file will remain on disk.</source>
     </message>
     <message>
         <location line="+3"/>
-        <location filename="../Windows/MainWindow.cpp" line="-3500"/>
+        <location filename="../Windows/MainWindow.cpp" line="-3564"/>
         <source>Frame Rendering Flow</source>
         <translation>帧渲染流程图</translation>
     </message>

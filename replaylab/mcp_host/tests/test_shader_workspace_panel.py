@@ -617,8 +617,12 @@ class ShaderWorkspaceModuleContractTests(unittest.TestCase):
         self.assertIsNotNone(constructor_source)
         self.assertLess(
             constructor_source.index("header.addWidget(self.files_button)"),
-            constructor_source.index("header.addWidget(title)"),
+            constructor_source.index("outer.addWidget(title)"),
         )
+        self.assertLess(constructor_source.index("outer.addLayout(header)"),
+                        constructor_source.index("outer.addWidget(title)"))
+        self.assertIn("self.subtitle.setWordWrap(True)", constructor_source)
+        self.assertIn("actions.addWidget(self.save_button)", constructor_source)
         self.assertIn("ShaderFlowGraphPanel", _attribute_calls(constructor))
         self.assertIn("nodeActivated", {
             node.attr for node in ast.walk(constructor)

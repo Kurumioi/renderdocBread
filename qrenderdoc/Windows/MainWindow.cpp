@@ -34,10 +34,13 @@
 #include <QPixmapCache>
 #include <QProgressBar>
 #include <QProgressDialog>
+#include <QSaveFile>
+#include <QScreen>
 #include <QShortcut>
 #include <QTabBar>
 #include <QToolButton>
 #include <QToolTip>
+#include <QWindow>
 #include "Code/QRDUtils.h"
 #include "Code/CaptureContext.h"
 #include "Code/Resources.h"
@@ -156,6 +159,10 @@ MainWindow::MainWindow(ICaptureContext &ctx) : QMainWindow(NULL), ui(new Ui::Mai
   setAcceptDrops(true);
 
   QObject::connect(ui->menu_Tools, &QMenu::aboutToShow, this, &MainWindow::updateToolsMenuOptions);
+
+  ui->menu_Load_Layout->addSeparator();
+  ui->menu_Load_Layout->addAction(tr("Restore Factory Layout"), this,
+                                  &MainWindow::ResetFactoryLayout);
 
   QObject::connect(ui->action_Load_Default_Layout, &QAction::triggered, this,
                    &MainWindow::loadLayout_triggered);
@@ -1746,86 +1753,136 @@ void MainWindow::BringToFront()
 
 void MainWindow::LoadInitialLayout()
 {
+  if(!LoadLayout(0))
+    ResetFactoryLayout();
+}
+
+void MainWindow::ResetFactoryLayout()
+{
   CaptureContext &ctx = static_cast<CaptureContext &>(m_Ctx);
-  bool loaded = LoadLayout(0);
-
-  // create default layout if layout failed to load
-  if(!loaded)
+  ToolWindowManager *manager = ui->toolWindowManager;
+  const QList<QWidget *> tools = manager->toolWindows();
+  QList<QWidget *> previouslyDocked;
+  for(QWidget *tool : tools)
   {
-    QWidget *eventBrowser = m_Ctx.GetEventBrowser()->Widget();
-
-    ui->toolWindowManager->addToolWindow(eventBrowser, ToolWindowManager::EmptySpace);
-
-    QWidget *textureViewer = m_Ctx.GetTextureViewer()->Widget();
-
-    ui->toolWindowManager->addToolWindow(
-        textureViewer,
-        ToolWindowManager::AreaReference(ToolWindowManager::RightOf,
-                                         ui->toolWindowManager->areaOf(eventBrowser), 0.75f));
-
-    QWidget *pipe = m_Ctx.GetPipelineViewer()->Widget();
-
-    ui->toolWindowManager->addToolWindow(
-        pipe, ToolWindowManager::AreaReference(ToolWindowManager::AddTo,
-                                               ui->toolWindowManager->areaOf(textureViewer)));
-
-    QWidget *mesh = m_Ctx.GetMeshPreview()->Widget();
-
-    ui->toolWindowManager->addToolWindow(
-        mesh, ToolWindowManager::AreaReference(ToolWindowManager::AddTo,
-                                               ui->toolWindowManager->areaOf(textureViewer)));
-
-    QWidget *capDialog = m_Ctx.GetCaptureDialog()->Widget();
-
-    ui->toolWindowManager->addToolWindow(
-        capDialog, ToolWindowManager::AreaReference(ToolWindowManager::AddTo,
-                                                    ui->toolWindowManager->areaOf(textureViewer)));
-
-    QWidget *bookmarksView = ctx.GetBookmarksView();
-
-    ui->toolWindowManager->addToolWindow(
-        bookmarksView,
-        ToolWindowManager::AreaReference(ToolWindowManager::BottomOf,
-                                         ui->toolWindowManager->areaOf(eventBrowser), 0.45f));
-
-    QWidget *apiInspector = m_Ctx.GetAPIInspector()->Widget();
-
-    ui->toolWindowManager->addToolWindow(
-        apiInspector,
-        ToolWindowManager::AreaReference(ToolWindowManager::AddTo,
-                                         ui->toolWindowManager->areaOf(bookmarksView)));
-    ToolWindowManager::raiseToolWindow(bookmarksView);
-
-    QWidget *annotationViewer = m_Ctx.GetAnnotationViewer()->Widget();
-    ui->toolWindowManager->addToolWindow(
-        annotationViewer, ToolWindowManager::AreaReference(
-                              ToolWindowManager::AddTo,
-                              ui->toolWindowManager->areaOf(bookmarksView)));
-    ToolWindowManager::raiseToolWindow(bookmarksView);
-
-    for(QWidget *tool : {m_Ctx.GetResourceInspector()->Widget(), m_Ctx.GetPythonShell()->Widget()})
-      ui->toolWindowManager->addToolWindow(
-          tool, ToolWindowManager::AreaReference(ToolWindowManager::AddTo,
-                                                ui->toolWindowManager->areaOf(textureViewer)));
-    ui->toolWindowManager->addToolWindow(
-        CreateFrameRenderFlowPlaceholder(),
-        ToolWindowManager::AreaReference(ToolWindowManager::AddTo,
-                                         ui->toolWindowManager->areaOf(textureViewer)));
-    ToolWindowManager::raiseToolWindow(textureViewer);
-
-    ui->toolWindowManager->addToolWindow(
-        ctx.GetAIAssistant()->Widget(),
-        ToolWindowManager::AreaReference(ToolWindowManager::RightWindowSide,
-                                         ui->toolWindowManager->areaOf(textureViewer), 0.28f),
-        ToolWindowManager::HideOnClose);
-
-    QWidget *timelineBar = m_Ctx.GetTimelineBar()->Widget();
-
-    ui->toolWindowManager->addToolWindow(
-        timelineBar,
-        ToolWindowManager::AreaReference(ToolWindowManager::TopWindowSide,
-                                         ui->toolWindowManager->areaOf(textureViewer), 0.08f));
+    if(manager->areaOf(tool))
+      previouslyDocked.append(tool);
   }
+  // Detach tabs without closing their widgets, including editors with unsaved state.
+  manager->moveToolWindows(previouslyDocked, ToolWindowManager::NoArea);
+  auto dock = [manager, &tools](QWidget *tool, const ToolWindowManager::AreaReference &area,
+                                ToolWindowManager::ToolWindowProperty properties =
+                                    ToolWindowManager::ToolWindowProperty(0)) {
+    if(tools.contains(tool))
+    {
+      manager->moveToolWindow(tool, area);
+      manager->setToolWindowProperties(tool, properties);
+    }
+    else
+    {
+      manager->addToolWindow(tool, area, properties);
+    }
+  };
+
+  QWidget *eventBrowser = m_Ctx.GetEventBrowser()->Widget();
+
+  dock(eventBrowser, ToolWindowManager::EmptySpace);
+
+  QWidget *textureViewer = m_Ctx.GetTextureViewer()->Widget();
+
+  dock(textureViewer,
+       ToolWindowManager::AreaReference(ToolWindowManager::RightOf,
+                                        ui->toolWindowManager->areaOf(eventBrowser), 0.75f));
+
+  QWidget *pipe = m_Ctx.GetPipelineViewer()->Widget();
+
+  dock(pipe, ToolWindowManager::AreaReference(ToolWindowManager::AddTo,
+                                              ui->toolWindowManager->areaOf(textureViewer)));
+
+  QWidget *mesh = m_Ctx.GetMeshPreview()->Widget();
+
+  dock(mesh, ToolWindowManager::AreaReference(ToolWindowManager::AddTo,
+                                              ui->toolWindowManager->areaOf(textureViewer)));
+
+  QWidget *capDialog = m_Ctx.GetCaptureDialog()->Widget();
+
+  dock(capDialog, ToolWindowManager::AreaReference(ToolWindowManager::AddTo,
+                                                   ui->toolWindowManager->areaOf(textureViewer)));
+
+  QWidget *bookmarksView = ctx.GetBookmarksView();
+
+  dock(bookmarksView,
+       ToolWindowManager::AreaReference(ToolWindowManager::BottomOf,
+                                        ui->toolWindowManager->areaOf(eventBrowser), 0.45f));
+
+  QWidget *apiInspector = m_Ctx.GetAPIInspector()->Widget();
+
+  dock(apiInspector, ToolWindowManager::AreaReference(
+                         ToolWindowManager::AddTo, ui->toolWindowManager->areaOf(bookmarksView)));
+  ToolWindowManager::raiseToolWindow(bookmarksView);
+
+  QWidget *annotationViewer = m_Ctx.GetAnnotationViewer()->Widget();
+  dock(annotationViewer, ToolWindowManager::AreaReference(
+                             ToolWindowManager::AddTo, ui->toolWindowManager->areaOf(bookmarksView)));
+  ToolWindowManager::raiseToolWindow(bookmarksView);
+
+  for(QWidget *tool : {m_Ctx.GetResourceInspector()->Widget(), m_Ctx.GetPythonShell()->Widget()})
+    dock(tool, ToolWindowManager::AreaReference(ToolWindowManager::AddTo,
+                                                ui->toolWindowManager->areaOf(textureViewer)));
+  QWidget *frameFlow = NULL;
+  for(QWidget *tool : tools)
+  {
+    // i18n-ignore: stable first-party dock identity stored in layout files.
+    if(tool->objectName() == lit("breadFrameRenderFlow"))
+    {
+      frameFlow = tool;
+      break;
+    }
+  }
+  dock(frameFlow ? frameFlow : CreateFrameRenderFlowPlaceholder(),
+       ToolWindowManager::AreaReference(ToolWindowManager::AddTo,
+                                        ui->toolWindowManager->areaOf(textureViewer)));
+  ToolWindowManager::raiseToolWindow(textureViewer);
+
+  dock(ctx.GetAIAssistant()->Widget(),
+       ToolWindowManager::AreaReference(ToolWindowManager::RightWindowSide,
+                                        ui->toolWindowManager->areaOf(textureViewer), 0.28f),
+       ToolWindowManager::HideOnClose);
+
+  QWidget *timelineBar = m_Ctx.GetTimelineBar()->Widget();
+
+  dock(timelineBar,
+       ToolWindowManager::AreaReference(ToolWindowManager::TopWindowSide,
+                                        ui->toolWindowManager->areaOf(textureViewer), 0.08f));
+
+  for(QWidget *tool : previouslyDocked)
+  {
+    if(!manager->areaOf(tool))
+      manager->moveToolWindow(tool, mainToolArea());
+  }
+  ToolWindowManager::raiseToolWindow(textureViewer);
+  ClampLayoutGeometry();
+}
+
+void MainWindow::ClampLayoutGeometry()
+{
+  if(isMaximized() || isFullScreen() || !QGuiApplication::primaryScreen())
+    return;
+
+  QRect desktop;
+  for(QScreen *screen : QGuiApplication::screens())
+    desktop = desktop.united(screen->availableGeometry());
+
+  // Keep intentional layouts spanning more than one display. Bring an oversized or
+  // off-desktop normal window back to an available screen after a topology change.
+  if(desktop.contains(frameGeometry()))
+    return;
+  QScreen *screen = windowHandle() ? windowHandle()->screen() : NULL;
+  const QRect available = (screen ? screen : QGuiApplication::primaryScreen())->availableGeometry();
+  const QSize frameMargins = frameGeometry().size() - size();
+  const QSize target = size().boundedTo(available.size() - frameMargins);
+  resize(target);
+  move(available.topLeft());
 }
 
 bool MainWindow::ErrorReportsAllowed()
@@ -3446,6 +3503,13 @@ QVariantMap MainWindow::saveState()
 
 bool MainWindow::restoreState(QVariantMap &state)
 {
+  // i18n-ignore: persisted ToolWindowManager version key.
+  const bool supported = state.value(lit("toolWindowManagerStateFormat")).toInt() == 1;
+  // i18n-ignore: persisted ToolWindowManager root key.
+  const bool hasMainWrapper = !state.value(lit("mainWrapper")).toMap().isEmpty();
+  if(!supported || !hasMainWrapper)
+    return false;
+
   restoreGeometry(QByteArray::fromBase64(state[lit("mainWindowGeometry")].toByteArray()));
 
   ui->toolWindowManager->restoreState(state);
@@ -3465,9 +3529,10 @@ bool MainWindow::SaveLayout(int layout)
 
   QVariantMap state = saveState();
 
-  QFile f(path);
-  if(f.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text))
-    return SaveToJSON(state, f, JSON_ID, JSON_VER);
+  QSaveFile f(path);
+  if(f.open(QIODevice::WriteOnly | QIODevice::Text) && SaveToJSON(state, f, JSON_ID, JSON_VER) &&
+     f.commit())
+    return true;
 
   qWarning() << "Couldn't write to " << path << " " << f.errorString();
 
@@ -3522,6 +3587,8 @@ bool MainWindow::LoadLayout(int layout)
       // i18n-ignore: internal layout migration key, never shown to the user.
       if(layout == 0 && state[lit("bookmarksViewLayoutVersion")].toInt() < 1)
         on_action_Bookmarks_triggered();
+
+      ClampLayoutGeometry();
 
       // Notify the already-running Python integration after the complete native restore. At
       // startup it will instead find and adopt the placeholder when it registers its windows.

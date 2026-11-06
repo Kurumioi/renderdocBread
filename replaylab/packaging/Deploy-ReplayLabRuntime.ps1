@@ -226,6 +226,9 @@ function Get-ValidatedRuntimeOutput {
     }
     $version = [string]$versionValue
 
+    if ($manifest.PSObject.Properties["layout"] -and $manifest.layout -eq "onedir") {
+        throw "Shared portable Host files are staged by Build-RenderDocBread.ps1. Build without -PortableHosts for Development deployment."
+    }
     $ownedFiles = @(Get-RequiredJsonProperty $manifest "ownedFiles" "ReplayLab runtime manifest")
     Assert-ExactFileNames $ownedFiles $runtimeOwnedNames "ReplayLab runtime manifest ownedFiles"
 

@@ -14,6 +14,7 @@ def fingerprint():
     paths.extend((REPO / "replaylab/packaging").glob("*_entry.py"))
     paths.extend(REPO / p for p in ("replaylab/pyproject.toml", "replaylab/mcp_host/pyproject.toml",
                                    "replaylab/packaging/Build-ReplayLabRuntime.ps1",
+                                   "replaylab/packaging/host_runtime.py",
                                    "replaylab/dependencies/build-requirements.lock"))
     digest = hashlib.sha256()
     for path in sorted(paths):

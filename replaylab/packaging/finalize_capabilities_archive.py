@@ -87,12 +87,11 @@ def finalize(base: Path, capabilities: Path | None, output: Path, runtime: Path 
         runtime_manifest = json.loads((runtime / "replaylab-runtime-manifest.json").read_text(encoding="utf-8-sig"))
         if runtime_manifest.get("sourceInputsSha256") != fingerprint():
             raise ValueError("Frozen runtime does not match the final source inputs")
-        expected_runtime = {item["path"]: item for item in runtime_manifest["files"]}
-        for name in ("replaylab-ai.exe", "BreadMCP.exe", "ReplayLabInternal.exe", "ReplayLabShaderTools.exe"):
-            path = runtime / name
-            record = expected_runtime[name]
-            if path.stat().st_size != record["size"] or digest(path) != record["sha256"]:
-                raise ValueError("Runtime payload differs from the frozen manifest")
+        from host_runtime import SUPPORT, runtime_paths
+        if runtime_manifest.get("layout") == "onedir" or any(
+                path.startswith("replaylab/" + SUPPORT + "/") for path in records):
+            raise ValueError("Rebuild the ZIP with build_compact_release.py when replacing shared Host files")
+        for name, path in runtime_paths(runtime, runtime_manifest).items():
             additions["replaylab/" + name] = path.read_bytes()
         runtime_manifest.get("shaderTools", {}).pop("path", None)
         additions["replaylab/replaylab-runtime-manifest.json"] = encoded(runtime_manifest)

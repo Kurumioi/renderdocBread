@@ -173,7 +173,10 @@ def test_native_layout_creates_placeholder_only_when_default_or_requested_by_sav
     source = (ROOT / 'qrenderdoc/Windows/MainWindow.cpp').read_text('utf8')
     initial = source[source.index('void MainWindow::LoadInitialLayout()'):
                      source.index('bool MainWindow::ErrorReportsAllowed()')]
-    assert initial.index('if(!loaded)') < initial.index('CreateFrameRenderFlowPlaceholder()')
+    assert 'if(!LoadLayout(0))\n    ResetFactoryLayout();' in initial
+    assert 'frameFlow ? frameFlow : CreateFrameRenderFlowPlaceholder()' in initial
+    assert 'manager->moveToolWindows(previouslyDocked, ToolWindowManager::NoArea);' in initial
+    assert 'forceCloseToolWindow' not in initial
     callback = source[source.index('setToolWindowCreateCallback('):source.index('ui->action_Start_Replay_Loop')]
     assert 'objectName == lit("breadFrameRenderFlow")' in callback
     assert 'return CreateFrameRenderFlowPlaceholder();' in callback

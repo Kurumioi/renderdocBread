@@ -2309,6 +2309,10 @@ async def _handle_public_timeline_update(
                 lifecycle=lifecycle,
             )
             event["activityTarget"] = target
+            if (target_name in {"validate_frame_render_flow", "publish_frame_render_flow"}
+                    and _enum_value(_field(update, "status")).casefold() == "pending"):
+                event["activityTitleId"] = "task.frame-flow.waiting-for-arguments"
+                event["activityTitle"] = "Waiting for the model to submit frame diagram arguments"
         else:
             event = _agent_reported_event(
                 activity_id=activity_id,

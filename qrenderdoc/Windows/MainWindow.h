@@ -95,6 +95,8 @@ public:
   ToolWindowManager::AreaReference leftToolArea();
 
   void LoadInitialLayout();
+  void ResetFactoryLayout();
+  void ClampLayoutGeometry();
 
   bool ErrorReportsAllowed();
   void sendErrorReport(bool forceCaptureInclusion);

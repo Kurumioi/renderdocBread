@@ -870,3 +870,41 @@ def test_local_intent_tools_are_never_part_of_the_host_effect_manifest() -> None
         (READ_ONLY_TOOLS | EFFECTFUL_TOOLS) | AGENT_LOCAL_TOOLS)
     for name in AGENT_LOCAL_TOOLS:
         assert tool_call_effects(name, {}) == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_frame_flow_retry_limit_is_released_by_valid_preflight(tmp_path):
+    from types import SimpleNamespace
+    from replaylab_agent.errors import PolicyError
+    from replaylab_agent.events import TaskEventWriter
+    from replaylab_agent.mcp_proxy import _FrameFlowCalls
+
+    class Host:
+        async def call_tool(self, name, arguments):
+            if name == "validate_frame_render_flow":
+                payload = {"valid": arguments["corrected"]}
+            else:
+                payload = {"error": "validation failed", "type": "FrameFlowValidationError",
+                           "issues": [{"path": "stages[0].category", "message": "Choose an allowed category"}]}
+            return SimpleNamespace(structuredContent=payload, content=[], isError=False)
+
+    calls = _FrameFlowCalls({})
+    calls.writer = TaskEventWriter(tmp_path, "frame-flow")
+    host = Host()
+    publish = "publish_frame_render_flow"
+    validate = "validate_frame_render_flow"
+    args = {"flow_id": "flow-1"}
+    for _ in range(3):
+        await calls.call(host, publish, args)
+    with pytest.raises(PolicyError, match=r"stages\[0\].category"):
+        await calls.call(host, publish, args)
+    await calls.call(host, validate, {**args, "corrected": False})
+    with pytest.raises(PolicyError, match="Publication paused"):
+        await calls.call(host, publish, args)
+    await calls.call(host, validate, {**args, "corrected": True})
+    await calls.call(host, publish, args)
+    events = [json.loads(row) for row in calls.writer.path.read_text(encoding="utf-8").splitlines()]
+    assert [event["kind"] for event in events] == ["tool-started", "tool-completed"] * 6
+    assert events[1]["data"]["status"] == "failed"
+    assert events[1]["data"]["publicDetail"] == "stages[0].category: Choose an allowed category"
+    assert events[1]["data"]["elapsedMs"] >= 0

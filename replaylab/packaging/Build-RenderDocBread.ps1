@@ -99,9 +99,9 @@ if (-not $SkipNativeBuild) {
 }
 if (-not (Test-Path -LiteralPath $gui)) { throw "Build RenderDocBread.exe first: $gui" }
 if (-not $SkipRuntimeBuild) {
-    Invoke-CheckedScript (Join-Path $PSScriptRoot 'Build-ReplayLabRuntime.ps1') @('-PythonExecutable', $PythonExecutable)
+    Invoke-CheckedScript (Join-Path $PSScriptRoot 'Build-ReplayLabRuntime.ps1') @('-PythonExecutable', $PythonExecutable, '-PortableHosts')
 }
-$runtime = Join-Path $repoRoot 'replaylab\output\replaylab'
+$runtime = Join-Path $repoRoot 'replaylab\output\portable-runtime'
 $unityBundle = $paths.'unity-mcp'
 & $PythonExecutable -c 'import sys;from pathlib import Path;sys.path.insert(0,sys.argv[1]);from prepare_unity_bundle import verify;verify(Path(sys.argv[2]))' $PSScriptRoot $unityBundle
 if ($LASTEXITCODE -ne 0) { throw 'Preparing the bundled Unity MCP runtime failed.' }

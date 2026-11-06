@@ -43,6 +43,56 @@ def setup(monkeypatch, tmp_path):
     return calls, data
 
 
+def test_preflight_returns_all_stage_errors_and_publishes_a_patched_draft(setup, monkeypatch):
+    calls, _ = setup
+    flow = json.loads(server.prepare_frame_render_flow())["flowId"]
+    calls.clear()
+    store = server._frame_render_flow_store
+    store.record_observation(SESSION, 4, {"expectedOutputs": [
+        {"resourceId": 100, "kind": "rtv", "index": 0, "mip": 0},
+        {"resourceId": 100, "kind": "rtv", "index": 0, "mip": 1},
+    ]}, flow)
+    omission = {"resourceId": 100, "kind": "rtv", "index": 0, "reason": "Auxiliary view", "evidence": "Observed RTV"}
+    invalid = [stage(2, 2, category="invalid", techniques=[{"name": "Test", "status": []}],
+                     investigation={"status": "done"}),
+               stage(4, 4, outputOmissions=[omission, {**omission, "resourceId": 999},
+                                            {**omission, "mip": 0}, {**omission, "mip": 0}])]
+    direct = json.loads(server.publish_frame_render_flow(flow, invalid))
+    first = json.loads(server.validate_frame_render_flow(flow, invalid, title="Example"))
+    assert first["valid"] is False and first["issueCount"] == 7
+    assert first["issues"] == direct["issues"]
+    errors = {issue["path"]: issue["message"] for issue in first["issues"]}
+    assert "actual EIDs" in errors["stages[0].bounds"]
+    assert "recognized, inferred" in errors["stages[0].techniques"]
+    assert "investigated, partial" in errors["stages[0].investigation"]
+    assert "2 observed matches" in errors["stages[1].outputOmissions[0]"]
+    assert "no observed match" in errors["stages[1].outputOmissions[1]"]
+    assert "duplicates outputOmissions[2]" in errors["stages[1].outputOmissions[3]"]
+    fixed = json.loads(server.validate_frame_render_flow(flow, draft_id=first["draftId"], stage_updates={
+        "0": {"startEventId": 1, "endEventId": 1, "category": "geometry", "techniques": [], "investigation": {}},
+        "1": {"outputOmissions": [{**omission, "mip": 1}]},
+    }))
+    assert fixed["valid"] is True and not fixed["saved"] and not fixed["replayed"]
+    assert not calls and store.get(SESSION)["document"] is None
+    assert store.get_draft(flow, first["draftId"])["stages"] == invalid
+    monkeypatch.setattr(server, "_precache_frame_flow_channels", lambda *args: {})
+    published = json.loads(server.publish_frame_render_flow(flow, draft_id=fixed["draftId"], show_in_window=False))
+    assert published["savedWithCapture"] is True and published["stageCount"] == 2, published
+    assert [method for method, _ in calls] == ["save_frame_render_flow"]
+    assert store.get(SESSION)["document"]["title"] == "Example"
+
+
+def test_preflight_requires_a_cached_current_capture_and_drafts_expire_on_reanalysis(setup):
+    calls, _ = setup
+    assert "prepare_frame_render_flow" in json.loads(server.validate_frame_render_flow("missing", [stage(1, 1)]))["error"]
+    assert not calls
+    flow = json.loads(server.prepare_frame_render_flow())["flowId"]
+    first = json.loads(server.validate_frame_render_flow(flow, [stage(1, 1)]))
+    server._frame_render_flow_store.begin_reanalysis(SESSION, flow)
+    result = json.loads(server.validate_frame_render_flow(flow, draft_id=first["draftId"]))
+    assert "No draft revision" in result["error"]
+
+
 def test_prepare_collects_complete_paged_tree_then_reads_cache(setup):
     calls, data = setup
     first = json.loads(server.prepare_frame_render_flow(refresh=True))

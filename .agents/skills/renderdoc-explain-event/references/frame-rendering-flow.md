@@ -269,8 +269,16 @@ texture is the final display output.
 
 ## Publish an interactive result
 
-Call `publish_frame_render_flow(flow_id, stages, title, summary,
-show_in_window=True)` with the existing flow ID and the explained stages.
+Call `validate_frame_render_flow(flow_id, stages, title, summary)` with the
+prepared flow ID and the explained stages. Read all returned issue paths.
+Repair only the affected fields with the returned `draft_id` and
+`stage_updates` keyed by zero-based index. A valid receipt checks the cached
+outline and output bindings. Use `publish_frame_render_flow(flow_id,
+draft_id=..., show_in_window=True)` to run full media validation and save the
+result. Never treat a preflight receipt as publication. If publication
+reports a media problem, edit the affected stage and use the new revision.
+When a repeated validation error cannot be resolved from available evidence,
+report the exact unresolved rule and keep the existing published work.
 Each stage supplies exact startEventId/endEventId, title, summary, category,
 techniques, investigation, confidence and useful evidence images. Add algorithm
 for meaningful calculations/resource chains, with inputs, steps, outputs and integration as specified in

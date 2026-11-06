@@ -5,12 +5,14 @@ param(
     [string]$WorkDirectory = "",
     [string]$TemporaryBuildRoot = "",
     [switch]$KeepBuildWork,
+    [switch]$PortableHosts,
     [switch]$ValidateOnly
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+$supportDirectoryName = "bread-host-support"
 $runtimeManifestName = "replaylab-runtime-manifest.json"
 $runtimeManifestSchema = "replaylab-runtime-output/v1"
 $buildSessionMarkerName = ".replaylab-build-session.json"
@@ -316,12 +318,12 @@ function Invoke-PyInstallerBuild {
         [string[]]$CollectSubmodules = @(),
         [string[]]$HiddenImports = @(),
         [string[]]$AddData = @(),
-        [string[]]$CopyMetadata = @()
+        [string[]]$CopyMetadata = @(),
+        [switch]$SharedSupport
     )
     $arguments = @(
         "-m", "PyInstaller",
         "--noconfirm",
-        "--onefile",
         "--noupx",
         "--log-level", "WARN",
         "--name", $Name,
@@ -330,6 +332,11 @@ function Invoke-PyInstallerBuild {
         "--workpath", $BuildPath,
         "--specpath", $SpecPath
     )
+    if ($SharedSupport) {
+        $arguments += @("--onedir", "--contents-directory", $supportDirectoryName)
+    } else {
+        $arguments += "--onefile"
+    }
     foreach ($root in $AdditionalImportRoots) {
         $arguments += @("--paths", $root)
     }
@@ -420,6 +427,7 @@ $agentEntry = Join-Path $packagingRoot "agent_host_entry.py"
 $internalEntry = Join-Path $packagingRoot "internal_host_entry.py"
 $mcpEntry = Join-Path $packagingRoot "mcp_host_entry.py"
 $shaderToolsEntry = Join-Path $packagingRoot "shader_tools_entry.py"
+$hostRuntime = Join-Path $packagingRoot "host_runtime.py"
 $shaderToolsBuilder = Join-Path $packagingRoot "build_shader_tools.py"
 $frozenMcpRouteProbe = Join-Path $packagingRoot "probe_frozen_mcp_route.py"
 $frozenHostLifetimeProbe = Join-Path $packagingRoot "tests\Test-FrozenHostLifetime.ps1"
@@ -445,7 +453,11 @@ if (-not [string]::IsNullOrWhiteSpace($TemporaryBuildRoot)) {
 }
 
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
-    $OutputDirectory = Join-Path $replayLabRoot "output\replaylab"
+    $OutputDirectory = if ($PortableHosts) {
+        Join-Path $replayLabRoot "output\portable-runtime"
+    } else {
+        Join-Path $replayLabRoot "output\replaylab"
+    }
 }
 if ([string]::IsNullOrWhiteSpace($WorkDirectory)) {
     $WorkDirectory = Join-Path $replayLabRoot "output\.pyinstaller-work"
@@ -485,6 +497,7 @@ foreach ($sourceFile in @(
     $mcpEntry,
     $shaderToolsEntry,
     $shaderToolsBuilder,
+    $hostRuntime,
     $frozenMcpRouteProbe,
     $frozenHostLifetimeProbe
 )) {
@@ -507,7 +520,7 @@ foreach ($skillFolder in $bundledSkillFolders) {
 }
 Write-Host ("ReplayLab: bundling " + $bundledSkillFolders.Count + " Skill folder(s): " +
     (($bundledSkillFolders | ForEach-Object { $_.Name }) -join ", "))
-Assert-OutputDirectorySafe $OutputDirectory $ownedRuntimeFiles
+if (-not $PortableHosts) { Assert-OutputDirectorySafe $OutputDirectory $ownedRuntimeFiles }
 
 if ($ValidateOnly) {
     [pscustomobject]@{
@@ -595,6 +608,7 @@ try {
         }
     }
     foreach ($hostDist in @($agentDist, $mcpDist, $internalDist)) {
+        if ($PortableHosts) { break }
         Copy-Item -LiteralPath $builtShaderTools `
             -Destination (Join-Path $hostDist "ReplayLabShaderTools.exe")
     }
@@ -663,18 +677,18 @@ try {
             "langchain_core.tools"
         ) `
         -AddData @($agentData) `
-        -CopyMetadata $agentCopyMetadata
+        -CopyMetadata $agentCopyMetadata -SharedSupport:$PortableHosts
 
     $freezeJobs += Invoke-PyInstallerBuild $PythonExecutable "BreadMCP" $mcpEntry $mcpRoot `
         $mcpDist $mcpBuild $mcpSpec `
         -CollectAll @("mcp") `
         -CollectSubmodules @("src", "uvicorn", "starlette") `
-        -AddData @($mcpProviderData)
+        -AddData @($mcpProviderData) -SharedSupport:$PortableHosts
 
     $freezeJobs += Invoke-PyInstallerBuild $PythonExecutable "ReplayLabInternal" $internalEntry $mcpRoot `
         $internalDist $internalBuild $internalSpec `
         -CollectSubmodules @("src", "uvicorn", "starlette") `
-        -AddData @($mcpProviderData)
+        -AddData @($mcpProviderData) -SharedSupport:$PortableHosts
 
     $freezeJobs | Wait-Job | Out-Null
     foreach ($job in $freezeJobs) {
@@ -691,6 +705,23 @@ try {
         }
     }
 
+    if ($PortableHosts) {
+        $portableDist = Join-Path $sessionRoot "portable"
+        New-Item -ItemType Directory -Path $portableDist | Out-Null
+        $portableAgent = Join-Path $agentDist "replaylab-ai"
+        $portableMcp = Join-Path $mcpDist "BreadMCP"
+        $portableInternal = Join-Path $internalDist "ReplayLabInternal"
+        & $PythonExecutable $hostRuntime merge (Join-Path $portableDist $supportDirectoryName) `
+            $portableAgent $portableMcp $portableInternal
+        if ($LASTEXITCODE -ne 0) { throw "Frozen Hosts could not share their support files safely." }
+        foreach ($hostDir in @($portableAgent, $portableMcp, $portableInternal)) {
+            $hostName = (Split-Path -Leaf $hostDir) + ".exe"
+            Copy-Item -LiteralPath (Join-Path $hostDir $hostName) -Destination $portableDist
+        }
+        Copy-Item -LiteralPath $builtShaderTools -Destination $portableDist
+        $agentDist = $mcpDist = $internalDist = $portableDist
+    }
+
     $builtAgent = Assert-RegularFile (Join-Path $agentDist "replaylab-ai.exe") `
         "built AgentHost executable"
     $builtMcp = Assert-RegularFile (Join-Path $mcpDist "BreadMCP.exe") `
@@ -698,6 +729,16 @@ try {
     $builtInternal = Assert-RegularFile `
         (Join-Path $internalDist "ReplayLabInternal.exe") `
         "built internal Host executable"
+
+    # Verify the actual embedded bytecode independently of PyInstaller's cache.
+    $agentPackage = Join-Path $agentSource "replaylab_agent"
+    $mcpPackage = Join-Path $mcpRoot "src"
+    & $PythonExecutable $hostRuntime verify-sources $builtAgent $agentEntry $agentPackage $mcpPackage
+    if ($LASTEXITCODE -ne 0) { throw "Frozen AgentHost source verification failed." }
+    & $PythonExecutable $hostRuntime verify-sources $builtMcp $mcpEntry $mcpPackage
+    if ($LASTEXITCODE -ne 0) { throw "Frozen MCP Host source verification failed." }
+    & $PythonExecutable $hostRuntime verify-sources $builtInternal $internalEntry $mcpPackage
+    if ($LASTEXITCODE -ne 0) { throw "Frozen Internal Host source verification failed." }
 
     & $builtAgent --help | Out-Null
     if ($LASTEXITCODE -ne 0) {
@@ -828,26 +869,35 @@ try {
         throw "The packaged replaylab-ai.exe could not resolve the verified Cursor Composer context window."
     }
 
-    if (-not (Test-Path -LiteralPath $OutputDirectory)) {
-        New-Item -ItemType Directory -Path $OutputDirectory | Out-Null
+    $finalSourceInputsSha256 = & $PythonExecutable (Join-Path $packagingRoot "runtime_inputs.py")
+    if ($LASTEXITCODE -ne 0 -or $finalSourceInputsSha256 -cne $sourceInputsSha256) {
+        throw "Runtime source inputs changed during freezing. Build again from a stable checkout."
     }
-    Assert-NoReparseComponents $OutputDirectory "OutputDirectory" | Out-Null
-    Assert-OutputDirectorySafe $OutputDirectory $ownedRuntimeFiles
+    $runtimeStage = $OutputDirectory
+    if ($PortableHosts) {
+        $runtimeStage = $portableDist
+    } else {
+        if (-not (Test-Path -LiteralPath $runtimeStage)) {
+            New-Item -ItemType Directory -Path $runtimeStage | Out-Null
+        }
+        Assert-NoReparseComponents $runtimeStage "OutputDirectory" | Out-Null
+        Assert-OutputDirectorySafe $runtimeStage $ownedRuntimeFiles
 
-    Copy-Item -LiteralPath $builtAgent `
-        -Destination (Join-Path $OutputDirectory "replaylab-ai.exe") -Force
-    Copy-Item -LiteralPath $builtMcp `
-        -Destination (Join-Path $OutputDirectory "BreadMCP.exe") -Force
-    Copy-Item -LiteralPath $builtInternal `
-        -Destination (Join-Path $OutputDirectory "ReplayLabInternal.exe") -Force
-    Copy-Item -LiteralPath $builtShaderTools `
-        -Destination (Join-Path $OutputDirectory "ReplayLabShaderTools.exe") -Force
+        Copy-Item -LiteralPath $builtAgent `
+            -Destination (Join-Path $runtimeStage "replaylab-ai.exe") -Force
+        Copy-Item -LiteralPath $builtMcp `
+            -Destination (Join-Path $runtimeStage "BreadMCP.exe") -Force
+        Copy-Item -LiteralPath $builtInternal `
+            -Destination (Join-Path $runtimeStage "ReplayLabInternal.exe") -Force
+        Copy-Item -LiteralPath $builtShaderTools `
+            -Destination (Join-Path $runtimeStage "ReplayLabShaderTools.exe") -Force
+    }
 
     $fileRecords = @()
     foreach ($name in @(
         "replaylab-ai.exe", "ReplayLabInternal.exe", "BreadMCP.exe",
         "ReplayLabShaderTools.exe")) {
-        $path = Assert-RegularFile (Join-Path $OutputDirectory $name) `
+        $path = Assert-RegularFile (Join-Path $runtimeStage $name) `
             "packaged ReplayLab runtime file '$name'"
         $file = Get-Item -LiteralPath $path
         $fileRecords += [ordered]@{
@@ -870,10 +920,20 @@ try {
         ownedFiles = $ownedRuntimeFiles
         files = $fileRecords
     }
+    if ($PortableHosts) {
+        $support = & $PythonExecutable $hostRuntime records $portableDist
+        if ($LASTEXITCODE -ne 0) { throw "Could not inventory frozen Host support files." }
+        $manifest["layout"] = "onedir"
+        $manifest["files"] += [object[]](ConvertFrom-Json -InputObject ($support -join "`n"))
+    }
     $stagedManifest = Join-Path $sessionRoot $runtimeManifestName
     $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $stagedManifest -Encoding UTF8
     Copy-Item -LiteralPath $stagedManifest `
-        -Destination (Join-Path $OutputDirectory $runtimeManifestName) -Force
+        -Destination (Join-Path $runtimeStage $runtimeManifestName) -Force
+    if ($PortableHosts) {
+        & $PythonExecutable $hostRuntime publish $portableDist $OutputDirectory
+        if ($LASTEXITCODE -ne 0) { throw "Could not publish the verified portable runtime directory." }
+    }
 
     Write-Host "ReplayLab runtime $($probe.agentVersion) created at $OutputDirectory"
 }

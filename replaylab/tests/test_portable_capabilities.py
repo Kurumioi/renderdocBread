@@ -99,6 +99,42 @@ async def test_model_claim_without_tool_receipt_fails(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("busy_attempts,model_success", [(2, True), (4, True), (4, False)])
+async def test_probe_cleanup_preserves_the_model_result(monkeypatch, tmp_path, busy_attempts, model_success):
+    workspace = tmp_path / "probe"
+    workspace.mkdir()
+    monkeypatch.setattr(readiness.tempfile, "mkdtemp", lambda **_: str(workspace))
+    attempts, warnings = [], []
+    real_remove = readiness.shutil.rmtree
+
+    def remove(path):
+        attempts.append(path)
+        if len(attempts) <= busy_attempts:
+            error = PermissionError("directory still in use")
+            error.winerror = 32
+            raise error
+        real_remove(path)
+
+    async def probe(profile, server, challenge, workspace, timeout):
+        if not model_success:
+            raise RuntimeError("actual-probe-failure")
+        import hashlib
+        (workspace / "probe-receipt.json").write_text(json.dumps({
+            "challengeSha256": hashlib.sha256(challenge.encode()).hexdigest(), "tool": "bread_connection_probe"}))
+
+    monkeypatch.setattr(readiness.shutil, "rmtree", remove)
+    monkeypatch.setattr(readiness, "_model_probe", probe)
+    monkeypatch.setattr(readiness, "get_logger", lambda: SimpleNamespace(warning=lambda *args: warnings.append(args)))
+    checks = await readiness.run_execution_check(object())
+    assert checks[0].status == ("ok" if model_success else "error")
+    if not model_success:
+        assert "actual-probe-failure" in checks[0].detail
+    assert len(attempts) == min(4, busy_attempts + 1)
+    assert workspace.exists() == (busy_attempts == 4)
+    assert len(warnings) == (1 if busy_attempts == 4 else 0)
+
+
+@pytest.mark.asyncio
 async def test_actual_probe_mcp_writes_verifiable_receipt(tmp_path):
     from replaylab_agent.external_mcp import ExternalMCPPool
     receipt = tmp_path / "proof.json"

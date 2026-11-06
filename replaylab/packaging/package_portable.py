@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from build_fs import long_path, logical_path, temporary_directory
 from file_hashes import digest, warm_digests
+from host_runtime import MANIFEST as HOST_MANIFEST, SUPPORT as HOST_SUPPORT, runtime_paths
 
 REPO = Path(__file__).resolve().parents[2]
 SKIP_DIRS = {"__pycache__", ".git", ".venv", "obj", ".uex-cache", ".uex-analysis",
@@ -124,6 +125,25 @@ def normalize_receipts(root):
         write_json(tool_manifest, value)
 
 
+def _vendor_support_source(name):
+    """Known source and license directories in the locked frozen dependencies."""
+    parts = name.split("/")
+    return (parts[:2] in (["deepagents", "profiles"], ["pyarrow", "src"])
+            or (parts[0].endswith(".dist-info") and parts[1:2] == ["licenses"]))
+
+
+def _machine_path_in_metadata(text, host_file):
+    if re.fullmatch(r"cryptography-[^/]+[.]dist-info/sboms/cryptography-rust[.]cyclonedx[.]json", host_file):
+        # Cargo's sealed, upstream CI workspace is part of the original SBOM
+        # component identity. Scan the rest for local build or profile paths.
+        text = re.sub(r"path[+]file:///D:/a/cryptography/cryptography/wheelhouse/[A-Za-z0-9._/%+-]+", "", text)
+    if host_file == "jsonschema/benchmarks/issue232/issue.json":
+        # This upstream JSON Schema pattern excludes backslashes from a
+        # hostname. Its JSON-escaped backslashes are not a UNC path.
+        text = text.replace('"^[^{}/ :\\\\\\\\]+(?::\\\\d+)?$"', '""')
+    return bool(ABSOLUTE.search(text))
+
+
 def audit(root, config):
     errors = [f"Missing {name}" for name in config["requiredFiles"] if not child(root, name).is_file()]
     native_record, _ = uex_native_input()
@@ -135,24 +155,27 @@ def audit(root, config):
         parts = path.relative_to(root).parts
         unity_runtime = relative.startswith("replaylab/tools/unity-mcp/runtime/")
         capability_runtime = relative.startswith("replaylab/tools/capabilities/")
+        host_file = relative.removeprefix("replaylab/" + HOST_SUPPORT + "/")
+        vendor_source = host_file != relative and _vendor_support_source(host_file)
         pinned_native = relative in native_inputs
         if pinned_native:
             expected = native_inputs[relative]
             if path.stat().st_size != expected["size"] or digest(path) != expected["sha256"]:
                 errors.append(f"UEX native dependency differs: {relative}")
-        if not capability_runtime and (path.name in PRIVATE or (not unity_runtime and not pinned_native and any(part in SKIP_DIRS for part in parts))):
+        if not capability_runtime and (path.name in PRIVATE or (not unity_runtime and not pinned_native and not vendor_source
+                                   and any(part in SKIP_DIRS for part in parts))):
             errors.append(f"Private/cache file: {relative}")
         if not capability_runtime and path.suffix.lower() in {".json", ".ini", ".cfg", ".config"} and path.stat().st_size < 4 * 1024**2:
-            if ABSOLUTE.search(path.read_text(encoding="utf-8-sig", errors="replace")):
+            if _machine_path_in_metadata(path.read_text(encoding="utf-8-sig", errors="replace"), host_file if host_file != relative else ""):
                 errors.append(f"Machine-specific path in {relative}")
     manifest = read_json(root / "replaylab/replaylab-runtime-manifest.json")
     from runtime_inputs import fingerprint
     if manifest.get("sourceInputsSha256") != fingerprint():
         errors.append("Frozen runtime is from different source/skill inputs; rebuild the runtime before release")
-    for record in manifest["files"]:
-        path = child(root / "replaylab", record["path"])
-        if not path.is_file() or path.stat().st_size != record["size"] or digest(path) != record["sha256"]:
-            errors.append(f"Runtime hash mismatch: {record['path']}")
+    try:
+        runtime_paths(root / "replaylab", manifest)
+    except (ValueError, OSError) as error:
+        errors.append(str(error))
     runtime_config = read_json(root / "replaylab/tools/unpackers/uex/uex.runtimeconfig.json")
     if "framework" in runtime_config["runtimeOptions"] or "frameworks" in runtime_config["runtimeOptions"]:
         errors.append("UEX requires a machine-installed .NET runtime; publish it self-contained")
@@ -284,8 +307,12 @@ def assemble(application, gui, runtime, uex, crt, destination, config, audit_onl
             if profile != "rdc":
                 compact_staging(root / "replaylab/tools/capabilities")
         copy_tree(REPO / "replaylab/unity", root / "replaylab/unity")
-        for name in ("replaylab-ai.exe", "BreadMCP.exe", "ReplayLabInternal.exe", "ReplayLabShaderTools.exe", "replaylab-runtime-manifest.json"):
-            shutil.copy2(runtime / name, root / "replaylab" / name)
+        manifest = read_json(runtime / HOST_MANIFEST)
+        for name, path in runtime_paths(runtime, manifest).items():
+            target = root / "replaylab" / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+        shutil.copy2(runtime / HOST_MANIFEST, root / "replaylab" / HOST_MANIFEST)
         if uex:
             # Start with the official unpacker files (native codecs/licenses), then overlay the
             # self-contained publish of the same patched source. Personal tool state is excluded.

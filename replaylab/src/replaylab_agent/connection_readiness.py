@@ -2,16 +2,41 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager
 import hashlib
 import json
 from pathlib import Path
 import secrets
+import shutil
 import sys
 import tempfile
 
+from .agent_diagnostics import get_logger
 from .doctor import DoctorCheck
 from .profiles import Profile
+
+
+@asynccontextmanager
+async def _probe_workspace(prefix: str):
+    """Finish process teardown before trying to remove a disposable probe directory."""
+    temp = tempfile.mkdtemp(prefix=prefix)
+    try:
+        yield temp
+    finally:
+        for delay in (0, 0.05, 0.1, 0.2):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                shutil.rmtree(temp)
+                break
+            except FileNotFoundError:
+                break
+            except OSError as error:
+                if getattr(error, "winerror", None) not in (5, 32, 33) or delay == 0.2:
+                    get_logger().warning(
+                        "Could not clean up the %s probe workspace (errno=%s, winerror=%s)",
+                        prefix, error.errno, getattr(error, "winerror", None))
+                    break
 
 
 def _route(receipt: Path):
@@ -102,7 +127,7 @@ async def _model_probe(profile: Profile, server: dict, challenge: str, workspace
 
 async def run_execution_check(profile: Profile, *, timeout: float = 120.0) -> list[DoctorCheck]:
     """Fresh temporary workspace, bounded model execution, one pure MCP tool."""
-    with tempfile.TemporaryDirectory(prefix="bread-connection-") as temp:
+    async with _probe_workspace("bread-connection-") as temp:
         workspace = Path(temp).resolve()
         receipt = workspace / "probe-receipt.json"
         server = _route(receipt)
@@ -130,7 +155,7 @@ async def _check_portable_tools() -> DoctorCheck:
     if server is None:
         return DoctorCheck("portable-tool-execution", "error", "Portable tools are not installed.", "connection.portable-missing")
     try:
-        with tempfile.TemporaryDirectory(prefix="bread-document-check-") as temp:
+        async with _probe_workspace("bread-document-check-") as temp:
             async with AsyncExitStack() as stack:
                 pool = ExternalMCPPool()
                 await pool.attach([server], stack)
@@ -188,7 +213,7 @@ async def check_host_tools(executable=None) -> DoctorCheck:
     import os
     try:
         host = find_bread_mcp(executable)
-        with tempfile.TemporaryDirectory(prefix="bread-host-check-") as temp:
+        async with _probe_workspace("bread-host-check-") as temp:
             env = {"REPLAYLAB_RUNTIME_DIR": temp, "PYINSTALLER_RESET_ENVIRONMENT": "1"}
             if os.environ.get("SystemRoot"):
                 env["SystemRoot"] = os.environ["SystemRoot"]
