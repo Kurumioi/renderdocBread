@@ -37,16 +37,19 @@
 #include <QPointer>
 #include <QScopedValueRollback>
 #include <QSplitter>
+#include <QStackedWidget>
 #include <QStyledItemDelegate>
+#include <QUuid>
 #include <memory>
 #include "Code/QRDUtils.h"
 #include "Code/ReplayLab/ReplayLabAIResourceAttachment.h"
 #include "Code/Resources.h"
 #include "Dialogs/TextureSaveDialog.h"
-#include "Windows/RenderTargetHistoryView.h"
 #include "Widgets/Extended/RDHeaderView.h"
 #include "Widgets/ResourcePreview.h"
 #include "Widgets/TextureGoto.h"
+#include "Windows/AI/AITextureAnnotation.h"
+#include "Windows/RenderTargetHistoryView.h"
 #include "flowlayout/FlowLayout.h"
 #include "toolwindowmanager/ToolWindowManagerArea.h"
 #include "ui_TextureViewer.h"
@@ -660,6 +663,15 @@ TextureViewer::TextureViewer(ICaptureContext &ctx, QWidget *parent)
 {
   ui->setupUi(this);
 
+  // Keep the native render window in its own page. Qt painting over a native GPU child is not
+  // reliable on Windows; the annotation page displays a pinned replay readback instead.
+  ui->renderLayout->removeItem(ui->gridLayout);
+  m_AIAnnotationStack = new QStackedWidget(this);
+  QWidget *liveTexture = new QWidget(m_AIAnnotationStack);
+  liveTexture->setLayout(ui->gridLayout);
+  m_AIAnnotationStack->addWidget(liveTexture);
+  ui->renderLayout->insertWidget(0, m_AIAnnotationStack, 1);
+
   ui->render->SetContext(m_Ctx);
   ui->pixelContext->SetContext(m_Ctx);
 
@@ -1260,6 +1272,186 @@ uint32_t TextureViewer::ActiveRenderTargetHistoryEvent() const
   // This accessor is used on the replay thread. Visibility is encoded by storing 0 when the
   // embedded panel is hidden, so no QWidget is ever touched outside the GUI thread.
   return m_RenderTargetHistoryEvent.load(std::memory_order_relaxed);
+}
+
+void TextureViewer::CloseAIAnnotation()
+{
+  ++m_AIAnnotationSerial;
+  m_AIAnnotationStack->setCurrentIndex(0);
+  if(m_AIAnnotation)
+  {
+    m_AIAnnotationStack->removeWidget(m_AIAnnotation);
+    m_AIAnnotation->deleteLater();
+    m_AIAnnotation.clear();
+  }
+}
+
+bool TextureViewer::MatchesAIAnnotation(const QJsonObject &context) const
+{
+  const ViewRequest request = CurrentViewRequest();
+  const QJsonObject capture = context.value(QLatin1String("capture")).toObject();
+  const QJsonObject resource = context.value(QLatin1String("resource")).toObject();
+  const QJsonObject annotation = context.value(QLatin1String("annotation")).toObject();
+  return capture.value(QLatin1String("eventId")).toDouble() ==
+             (request.historyEvent ? request.historyEvent : request.eventId) &&
+         resource.value(QLatin1String("resourceId")).toString() ==
+             ToQStr(request.display.resourceId) &&
+         resource.value(QLatin1String("mip")).toDouble() == request.display.subresource.mip &&
+         resource.value(QLatin1String("slice")).toDouble() == request.display.subresource.slice &&
+         resource.value(QLatin1String("sample")).toDouble() == request.display.subresource.sample &&
+         annotation.value(QLatin1String("flipY")).toBool() == request.display.flipY &&
+         annotation.value(QLatin1String("rangeMin")).toDouble() == request.display.rangeMin &&
+         annotation.value(QLatin1String("rangeMax")).toDouble() == request.display.rangeMax &&
+         annotation.value(QLatin1String("channels")).toArray() ==
+             QJsonArray({request.display.red, request.display.green, request.display.blue,
+                         request.display.alpha}) &&
+         annotation.value(QLatin1String("typeCast")).toString() == ToQStr(request.display.typeCast) &&
+         annotation.value(QLatin1String("overlay")).toString() == ToQStr(request.display.overlay) &&
+         annotation.value(QLatin1String("customShaderId")).toString() ==
+             ToQStr(request.display.customShaderId) &&
+         annotation.value(QLatin1String("decodeYUV")).toBool() == request.display.decodeYUV &&
+         annotation.value(QLatin1String("linearDisplayAsGamma")).toBool() ==
+             request.display.linearDisplayAsGamma;
+}
+
+void TextureViewer::EditAIAnnotation(
+    const QImage &original, const QString &title, const QJsonObject &context,
+    std::function<bool(const QImage &, const QImage &, const QJsonObject &)> accept)
+{
+  // An in-progress editor owns its unsaved strokes. Bring it forward instead of replacing it.
+  if(m_AIAnnotation)
+  {
+    m_AIAnnotationStack->setCurrentWidget(m_AIAnnotation);
+    m_AIAnnotation->setFocus();
+    return;
+  }
+  ++m_AIAnnotationSerial;
+  QPointer<TextureViewer> self(this);
+  m_AIAnnotation = new AITextureAnnotation(
+      original, title, context, accept,
+      [self]() {
+        if(self)
+          self->CloseAIAnnotation();
+      },
+      m_AIAnnotationStack);
+  m_AIAnnotationStack->addWidget(m_AIAnnotation);
+  m_AIAnnotationStack->setCurrentWidget(m_AIAnnotation);
+}
+
+void TextureViewer::BeginAIAnnotation(
+    const QJsonObject &captureBinding,
+    std::function<bool(const QImage &, const QImage &, const QJsonObject &)> accept,
+    std::function<void(const QString &)> error)
+{
+  if(m_AIAnnotation)
+  {
+    m_AIAnnotationStack->setCurrentWidget(m_AIAnnotation);
+    m_AIAnnotation->setFocus();
+    return;
+  }
+  const ViewRequest request = CurrentViewRequest();
+  const uint32_t eventId = request.historyEvent ? request.historyEvent : request.eventId;
+  if(!m_Ctx.IsCaptureLoaded() || request.texture.resourceId == ResourceId() ||
+     request.display.resourceId == ResourceId() || eventId == 0)
+  {
+    error(tr("Select a render target in the Texture Viewer before drawing."));
+    return;
+  }
+  const uint64_t serial = ++m_AIAnnotationSerial;
+  const int mip = qMin(31U, request.display.subresource.mip);
+  const QSize textureSize(qMax(1U, request.texture.width >> mip),
+                          qMax(1U, request.texture.height >> mip));
+  QSize imageSize = textureSize.scaled(QSize(1600, 1600), Qt::KeepAspectRatio).boundedTo(textureSize);
+  imageSize = QSize(qMax(1, imageSize.width()), qMax(1, imageSize.height()));
+  QJsonObject context =
+      ReplayLabAIResourceContext(m_Ctx, request.display.resourceId, "texture-viewer");
+  QJsonObject capture = captureBinding;
+  capture[QLatin1String("eventId")] = double(eventId);
+  capture[QLatin1String("selectedEventId")] = double(m_Ctx.CurSelectedEvent());
+  context[QLatin1String("capture")] = capture;
+  QJsonObject origin = context.value(QLatin1String("origin")).toObject();
+  origin[QLatin1String("kind")] = QLatin1String("rt-annotation");
+  context[QLatin1String("origin")] = origin;
+  QJsonObject resource = context.value(QLatin1String("resource")).toObject();
+  resource[QLatin1String("mip")] = double(request.display.subresource.mip);
+  resource[QLatin1String("slice")] = double(request.display.subresource.slice);
+  resource[QLatin1String("sample")] = double(request.display.subresource.sample);
+  context[QLatin1String("resource")] = resource;
+  QJsonObject annotation;
+  annotation[QLatin1String("schema")] = QLatin1String("replaylab-rt-annotation/v1");
+  annotation[QLatin1String("pairId")] = QUuid::createUuid().toString().mid(1, 36);
+  annotation[QLatin1String("coordinateSpace")] = QLatin1String("display-normalized-top-left");
+  annotation[QLatin1String("imageWidth")] = imageSize.width();
+  annotation[QLatin1String("imageHeight")] = imageSize.height();
+  annotation[QLatin1String("textureWidth")] = textureSize.width();
+  annotation[QLatin1String("textureHeight")] = textureSize.height();
+  annotation[QLatin1String("flipY")] = request.display.flipY;
+  annotation[QLatin1String("rangeMin")] = request.display.rangeMin;
+  annotation[QLatin1String("rangeMax")] = request.display.rangeMax;
+  annotation[QLatin1String("typeCast")] = ToQStr(request.display.typeCast);
+  annotation[QLatin1String("channels")] = QJsonArray(
+      {request.display.red, request.display.green, request.display.blue, request.display.alpha});
+  annotation[QLatin1String("overlay")] = ToQStr(request.display.overlay);
+  annotation[QLatin1String("customShaderId")] = ToQStr(request.display.customShaderId);
+  annotation[QLatin1String("decodeYUV")] = request.display.decodeYUV;
+  annotation[QLatin1String("linearDisplayAsGamma")] = request.display.linearDisplayAsGamma;
+  context[QLatin1String("annotation")] = annotation;
+  const QString title = tr("Annotate EID %1 | %2 | MIP %3, slice %4")
+                            .arg(eventId)
+                            .arg(m_Ctx.GetResourceName(request.display.resourceId))
+                            .arg(request.display.subresource.mip)
+                            .arg(request.display.subresource.slice);
+  QPointer<TextureViewer> self(this);
+  m_Ctx.Replay().AsyncInvoke([self, serial, request, eventId, imageSize, context, title, accept,
+                              error](IReplayController *r) {
+    QImage image;
+    QString diagnostic;
+    if(!self || !self->IsCurrentViewRequest(request) || r->GetCurrentEventID() != request.eventId)
+      diagnostic = tr("The texture changed while preparing the annotation. Click the brush again.");
+    else
+    {
+      TextureDisplay display = request.display;
+      display.scale = -1.0f;
+      display.xOffset = display.yOffset = 0;
+      const uint64_t generation = r->GetShaderReplacementGeneration(0);
+      IReplayOutput *output =
+          r->CreateOutput(CreateHeadlessWindowingData(imageSize.width(), imageSize.height()),
+                          ReplayOutputType::Texture);
+      if(output)
+      {
+        output->DisplayTextureAtEvent(eventId, display);
+        const bytebuf pixels = output->ReadbackOutputTexture();
+        if(pixels.size() == uint64_t(imageSize.width()) * imageSize.height() * 3 &&
+           r->GetShaderReplacementGeneration(0) == generation)
+          image = QImage(pixels.data(), imageSize.width(), imageSize.height(),
+                         imageSize.width() * 3, QImage::Format_RGB888)
+                      .copy();
+        output->Shutdown();
+      }
+      if(image.isNull())
+        diagnostic = tr("The render target image could not be read for annotation.");
+    }
+    GUIInvoke::call(qApp, [self, serial, request, image, context, title, accept, error, diagnostic]() {
+      if(!self || self->m_AIAnnotationSerial != serial)
+        return;
+      if(!diagnostic.isEmpty() || !self->IsCurrentViewRequest(request))
+      {
+        error(diagnostic.isEmpty()
+                  ? tr("The texture changed while preparing the annotation. Click the brush again.")
+                  : diagnostic);
+        return;
+      }
+      self->m_AIAnnotation = new AITextureAnnotation(
+          image, title, context, accept,
+          [self]() {
+            if(self)
+              self->CloseAIAnnotation();
+          },
+          self->m_AIAnnotationStack);
+      self->m_AIAnnotationStack->addWidget(self->m_AIAnnotation);
+      self->m_AIAnnotationStack->setCurrentWidget(self->m_AIAnnotation);
+    });
+  });
 }
 
 void TextureViewer::RT_UpdateVisualRange(IReplayController *r, const ViewRequest &request)
@@ -2301,6 +2493,7 @@ void TextureViewer::UI_UpdateChannels()
 #undef DISABLE
 
   m_TexDisplay.flipY = ui->flip_y->isChecked();
+  setProperty("textureDisplayFlipY", m_TexDisplay.flipY);
 
   QueueUpdateAndDisplay();
   QueueUpdateVisualRange();
@@ -3880,6 +4073,7 @@ void TextureViewer::OnCaptureLoaded()
 
 void TextureViewer::Reset()
 {
+  CloseAIAnnotation();
   m_TemporaryOutputFollowToken = 0;
   m_BeforeTemporaryOutputTab.clear();
   m_PresentationSuspended = false;

@@ -310,9 +310,10 @@ def save(capture_path, document, outline, artifact_root):
         return result
 
 
-def _load_at(folder, capture_path):
+def _load_at(folder, capture_path, pointer_override=None):
     capture_before = Path(capture_path).stat()
-    pointer = json.loads(_bounded(folder / "current.json", MAX_POINTER).decode("utf-8"))
+    pointer = (pointer_override if pointer_override is not None else
+               json.loads(_bounded(folder / "current.json", MAX_POINTER).decode("utf-8")))
     saved_fingerprint = pointer.get("capture")
     legacy = (isinstance(saved_fingerprint, dict) and saved_fingerprint.get("method") ==
               "size-mtime-sampled-sha256-and-action-outline/v1")
@@ -360,7 +361,7 @@ def _load_at(folder, capture_path):
         # reaches this branch and cannot be adopted merely from its outline.
         current_fingerprint = capture_fingerprint(capture_path)
     _check_capture_stat(Path(capture_path), capture_before)
-    if legacy and current_fingerprint.get("method") != saved_fingerprint.get("method"):
+    if pointer_override is None and legacy and current_fingerprint.get("method") != saved_fingerprint.get("method"):
         upgraded = dict(pointer, capture=current_fingerprint)
         payload = encoded(upgraded)
         if len(payload) > MAX_POINTER:
@@ -377,6 +378,42 @@ def load(capture_path, artifact_root):
         if (folder / "current.json").exists():
             return _load_at(folder, capture_path)
     return None
+
+
+def restore_revision(capture_path, artifact_root, revision):
+    """Restore a checked prior document without deleting the current revision."""
+    if not isinstance(revision,str) or not HEX64.match(revision):
+        raise ValueError('A content-addressed frame diagram revision is required')
+    current=load(capture_path,artifact_root)
+    if current is None:raise ValueError('No verified frame diagram bundle is available')
+    folder=Path(current['directory'])
+    old_pointer=_bounded(folder/'current.json',MAX_POINTER)
+    pointer=json.loads(old_pointer.decode('utf-8'))
+    raw=_bounded(folder/(revision+'.json'),MAX_DOCUMENT)
+    if hashlib.sha256(raw).hexdigest()!=revision:raise ValueError('Historical frame document changed')
+    document=json.loads(raw.decode('utf-8'));snapshot=document.get('snapshotId','')
+    if not isinstance(snapshot,str) or not HEX64.match(snapshot):raise ValueError('Invalid historical outline identity')
+    outline_raw=_bounded(folder/(snapshot+'.outline.json'),MAX_OUTLINE)
+    if hashlib.sha256(outline_raw).hexdigest()!=snapshot:raise ValueError('Historical frame outline changed')
+    outline=json.loads(outline_raw.decode('utf-8'))
+    if (outline_identity(outline)!=current['outlineIdentity'] or
+            os.path.normcase(os.path.abspath(document.get('capturePath','')))!=os.path.normcase(os.path.abspath(str(capture_path)))):
+        raise ValueError('Historical diagram does not match the current capture/action tree')
+    media={}
+    for owner,key,hash_key,suffix in _asset_fields(document):
+        relative=owner[key]
+        if not re.match(r'^media/[0-9a-f]{64}'+re.escape(suffix)+r'$',relative):raise ValueError('Invalid historical media path')
+        path=folder/relative;payload=_bounded(path,MAX_MEDIA)
+        digest=hashlib.sha256(payload).hexdigest()
+        if digest!=owner[hash_key]:raise ValueError('Historical frame media changed')
+        media[relative]={'sha256':digest,'byteSize':len(payload)}
+    proposed=dict(pointer,documentSha256=revision,outlineSha256=snapshot,media=media)
+    checked=_load_at(folder,capture_path,proposed)
+    _atomic(folder/(hashlib.sha256(old_pointer).hexdigest()+'.pointer.json'),old_pointer)
+    # Commit only after the historical document, outline and media all passed.
+    if _bounded(folder/'current.json',MAX_POINTER)!=old_pointer:raise ValueError('Current diagram changed during restoration')
+    _atomic(folder/'current.json',encoded(proposed))
+    return checked
 
 
 def rebind(bundle, current_outline):

@@ -57,7 +57,7 @@ def test_preflight_returns_all_stage_errors_and_publishes_a_patched_draft(setup,
                      investigation={"status": "done"}),
                stage(4, 4, outputOmissions=[omission, {**omission, "resourceId": 999},
                                             {**omission, "mip": 0}, {**omission, "mip": 0}])]
-    direct = json.loads(server.publish_frame_render_flow(flow, invalid))
+    direct = json.loads(server.publish_frame_render_flow(flow, invalid, publication_scope="frame"))
     first = json.loads(server.validate_frame_render_flow(flow, invalid, title="Example"))
     assert first["valid"] is False and first["issueCount"] == 7
     assert first["issues"] == direct["issues"]
@@ -76,7 +76,7 @@ def test_preflight_returns_all_stage_errors_and_publishes_a_patched_draft(setup,
     assert not calls and store.get(SESSION)["document"] is None
     assert store.get_draft(flow, first["draftId"])["stages"] == invalid
     monkeypatch.setattr(server, "_precache_frame_flow_channels", lambda *args: {})
-    published = json.loads(server.publish_frame_render_flow(flow, draft_id=fixed["draftId"], show_in_window=False))
+    published = json.loads(server.publish_frame_render_flow(flow, draft_id=fixed["draftId"], show_in_window=False, publication_scope="frame"))
     assert published["savedWithCapture"] is True and published["stageCount"] == 2, published
     assert [method for method, _ in calls] == ["save_frame_render_flow"]
     assert store.get(SESSION)["document"]["title"] == "Example"
@@ -218,7 +218,7 @@ def test_publish_window_receipt_and_exact_coverage(setup):
     calls, _ = setup
     prepared = json.loads(server.prepare_frame_render_flow())
     result = json.loads(server.publish_frame_render_flow(prepared["flowId"], [stage(1, 12001)],
-                                                       title="整帧渲染流程", summary="阶段解释"))
+                                                       title="整帧渲染流程", summary="阶段解释", publication_scope='frame'))
     assert "error" not in result, result
     assert result["saved"] and result["window"]["published"]
     assert result["savedWithCapture"] and result["persistence"]["portable"]
@@ -232,7 +232,7 @@ def test_publish_window_receipt_and_exact_coverage(setup):
 def test_window_failure_is_not_claimed_as_displayed(setup, monkeypatch):
     prepared = json.loads(server.prepare_frame_render_flow())
     monkeypatch.setattr(server.ipc, "call", lambda *args, **kwargs: {"error": "capture closed"})
-    result = json.loads(server.publish_frame_render_flow(prepared["flowId"], [stage(1, 12001)]))
+    result = json.loads(server.publish_frame_render_flow(prepared["flowId"], [stage(1, 12001)], publication_scope='frame'))
     assert result["saved"] and result["window"]["requested"]
     assert not result["window"]["published"]
     assert "capture closed" in result["window"]["error"]
@@ -247,7 +247,7 @@ def test_publication_explains_omitted_repeated_snapshot_graph_without_replay(set
              "edges": [{"from": "surface", "to": "lighting", "label": ""}]}
     proposal = stage(1, 12001, images=[{"manifestPath": str(manifest),
         "title": "Scene color", "description": "Accumulated scene illumination."}], processGraph=graph)
-    result = json.loads(server.publish_frame_render_flow(prepared["flowId"], [proposal], show_in_window=False))
+    result = json.loads(server.publish_frame_render_flow(prepared["flowId"], [proposal], show_in_window=False, publication_scope='frame'))
     assert "error" not in result, result
     assert result["saved"] and result["savedWithCapture"]
     assert result["presentation"] == [{"stageId": "stage-1", "kind": "processGraph",
@@ -260,7 +260,7 @@ def test_publication_explains_omitted_repeated_snapshot_graph_without_replay(set
 
 def test_published_diagram_restores_after_host_restart_without_bridge_replay(setup, monkeypatch):
     prepared = json.loads(server.prepare_frame_render_flow())
-    published = json.loads(server.publish_frame_render_flow(prepared["flowId"], [stage(1, 12001)], show_in_window=False))
+    published = json.loads(server.publish_frame_render_flow(prepared["flowId"], [stage(1, 12001)], show_in_window=False, publication_scope='frame'))
     assert published["saved"]
     monkeypatch.setattr(server, "_frame_render_flow_store", FrameRenderFlowStore())
     monkeypatch.setattr(server.ipc, "call", lambda *args, **kwargs: pytest.fail("Replay was invoked for a persisted diagram"))
@@ -276,7 +276,7 @@ def test_cross_capture_flow_cannot_publish(setup, monkeypatch):
     prepared = json.loads(server.prepare_frame_render_flow())
     monkeypatch.setattr(server, "_active_live_context", lambda **kwargs: {
         "capture": {"captureSessionId": "b" * 32, "path": "C:/captures/frame.rdc"}})
-    result = json.loads(server.publish_frame_render_flow(prepared["flowId"], [stage(1, 12001)]))
+    result = json.loads(server.publish_frame_render_flow(prepared["flowId"], [stage(1, 12001)], publication_scope='frame'))
     assert "error" in result and not result.get("saved")
 
 
@@ -287,7 +287,7 @@ def test_host_restart_keeps_requested_reanalysis_separate_from_saved_baseline(se
     ledger.begin_task_review(hashlib.sha256(b"regenerate this frame").hexdigest())
     monkeypatch.setattr(task_report, "current_task_report_store", lambda: ledger)
     prepared = json.loads(server.prepare_frame_render_flow())
-    old = json.loads(server.publish_frame_render_flow(prepared["flowId"], [stage(1, 12001)], show_in_window=False))
+    old = json.loads(server.publish_frame_render_flow(prepared["flowId"], [stage(1, 12001)], show_in_window=False, publication_scope='frame'))
     assert old["saved"]
     json.loads(server.prepare_frame_render_flow(reanalyze=True))
     if failed_first_publication:
@@ -394,7 +394,7 @@ def test_stage_inspection_rejects_flow_from_another_active_capture(setup, monkey
 def test_stage_inspection_refreshes_compact_inventory_restored_after_restart(setup, monkeypatch):
     prepared = json.loads(server.prepare_frame_render_flow())
     server._frame_render_flow_store.record_observation(SESSION, 12001, _stage_inspection())
-    saved = json.loads(server.publish_frame_render_flow(prepared["flowId"], [stage(1, 12001)], show_in_window=False))
+    saved = json.loads(server.publish_frame_render_flow(prepared["flowId"], [stage(1, 12001)], show_in_window=False, publication_scope='frame'))
     assert saved["saved"]
     monkeypatch.setattr(server, "_frame_render_flow_store", FrameRenderFlowStore())
     calls = []
@@ -432,13 +432,13 @@ def test_only_bound_managed_untampered_images_are_admitted(setup, tmp_path):
     prepared = json.loads(server.prepare_frame_render_flow())
     manifest, png = _evidence(tmp_path / "evidence")
     result = json.loads(server.publish_frame_render_flow(prepared["flowId"],
-        [stage(1, 12001, images=[{"manifestPath": str(manifest), "title": "Color output"}])], show_in_window=False))
+        [stage(1, 12001, images=[{"manifestPath": str(manifest), "title": "Color output"}])], show_in_window=False, publication_scope='frame'))
     assert "error" not in result, result
     document = json.loads(Path(result["documentPath"]).read_text(encoding="utf-8"))
     assert document["stages"][0]["images"][0]["resourceId"] == 2**48
     png.write_bytes(png.read_bytes() + b"tampered")
     changed = json.loads(server.publish_frame_render_flow(prepared["flowId"],
-        [stage(1, 12001, images=[{"manifestPath": str(manifest)}])]))
+        [stage(1, 12001, images=[{"manifestPath": str(manifest)}])], publication_scope='frame'))
     assert "error" in changed and not changed.get("saved")
 
 
@@ -446,7 +446,7 @@ def test_wrong_session_image_is_rejected(setup, tmp_path):
     prepared = json.loads(server.prepare_frame_render_flow())
     manifest, _ = _evidence(tmp_path / "evidence", session="d" * 32)
     result = json.loads(server.publish_frame_render_flow(prepared["flowId"],
-        [stage(1, 12001, images=[{"manifestPath": str(manifest)}])]))
+        [stage(1, 12001, images=[{"manifestPath": str(manifest)}])], publication_scope='frame'))
     assert "different capture" in result["error"]
 
 
@@ -457,7 +457,7 @@ def test_verified_uav_image_preserves_shader_stage(setup, tmp_path):
     payload["artifact"]["attachment"].update(kind="uav", stage="compute")
     manifest.write_text(json.dumps(payload), encoding="utf-8")
     result = json.loads(server.publish_frame_render_flow(prepared["flowId"],
-        [stage(1, 12001, images=[{"manifestPath": str(manifest)}])], show_in_window=False))
+        [stage(1, 12001, images=[{"manifestPath": str(manifest)}])], show_in_window=False, publication_scope='frame'))
     assert "error" not in result, result
     document = json.loads(Path(result["documentPath"]).read_text(encoding="utf-8"))
     image = document["stages"][0]["images"][0]
@@ -468,7 +468,7 @@ def test_verified_uav_image_preserves_shader_stage(setup, tmp_path):
 def test_publication_reports_corrected_navigation_and_quality_not_just_coverage(setup):
     prepared = json.loads(server.prepare_frame_render_flow())
     result = json.loads(server.publish_frame_render_flow(prepared["flowId"],
-        [stage(1, 12001, representativeEventId=1)], show_in_window=False))
+        [stage(1, 12001, representativeEventId=1)], show_in_window=False, publication_scope='frame'))
     assert result["coverage"]["complete"]
     assert not result["quality"]["analysisComplete"]
     assert result["navigationCorrections"] == [{"stageId": "stage-1", "requestedEventId": 1,
@@ -510,7 +510,7 @@ def test_v2_annotations_inventory_and_comparisons_survive_host_restart(setup, mo
                  "description": "A reference view for comparing the visible lighting."}],
         comparisons=[{"leftImageIndex": 0, "rightImageIndex": 1, "label": "Reference comparison", "relationship": "reference"}],
         processSteps=process, outputOmissions=[omission], algorithm=algorithm)
-    saved = json.loads(server.publish_frame_render_flow(prepared["flowId"], [proposal], show_in_window=False))
+    saved = json.loads(server.publish_frame_render_flow(prepared["flowId"], [proposal], show_in_window=False, publication_scope='frame'))
     assert "error" not in saved, saved
     assert saved["quality"]["analysisComplete"]
     monkeypatch.setattr(server, "_frame_render_flow_store", FrameRenderFlowStore())
@@ -533,7 +533,7 @@ def test_v2_annotations_inventory_and_comparisons_survive_host_restart(setup, mo
 
 def test_legacy_v1_diagram_is_upgraded_with_quality_findings(setup, monkeypatch):
     prepared = json.loads(server.prepare_frame_render_flow())
-    saved = json.loads(server.publish_frame_render_flow(prepared["flowId"], [stage(1, 12001)], show_in_window=False))
+    saved = json.loads(server.publish_frame_render_flow(prepared["flowId"], [stage(1, 12001)], show_in_window=False, publication_scope='frame'))
     path = Path(saved["documentPath"])
     document = json.loads(path.read_text(encoding="utf-8"))
     document["schemaVersion"] = 1
@@ -566,7 +566,7 @@ def test_incomplete_binding_inventory_stays_incomplete_after_restart(setup, monk
                  "channelMeaning": "RGB stores direct light; A is not read by the next composition shader.",
                  "evidence": "The producing PS writes diffuse illumination to xyz and composition samples xyz.",
                  "description": "Direct lighting color before final composition."}])
-    saved = json.loads(server.publish_frame_render_flow(prepared["flowId"], [proposal], show_in_window=False))
+    saved = json.loads(server.publish_frame_render_flow(prepared["flowId"], [proposal], show_in_window=False, publication_scope='frame'))
     assert saved["saved"] and not saved["quality"]["analysisComplete"]
     monkeypatch.setattr(server, "_frame_render_flow_store", FrameRenderFlowStore())
     restored = json.loads(server.get_frame_render_flow(prepared["flowId"]))
@@ -582,7 +582,7 @@ def test_portable_restore_is_adopted_without_reexporting_images(setup, monkeypat
     saved = json.loads(server.publish_frame_render_flow(prepared["flowId"],
         [stage(1, 12001, images=[{"manifestPath": str(manifest), "description": "Scene color before tone mapping.",
                                 "presentation": "detail"}])],
-        show_in_window=False))
+        show_in_window=False, publication_scope='frame'))
     document = json.loads(Path(saved["documentPath"]).read_text(encoding="utf-8"))
     data = server._frame_render_flow_store.get(SESSION)["outline"]
     new_session = "b" * 32
@@ -614,7 +614,7 @@ def test_portable_restore_is_adopted_without_reexporting_images(setup, monkeypat
     assert restored["items"][0]["images"][0]["presentation"] == "detail"
     republished = json.loads(server.publish_frame_render_flow(record["flowId"],
         [stage(1, 12001, images=[{"manifestPath": str(manifest), "description": "Reused captured scene color."}])],
-        show_in_window=False))
+        show_in_window=False, publication_scope='frame'))
     assert republished["savedWithCapture"] and republished["imageCount"] == 1
     assert calls == ["get_saved_frame_render_flow", "save_frame_render_flow"]
 
@@ -623,7 +623,7 @@ def test_corrupt_same_session_media_cannot_restore_from_a_valid_document_hash(se
     prepared = json.loads(server.prepare_frame_render_flow())
     manifest, _ = _evidence(tmp_path / "evidence", event=12001)
     saved = json.loads(server.publish_frame_render_flow(prepared["flowId"],
-        [stage(1, 12001, images=[{"manifestPath": str(manifest)}])], show_in_window=False))
+        [stage(1, 12001, images=[{"manifestPath": str(manifest)}])], show_in_window=False, publication_scope='frame'))
     document = json.loads(Path(saved["documentPath"]).read_text(encoding="utf-8"))
     Path(document["stages"][0]["images"][0]["path"]).write_bytes(b"changed preview")
     monkeypatch.setattr(server, "_frame_render_flow_store", FrameRenderFlowStore())

@@ -3,7 +3,7 @@ name: renderdoc-shader-workbench
 description: Investigate a captured Shader or reorganize its source into readable calculations and interfaces, with Bread Shader Workspace delivery and validated replay replacement.
 metadata:
   replaylab-category: shader
-  replaylab-version: "121"
+  replaylab-version: "122"
 ---
 
 # Shader workbench
@@ -31,6 +31,9 @@ and prior receipts with read tools. Do not start a new organization draft merely
 to explain those facts, or silently turn that explanation into another rewrite.
 For explanations, use language-tagged code blocks and links to the actual saved
 source as described in [source-operations.md](references/source-operations.md).
+Choose visual evidence and interactive algorithm examples using the event Skill's
+visual-explanations.md reference. A preview example does not validate this Shader
+or replace a requested debugger/Unity delivery.
 
 Asset matching is optional when no usable unpacked assets are configured;
 unknown names do not block organization. Shader organization is independent of the source engine. Use

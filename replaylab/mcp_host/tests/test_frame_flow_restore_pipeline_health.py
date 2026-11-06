@@ -117,11 +117,11 @@ def test_publication_remembers_only_native_fatal_and_retains_saved_media(setup, 
         return {"attempted": 1, "prepared": 0, "failed": 1, "complete": False,
                 "errors": [{"parent": "stage-1:0", "errors": [{"error": message}]}]}
     monkeypatch.setattr(server, "_precache_frame_flow_channels", precache)
-    first = json.loads(server.publish_frame_render_flow(prepared["flowId"], [proposal], show_in_window=False))
+    first = json.loads(server.publish_frame_render_flow(prepared["flowId"], [proposal], show_in_window=False, publication_scope='frame'))
     assert first["saved"] and not first["channelCache"]["complete"]
     record = server._frame_render_flow_store.get(SESSION)
     assert bool(record.get("replayUnavailable")) is fatal
-    second = json.loads(server.publish_frame_render_flow(prepared["flowId"], [proposal], show_in_window=False))
+    second = json.loads(server.publish_frame_render_flow(prepared["flowId"], [proposal], show_in_window=False, publication_scope='frame'))
     assert second["saved"] and second["savedWithCapture"]
     assert len(calls) == (1 if fatal else 2)
     if fatal:

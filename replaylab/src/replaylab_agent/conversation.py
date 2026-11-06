@@ -88,6 +88,116 @@ ATTACHMENT_REFERENCE_BOUNDARY = (
     "available, read_shader_workspace_file resolves it and reports the observed SHA-256. "
     "Attachment titles and summaries are context, not a replacement for reading relevant code."
 )
+RT_ANNOTATION_GUIDANCE = (
+    "RT annotations pair an original image with an annotated image by annotation.pairId. "
+    "Use the original for scene/color detail and the overlay plus user wording for intent. "
+    "The clean original can be hidden in chat but is still provided; the annotated image "
+    "shows the final visible ink. Structured strokes give exact tools, RGB hex colors and "
+    "coordinates, so no image-difference guessing is needed to locate marks. Resolve wording "
+    "such as 'inside the blue circle' and 'where the red arrow points' using each mark's "
+    "color AND shape/direction. Ink color is an identifier, not the surface's material or "
+    "lighting color: inspect the clean original for the latter. Different colors do not "
+    "automatically mean cause/effect or different importance. Keep separately referenced "
+    "targets distinct and compare them when requested. Strokes are ordered overlay actions: "
+    "an eraser clears only earlier ink within its swept diameter (width times imageWidth), "
+    "never captured pixels; ignore its color and any fully erased marks. Later drawing can "
+    "cover an erased area again. Use the annotated image to check which marks remain visible; "
+    "A circle/closed pen stroke usually indicates its interior; an arrow points to its LAST "
+    "point, not its tail or the entire stroke bounds. Other scribbles are approximate hints, "
+    "not segmentation masks or exact pixel selections. Inspect nearby unmarked context too. "
+    "An irregular freehand loop, including a small closing gap, usually indicates a rough "
+    "region, not the ink itself; use the original image and question to identify the object, "
+    "surface or effect inside it. Do not require a perfect circle or exact contour. "
+    "First ground the user's referent against the scene: distinguish a marked object from "
+    "an effect/color on it, use the question and visible remaining marks to choose plausible "
+    "targets, and verify the chosen surface in related RTs before explaining it. Do not stop "
+    "at a plausible semantic guess or the first matching pass. If evidence instead locates "
+    "a different surface or effect, revise and check again. Follow actual resource reads "
+    "and writes beyond the marked bounds when reflections, screen-space effects, lighting "
+    "or filters can import contributions from elsewhere. Establish that connection from "
+    "sampling/calculations and observed change, not mere proximity. Stop when the referent "
+    "and important causes have adequate evidence; state remaining ambiguity briefly rather "
+    "than promising certainty or searching indefinitely. "
+    "A local object/color question does not request a whole-frame rendering diagram, "
+    "pass reorganization, a published report or an editable Shader workspace. Keep work "
+    "focused on the marked targets and the dependencies that can affect them; do not "
+    "create those extra deliverables just to satisfy a generic review/outline workflow. "
+    "Reuse verified observations within this investigation. Once the referent and main "
+    "causes are supported, answer with the conclusion, a few decisive facts and links, "
+    "keeping raw tool dumps and investigation housekeeping out of the reply. "
+    "Coordinates are normalized to the full displayed image, top-left origin. Convert to the "
+    "selected mip's texels with textureWidth/textureHeight, clamp to valid texels, and invert "
+    "Y when flipY is true; do not treat imageWidth/imageHeight as native RT dimensions. "
+    "That conversion locates the observation RT only. When tracing to another RT, derive "
+    "its coordinates from the actual sampling UVs, viewport, dimensions and subresource. "
+    "A fullscreen copy can flip, scale or crop the image; do not reuse the same texel across "
+    "resources without checking that mapping. Verify the mapped point still lies on the "
+    "intended surface in the intermediate image before attributing an earlier draw. "
+    "Before naming a geometry draw as the object's owner, verify that draw actually changes "
+    "the indicated object using before/after RT views or a correctly mapped fragment and "
+    "geometry footprint. A passed background fragment at an unverified coordinate is not "
+    "object ownership. Resource usage lists possible writers, not pixel coverage. A draw "
+    "bound to the marked RT may only cover an unrelated UI widget elsewhere. Do not select "
+    "an owner from the last resource writer alone. If ownership has not been verified at "
+    "the indicated region, say it remains unresolved rather than assert a specific draw. "
+    "Treat early target ownership and color-cause rankings as provisional hypotheses. "
+    "Cross-check the evidence that distinguishes the plausible alternatives: depth and "
+    "stencil explain occlusion; transformed mesh shape and coverage locate geometry; "
+    "texture contents, normals, masks and Shader calculations explain the material; "
+    "blend state, attachment versions and pass dependencies explain composition. "
+    "Choose relevant dimensions rather than mechanically querying every source. "
+    "When deeper inspection contradicts an earlier interpretation, revise the target EID, "
+    "object/effect interpretation or cause ranking instead of defending the first guess. "
+    "Briefly state a material correction and the decisive observed evidence; keep remaining "
+    "uncertainty explicit. A successful depth test, a bound texture or a plausible mesh alone "
+    "does not establish visible contribution after blending and later writes. "
+    "Use capture_draw_image with inline=true to actually see relevant "
+    "intermediate views; a returned PNG path or receipt alone is not visual inspection. "
+    "Display channels, range, gamma, overlays and custom shaders may alter visible colors. "
+    "Use the attachment's capture session, EID, resource, mip, slice and sample even if the "
+    "current UI selection has changed; verify this historical candidate against Host evidence. "
+    "Infer whether request.content asks about object geometry/material draws, regional color "
+    "from lighting/blending/post-processing, or another effect. Briefly state your interpretation "
+    "and investigate with resource usage, relevant draw/dispatch/shader inputs and outputs, "
+    "and representative pixel history where supported. The annotated EID is an observation "
+    "point, not proof that it drew the object or caused its color. Follow preceding producers "
+    "and later compositing as needed. Distinguish observed facts from inference; only ask a "
+    "focused clarification if materially different interpretations remain. Answer concisely "
+    "with the responsible EIDs/stages and evidence. For a question like 'why is this blue' or "
+    "'why does this look like that', lead with the understood region and the most important "
+    "supported cause, followed by at most a few secondary influences. Rank causes by their "
+    "observed effect on this region, not EID order, names or visual proximity. "
+    "For a causal color question, 'the B channel is higher' only describes the appearance; "
+    "it does not explain its origin. A copy/blit that passes through an already colored "
+    "input only transports that color. A shared final pass proves neither a shared material "
+    "nor the same underlying cause. Do not use that as a causal conclusion: follow the "
+    "actual upstream producers and distinguish the material, illumination, reflection or "
+    "filter contributions at the intended surfaces. When comparing marked regions, verify "
+    "each one's causes independently before saying they are the same. If only an unverified "
+    "writer/material candidate is known, continue available targeted views, Shader calculations, "
+    "pixel debugging or a suitable bounded comparison instead of finishing with a generic "
+    "RGB description. A concise final answer does not mean a shallow investigation. "
+    "Before finishing, check that the answer explains why, rather than merely where the "
+    "final color was copied or what its channels contain. Trace multiple "
+    "passes as needed: geometry/material color, direct or indirect lighting, reflections, "
+    "emissive spill/Bloom and final composition can contribute differently. These are possible "
+    "causes, not a required checklist or assumed technologies. Test the user's suggested cause "
+    "rather than accepting it: nearby UI or a bright object is not automatically a light source. "
+    "Use representative interior pixels and a nearby control, matched intermediate views, "
+    "shader reads/calculations, blend state and actual resource versions to support the ranking. "
+    "For nonlinear composition, do not invent percentage attribution or equate a coefficient "
+    "with perceptual importance. If the evidence cannot rank two causes, state that uncertainty "
+    "briefly instead of presenting a guessed order. Distinguish a bound or sampled resource "
+    "from an observed contribution at the marked pixels. Give clickable rdoc://event/<EID> "
+    "links for the decisive events; use verified workspace/source links when available. "
+    "For an ordinary why/how question, explain a concrete parameter or A/B check the user "
+    "can try without silently changing replay. When the user also asks for editable Shader "
+    "debugging or organization, load the Shader workbench Skill and deliver the most relevant "
+    "captured target through its supported source, review and validation route, preserving "
+    "existing user source. Only claim editability, replacement or live debugging when its "
+    "corresponding receipt confirms it. Drawing alone never authorizes edits."
+)
+ATTACHMENT_REFERENCE_BOUNDARY += " " + RT_ANNOTATION_GUIDANCE
 LEGACY_CONVERSATION_PREFIX = (
     "Continue this Bread AI conversation. Treat the final USER block as the "
     "new request; earlier blocks are conversation history, not tool evidence.\n\n"
@@ -244,6 +354,7 @@ class AttachmentOrigin(BaseModel):
         "chat-selection", "shader-selection", "shader-source-selection",
         "shader-disassembly-selection", "shader-workspace", "pipeline-state", "resource-selection",
         "file-picker", "clipboard-file", "clipboard-image", "drag-drop", "other",
+        "rt-annotation",
     ]
     panel: str = Field(min_length=1, max_length=128)
     source_id: str = Field(default="", alias="sourceId", max_length=512)
@@ -364,6 +475,55 @@ class AttachmentResourceContext(BaseModel):
         return self
 
 
+class AttachmentAnnotationStroke(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    tool: Literal["pen", "ellipse", "arrow", "eraser"]
+    color: str = Field(pattern=r"^#[0-9a-fA-F]{6}$")
+    width: float = Field(gt=0, le=1.0, allow_inf_nan=False)
+    points: list[list[float]] = Field(min_length=2, max_length=256)
+
+    @model_validator(mode="after")
+    def validate_points(self) -> "AttachmentAnnotationStroke":
+        if self.tool in {"ellipse", "arrow"} and len(self.points) != 2:
+            raise ValueError("ellipse and arrow marks require exactly two points")
+        if self.tool != "eraser" and self.width > 0.1:
+            raise ValueError("drawing marks exceed the maximum line width")
+        if any(len(point) != 2 or any(not 0 <= component <= 1 for component in point)
+               for point in self.points):
+            raise ValueError("annotation points must be finite normalized image coordinates")
+        return self
+
+
+class AttachmentRTAnnotation(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True, populate_by_name=True)
+
+    schema_id: Literal["replaylab-rt-annotation/v1"] = Field(alias="schema")
+    pair_id: str = Field(alias="pairId", pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+    image_role: Literal["original", "annotated"] = Field(alias="imageRole")
+    coordinate_space: Literal["display-normalized-top-left"] = Field(alias="coordinateSpace")
+    image_width: int = Field(alias="imageWidth", ge=1, le=1600)
+    image_height: int = Field(alias="imageHeight", ge=1, le=1600)
+    texture_width: int = Field(alias="textureWidth", ge=1, le=0xFFFFFFFF)
+    texture_height: int = Field(alias="textureHeight", ge=1, le=0xFFFFFFFF)
+    flip_y: bool = Field(alias="flipY")
+    range_min: float = Field(alias="rangeMin", allow_inf_nan=False)
+    range_max: float = Field(alias="rangeMax", allow_inf_nan=False)
+    type_cast: str = Field(alias="typeCast", max_length=64)
+    channels: list[bool] = Field(min_length=4, max_length=4)
+    overlay: str = Field(max_length=128)
+    custom_shader_id: str = Field(alias="customShaderId", max_length=128)
+    decode_yuv: bool = Field(alias="decodeYUV")
+    linear_display_as_gamma: bool = Field(alias="linearDisplayAsGamma")
+    strokes: list[AttachmentAnnotationStroke] = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_budget(self) -> "AttachmentRTAnnotation":
+        if sum(len(stroke.points) for stroke in self.strokes) > 1024:
+            raise ValueError("annotation exceeds the total point budget")
+        return self
+
+
 class AttachmentContext(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True, populate_by_name=True)
 
@@ -372,10 +532,17 @@ class AttachmentContext(BaseModel):
     capture: AttachmentCaptureContext | None = None
     shader: AttachmentShaderContext | None = None
     resource: AttachmentResourceContext | None = None
+    annotation: AttachmentRTAnnotation | None = None
     relations: list[AttachmentRelation] = Field(default_factory=list, max_length=16)
 
     @model_validator(mode="after")
     def validate_context(self) -> "AttachmentContext":
+        if self.annotation is not None and (
+            self.capture is None or not self.capture.capture_session_id or not self.capture.event_id
+            or self.resource is None or self.resource.kind != "texture"
+            or self.origin is None or self.origin.kind != "rt-annotation"
+        ):
+            raise ValueError("RT annotations require a pinned capture session, EID and texture")
         if self.origin is None and self.capture is None and self.shader is None and self.resource is None and not self.relations:
             raise ValueError("attachment context must contain provenance or relations")
         ids = [relation.id for relation in self.relations]
@@ -404,6 +571,8 @@ class ConversationAttachment(BaseModel):
 
     @model_validator(mode="after")
     def validate_reference(self) -> "ConversationAttachment":
+        if self.context is not None and self.context.annotation is not None and self.kind != "image":
+            raise ValueError("RT annotations must be image attachments")
         _bounded_single_line(self.title, "title", 512)
         _bounded_single_line(self.source, "source", 32 * 1024)
         essence = _media_type_essence(self.media_type)
@@ -1017,6 +1186,27 @@ def prepare_provider_conversation_input(
     native_binaries = tuple(item for item in binaries if supported(item))
     native_paths = tuple(paths) if native_path_references else ()
     binary_ids = frozenset(item.id for item in native_binaries)
+    if is_typed:
+        annotation_pairs: dict[str, list[ConversationAttachment]] = {}
+        for item in envelope.request.attachments:
+            if item.context is not None and item.context.annotation is not None:
+                annotation_pairs.setdefault(item.context.annotation.pair_id, []).append(item)
+        for pair in annotation_pairs.values():
+            if len(pair) != 2 or {item.context.annotation.image_role for item in pair} != {"original", "annotated"}:
+                raise ConfigurationError("Keep both the original and marked render target images, or remove the annotation.")
+            contexts = [item.context.model_dump(by_alias=True, exclude_none=True) for item in pair]
+            for context in contexts:
+                context["annotation"].pop("imageRole")
+            if contexts[0] != contexts[1]:
+                raise ConfigurationError("The render target annotation images have different capture or drawing metadata.")
+    if is_typed and any(
+        item.context is not None and item.context.annotation is not None and item.id not in binary_ids
+        for item in envelope.request.attachments
+    ):
+        raise ConfigurationError(
+            "Render target annotations require image input. Select a vision-capable model "
+            "and enable image input for this connection, or remove the annotations."
+        )
     path_ids = frozenset(item.id for item in native_paths)
     path_identities = {item.id: item.identity_sha256 for item in paths}
     metadata_only: list[str] = []
@@ -1278,6 +1468,7 @@ def resolve_context_spec(
 
 __all__ = [
     "ATTACHMENT_REFERENCE_BOUNDARY",
+    "RT_ANNOTATION_GUIDANCE",
     "AttachmentCaptureContext",
     "AttachmentContext",
     "AttachmentOrigin",

@@ -3,7 +3,7 @@ name: renderdoc-explain-event
 description: Explain a RenderDoc EID, pass, or frame from captured evidence; create clickable frame rendering diagrams in Bread, investigate missing output, or organize passes.
 metadata:
   replaylab-category: event-pipeline
-  replaylab-version: "30"
+  replaylab-version: "31"
 ---
 
 # Explain captured events
@@ -12,8 +12,32 @@ The Agent chooses the scope, tools and presentation for the current capture;
 never inherit another capture's EIDs or conclusions.
 No required phase prefix.
 
-Use `prepare_frame_render_flow` and `get_frame_render_flow` for the bound outline,
-then `publish_frame_render_flow` for Bread's Frame Rendering Flow window. Read
+For annotated/chat questions, read [visual-explanations.md](references/visual-explanations.md)
+to choose images, code, local graphs and interactive meshes according to the user's
+actual purpose, including vertex/compute debugging and Unity restoration.
+
+For a local object/color/algorithm/effect question, use `publish_visual_reply` for
+chat-local images, comparisons and a small multi-pass diagram with RT thumbnails,
+calculation notes and evidenced arrows. Its expanded viewer is independent. Never
+replace the global Frame Rendering Flow or its capture sidecar for a local explanation.
+Show important algorithms as language-tagged code blocks or saved-source code cards,
+with exact Shader Workspace line links. Use `get_cbuffer_parameter_link` for reflected
+parameter/component links. Keep annotation coordinates tied to their output EID/RT and
+display orientation. A flipped earlier HDR target is not the same image basis as the
+final presentation. Verify the full and ROI pictures actually contain the marked target;
+never interpret a background ROI as evidence that an effect is inactive. Prefer observing
+the annotated final output; map coordinates explicitly before using a different RT.
+Establish a cause with `run_shader_effect_experiment`
+where supported: same output event/region, unchanged-source baseline control, stable
+A/B/A, physical ABI checks and confirmed restoration. Publish its exact image pair
+and experimentReceipt for a verified slider. Different EIDs only compare stages.
+Rank the main observed causes; briefly mention a relevant disabled/low-impact
+mechanism with evidence, without presenting it as this frame's active contribution.
+Material/specular color, lighting and post effects can overlap; revise a hypothesis
+when depth, meshes, resource usage, mathematics or controlled results contradict it.
+
+Only for an explicitly requested whole-frame diagram, use `prepare_frame_render_flow` and `get_frame_render_flow` for the bound outline,
+then `publish_frame_render_flow(publication_scope='frame')` for Bread's Frame Rendering Flow window. Read
 [references/frame-rendering-flow.md](references/frame-rendering-flow.md) for
 grouping, images and navigation, and
 [references/algorithm-investigation.md](references/algorithm-investigation.md)

@@ -29406,11 +29406,18 @@ def validate_frame_render_flow(flow_id: str, stages: list[dict[str, Any]] | None
 @mcp.tool()
 def publish_frame_render_flow(flow_id: str, stages: list[dict[str, Any]] | None = None,
                               title: str = "", summary: str = "", show_in_window: bool = True,
-                              draft_id: str = "") -> str:
+                              draft_id: str = "",
+                              publication_scope: Literal["explanation", "frame"] = "explanation") -> str:
     """Save an AI-explained frame diagram and show it in the native dock window.
 
     Prefer validate_frame_render_flow and publish its draft_id without resending
     stages, title or summary. Existing callers may still pass proposals directly.
+
+    Only an explicitly requested WHOLE-FRAME diagram uses publication_scope='frame'.
+    The default 'explanation' refuses global publication before any write. For a
+    local object, color, algorithm or multi-pass effect, use publish_visual_reply
+    diagram nodes with RT images instead: these open in their own chat viewer and
+    never replace the Frame Rendering Flow document or capture companion bundle.
 
     Each stage has title, summary, confidence (captured/inferred/unknown), real
     startEventId/endEventId bounds, category (depth/shadow/geometry/lighting/
@@ -29500,6 +29507,9 @@ def publish_frame_render_flow(flow_id: str, stages: list[dict[str, Any]] | None 
     it restores and opens automatically on the next capture load.
     """
     try:
+        if publication_scope != 'frame':
+            raise ValueError("Local effect explanations belong in publish_visual_reply, type='diagram'. "
+                             "Frame publication requires publication_scope='frame' for an explicitly requested whole-frame analysis. No frame diagram was changed.")
         show_in_window = _strict_bool(show_in_window, "show_in_window")
         context, record = _frame_render_flow_record(flow_id)
         if draft_id:
@@ -33067,6 +33077,227 @@ def get_draw_workflow_plan(
 from .unity_restoration_tools import register_tools as _register_unity_restoration_tools
 import sys as _unity_restoration_sys
 globals().update(_register_unity_restoration_tools(mcp, _unity_restoration_sys.modules[__name__]))
+
+from .effect_experiments import ExactSourceEdit, RelatedVertexEdit
+from .visual_replies import Card as VisualReplyCard
+
+
+@mcp.tool()
+def inspect_vertex_effect_scope(event_id: int, observation_event_id: int) -> str:
+    """Find related geometry/depth draws before editing a vertex calculation.
+
+    Checks shared vertex/index ranges and exact position/connectivity across
+    duplicate buffers. Review roles, instance and bindings before coordinating
+    edits. It does not prove matches across remeshing/position encodings.
+    """
+    try:
+        return _ok(ipc.call('inspect_vertex_effect_scope', dict(event_id=event_id,
+                            observation_event_id=observation_event_id), timeout=120))
+    except Exception as error:
+        return _err(error)
+
+
+@mcp.tool(structured_output=False)
+def run_shader_effect_experiment(workspace_path: str, expected_source_sha256: str,
+        edits: list[ExactSourceEdit], observation_event_id: int, attachment_index: int=0,
+        roi: list[float] | None=None, flip_y: bool=False, label: str='',
+        related_edits: list[RelatedVertexEdit] | None=None) -> list[Any]:
+    """Test a focused Shader calculation with a restored, controlled A/B/A replay.
+
+    Source stays unchanged. edits are exact unique {old_text,new_text} spans in
+    current saved source (LF/CRLF are normalized in the temporary compile unit).
+    Supports vertex or fragment workspaces with read-only Shader storage. For
+    compute/writable storage use the debug/resource tools; do not invent a toggle.
+    attachment_index is ZERO based; Present has one destination at index 0.
+    A stale managed toolchain binding is refreshed through
+    its supported source-preserving, provenance-archiving migration. Change only
+    the investigated term/branch. First the
+    unchanged source is compiled and compared to original captured output at the
+    SAME observation_event_id. Only a stable matching control permits the trial.
+    Then the changed source is compiled, physical ABI checked and compared at that
+    output event, repeating A to check stability. Replacement is temporary and
+    shared across uses of the original Shader; preserve that scope in conclusions.
+    For vertex motion, inspect_vertex_effect_scope finds related depth/color draws.
+    Identical VS bytes can share a trial across the verified related resources.
+    Different VS calculations require related_edits with their verified workspace,
+    source hash and exact edits. The baseline and trial switch together.
+    The exact previous replacement and visible event are restored in finally.
+    If constant folding removes physical bindings, use a verified runtime-uniform
+    gate to suppress the term for these captured inputs while retaining resources.
+    Use a same-or-later real draw's RTV or Present destination; roi=[left,top,right,bottom] is normalized
+    to the saved image. flip_y applies equally to both images and ROI orientation.
+    Standard display mapping is RGB 0..1. Fixed full-output raw numeric metrics
+    and region metrics are retained. 'no-observed-change' means no effect in this
+    tested region/input, not proof that an algorithm never matters. Failed compile,
+    ABI, baseline control or stability is a real limit, never causal confirmation.
+    Return images plus receiptPath; publish_visual_reply compare with exactly
+    these path sources and experimentReceipt=receiptPath provides the slider.
+    """
+    try:
+        from .effect_experiments import run, model_previews
+        import sys
+        changes=[e.model_dump()if isinstance(e,ExactSourceEdit)else e for e in edits]
+        result=run(sys.modules[__name__],workspace_path,expected_source_sha256,changes,
+            observation_event_id,attachment_index,roi,flip_y,label,
+            [e.model_dump() if isinstance(e, RelatedVertexEdit) else e for e in (related_edits or [])])
+        # Paths alone do not deliver pixels to API/subscription models.
+        blocks=[_ok_compact(result)]
+        for preview in model_previews(result):
+            blocks.extend(_saved_image_result(preview,True))
+        return blocks
+    except Exception as error:return [_err(error)]
+
+
+@mcp.tool()
+def get_cbuffer_parameter_link(event_id: int, constant_block_index: int, variable_path: str,
+                               stage: str = 'fragment', array_index: int = 0) -> str:
+    """Create a clickable rdoc://cbuffer link to an actual reflected scalar/vector.
+
+    Supply the exact reflected variable path, optionally with .x/.y/.z/.w.
+    Names and offsets are resolved from this EID's actual reflection. Invalid
+    names return field choices instead of guessing. Clicking opens the bound
+    CBuffer, selects the leaf/component and exposes its existing live controls.
+    This tool reads only; it never edits a parameter or changes the selected EID.
+    """
+    try:
+        from .visual_replies import save_navigation_target
+        context=json.loads(get_current_renderdoc_context())
+        observed=ipc.call('get_cbuffer_navigation_target',dict(event_id=event_id,
+            block_index=constant_block_index,stage=stage,array_index=array_index,variable_path=variable_path),timeout=60)
+        if not isinstance(observed,dict) or not observed.get('target'):return _ok(observed)
+        result=save_navigation_target(observed['target'],context.get('capture') or {})
+        result['markdown']='['+variable_path.replace(']','')+']('+result['url']+')'
+        result['applied']=False
+        return _ok(result)
+    except Exception as error:return _err(error)
+
+
+@mcp.tool()
+def get_mesh_uv_link(event_id: int, stage: str='vs-in',
+                     channel: str='', pair: int=0, texture_resource_id: int=0) -> str:
+    """Link to a verified mesh stage and UV channel, optionally with a bound 2D texture.
+
+    An empty channel selects the native UV default. Use pair 0 for XY, 1 for ZW.
+    Invalid choices return the captured channels and bound texture IDs.
+    """
+    try:
+        from .visual_replies import save_navigation_target
+        context = json.loads(get_current_renderdoc_context())
+        observed = ipc.call('get_mesh_uv_navigation_target', dict(event_id=event_id, stage=stage,
+            channel=channel, pair=pair, texture_resource_id=texture_resource_id), timeout=60)
+        if not observed.get('target'):
+            return _ok(observed)
+        return _ok(save_navigation_target(observed['target'], context.get('capture') or {}))
+    except Exception as error:
+        return _err(error)
+
+
+@mcp.tool()
+def publish_visual_reply(title: str, cards: list[VisualReplyCard]) -> str:
+    """Attach a compact interactive visual explanation to this chat answer.
+
+    Use 1..6 focused cards, then give a short text conclusion. All fixed UI labels
+    are localized; write titles/captions/annotation text in the user's language.
+    No replay, Shader or material is changed. The UI receives durable verified
+    assets, not arbitrary HTML/image URLs. The reply survives capture closure.
+
+    Image: {type:'image',title:'...',image:{eventId:1296,attachmentKind:'rtv',
+    attachmentIndex:0,flipY:false,rangeMode:'native'},annotations:[{type:'arrow',
+    points:[[.8,.2],[.5,.5]],color:'#ff4050',text:'...'}]}.
+    Sources may instead use {path:'absolute Host-produced image file'}; those are
+    labelled reference images, not claimed captured originals. Mip/slice/sample,
+    channel and explicit blackPoint/whitePoint are available on captured sources.
+    Omit flipY to inherit the matching selected RT's orientation; true flips the
+    source once, including reference files. Inspect alignment before publishing.
+
+    Compare: {type:'compare',title:'...',image:{eventId:...},secondImage:{eventId:...},
+    beforeLabel:'...',afterLabel:'...'}. Supports A/B, wipe and side by side. Two
+    different EIDs compare stages; they do NOT prove an isolated effect on/off.
+    Match orientation, display mapping and coordinates before interpreting changes.
+
+    Mesh: {type:'mesh',title:'...',eventId:1272,instance:0,stage:'vs-out'} uses bounded
+    real post-transform geometry with approximate projection. Or use meshFile:
+    'exported.obj' (Host evidence path), or primitive:'sphere'|'cube'|'plane'. A
+    material:{baseColor:[.5,.6,.7],roughness:.3,metalness:0,texture:{path:'...'}}
+    creates an INTERACTIVE ILLUSTRATIVE material, not the original game Shader.
+    Exported OBJ UVs are supported. A mesh preview does not prove pixel coverage.
+    Add meshEffect:{type:'inverted-hull',amount:.04,color:'#101018',enabled:true}
+    for normal extrusion with front-face culling, or type:'sine-displacement'
+    with amount/frequency/phase for a vertex-motion illustration. Users can
+    compare position.y += sin(position.x*frequency+phase)*amount for the latter.
+    orbit/zoom, tune the bounded preview parameters and compare synchronized
+    before/after renders. Normals/units are derived for this illustration; no
+    captured Shader is executed or capture parameter edited by these controls.
+    Link the actual Shader/CBuffer separately using links. Choose a recipe only
+    after checking the actual algorithm; do not call this a captured A/B trial.
+
+    Diagram: {type:'diagram',title:'...',nodes:[{id:'a',text:'...',eventId:1296,
+    image:{eventId:1296},calculation:'...',description:'...'},...],
+    edges:[['a','b'],...],edgeLabels:['what changes',...]}. Each node may have an
+    RT thumbnail and links:[{label:'...',url:'rdoc://shader/...'}] to code,
+    resources or get_cbuffer_parameter_link URLs. Click goes to EID (or the first
+    link for calculation-only nodes); right-click lists all node targets.
+    Give each texture a named node and one short role. Use separate calculation
+    nodes and concise connections for the verified flow. Use get_mesh_uv_link
+    for UV channel/texture inspection.
+    The chat preview expands into an independent window; the global frame diagram
+    and its capture companion are never touched.
+    Code: {type:'code',title:'...',workspacePath:'...',sourceFile:'source/shader.hlsl',
+    expectedSourceSha256:'64 hex from source read',startLine:100,endLine:115}.
+    Host reads the exact saved source; every displayed line links to its workspace.
+    Optional exampleCode displays a simplified example whose lines jump to the
+    same verified starting calculation. Only use it for a real source mapping.
+    For a true controlled comparison pass experimentReceipt from
+    run_shader_effect_experiment and exactly its before/after image paths.
+    Circle annotations use type:'ellipse',points:[[left,top],[right,bottom]].
+    Any card supports caption and links:[{label:'...',url:'rdoc://event/1296'}].
+    Use verified rdoc://resource/<ID> or rdoc://shader/<workspace>?path=... links.
+    Annotation points use the saved image's normalized top-left coordinates.
+    """
+    try:
+        from .visual_replies import publish
+        context=json.loads(get_current_renderdoc_context())
+        def capture_image(source):
+            receipt=json.loads(_capture_event_texture_evidence_receipt(
+                event_id=source.eventId,attachment_kind=source.attachmentKind,
+                attachment_index=source.attachmentIndex,channel=source.channel,
+                mip=source.mip,slice=source.slice,sample=source.sample,
+                range_mode=source.rangeMode,black_point=source.blackPoint,
+                white_point=source.whitePoint,flip_y=False,max_dimension=1600,stage=source.stage))
+            artifact=receipt.get("artifact") or {}
+            if receipt.get("error") or artifact.get("status")!="saved":
+                raise ValueError("Captured visual source unavailable: "+str(receipt.get("error") or artifact.get("skipReason")))
+            return dict(artifact.get("output") or {},
+                        resourceId=(artifact.get('attachment') or {}).get('resourceId'))
+        def capture_mesh(card):
+            return json.loads(get_post_vs_data(card.eventId,card.instance,0,card.stage,16384,49152))
+        def read_code(card):
+            from urllib.parse import urlencode,quote
+            root,status=_workspace_file_context(card.workspacePath)
+            relative=card.sourceFile or str(Path(status['source']['path']).relative_to(root)).replace('\\','/')
+            target=_workspace_file_target(root,relative)
+            canonical=Path(status['source']['path']).resolve()
+            if target.resolve()!=canonical and not relative.startswith('source/'):
+                raise ValueError('Code excerpts must come from saved Shader source/includes')
+            raw=_read_workspace_text_bytes(target);digest=hashlib.sha256(raw).hexdigest()
+            if digest!=card.expectedSourceSha256:raise ValueError('Shader source changed; read its current hash before publishing')
+            lines=raw.decode('utf-8-sig').splitlines()
+            if card.endLine>len(lines):raise ValueError('Code range is outside the saved source')
+            excerpt='\n'.join(lines[card.startLine-1:card.endLine])
+            if len(excerpt)>16000:raise ValueError('Code excerpt exceeds 16000 characters')
+            query=urlencode({'path':str(target),'line':card.startLine,'column':1,'sourceSha256':digest},quote_via=quote)
+            return dict(text=card.exampleCode or excerpt,example=bool(card.exampleCode),
+                        startLine=card.startLine,sha256=digest,language=target.suffix.lstrip('.'),
+                        url='rdoc://shader/?'+query,path=str(target))
+        result=publish(title,cards,context,capture_image=capture_image,capture_mesh=capture_mesh,
+                       authorize_file=_within_evidence_roots,read_code=read_code)
+        if json.loads(get_current_renderdoc_context()).get('capture',{}).get('captureSessionId')!=context.get('capture',{}).get('captureSessionId'):
+            raise ValueError("Capture changed while collecting the visual answer")
+        result['publishedToChat']=current_task_report_store().register_reply_visual(result['id'])
+        return _ok(result)
+    except Exception as error:
+        return _err(error)
+
 
 # ==================== ENTRYPOINT ====================
 

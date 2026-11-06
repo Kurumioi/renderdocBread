@@ -19,7 +19,7 @@ def test_transcript_styles_documents_and_live_updates(tmp_path):
     qt = ROOT / "qrenderdoc/3rdparty/qt"
     objects = ROOT / "x64/Development/obj/qrenderdoc"
     dependencies = [objects / (name + ".obj") for name in
-                    ("AIFileThumbnail", "Resources", "qrc_resources", "precompiled")]
+                    ("AIFileThumbnail", "AIVisualReply", "Resources", "qrc_resources", "precompiled")]
     if not (qt / "x64/lib/Qt5Widgets.lib").exists() or not all(p.exists() for p in dependencies):
         pytest.skip("The shipped Qt development libraries and resource objects are required")
     probe = tmp_path / "transcript.cpp"
@@ -75,6 +75,11 @@ int main(int argc, char **argv) {
   result["shaderIncludeLink"]=QUrlQuery(QUrl(citations.find("include").charFormat().anchorHref())).queryItemValue("line")=="7";
   result["rejectExecutableLinks"]=citations.find("script").charFormat().anchorHref().isEmpty() &&
                                   citations.find("raw").charFormat().anchorHref().isEmpty();
+  QTextDocument table;
+  table.setHtml(safeMarkdown("| Feature | Result |\n|---|---|\n| `a|b` | **Visible** |\n\n"
+      "```hlsl source=rdoc://shader/example?line=73\nfloat one;\nfloat two;\n```"));
+  result["markdownTable"]=table.toPlainText().contains("a|b") && !table.toPlainText().contains("|---|");
+  result["exampleLinksToCalculation"]=QUrlQuery(QUrl(table.find("two").charFormat().anchorHref())).queryItemValue("line")=="73";
 
   AIConversationView view;view.setAttribute(Qt::WA_DontShowOnScreen);view.resize(550,900);view.show();
   auto browser=view.findChild<QTextBrowser*>();

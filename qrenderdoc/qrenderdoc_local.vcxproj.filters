@@ -225,6 +225,9 @@
     <ClCompile Include="Windows\BufferViewer.cpp">
       <Filter>Windows</Filter>
     </ClCompile>
+    <ClCompile Include="Windows\MeshUVView.cpp">
+      <Filter>Windows</Filter>
+    </ClCompile>
     <ClCompile Include="Widgets\Extended\RDTableView.cpp">
       <Filter>Widgets\Extended</Filter>
     </ClCompile>
@@ -655,6 +658,12 @@
       <Filter>Windows\AI</Filter>
     </ClCompile>
     <ClCompile Include="Windows\AI\AIFileThumbnail.cpp">
+      <Filter>Windows\AI</Filter>
+    </ClCompile>
+    <ClCompile Include="Windows\AI\AITextureAnnotation.cpp">
+      <Filter>Windows\AI</Filter>
+    </ClCompile>
+    <ClCompile Include="Windows\AI\AIVisualReply.cpp">
       <Filter>Windows\AI</Filter>
     </ClCompile>
     <ClCompile Include="Windows\AI\AIAgentMonitorWindow.cpp">
@@ -1185,6 +1194,15 @@
       <Filter>Windows\AI</Filter>
     </ClInclude>
     <ClInclude Include="Windows\AI\AIFileThumbnail.h">
+      <Filter>Windows\AI</Filter>
+    </ClInclude>
+    <ClInclude Include="Windows\AI\AITextureAnnotation.h">
+      <Filter>Windows\AI</Filter>
+    </ClInclude>
+    <ClInclude Include="Windows\AI\AIVisualReply.h">
+      <Filter>Windows\AI</Filter>
+    </ClInclude>
+    <ClInclude Include="Windows\AI\AICodeFormatting.h">
       <Filter>Windows\AI</Filter>
     </ClInclude>
     <ClInclude Include="Windows\AI\AIAgentMonitorWindow.h">

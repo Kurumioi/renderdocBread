@@ -25,6 +25,10 @@ AGENT_LOCAL_TOOLS = frozenset(
 # they remain discoverable on demand instead of filling every model turn.
 # This list is a capability list, not an order in which work must be done.
 CORE_DIRECT_TOOLS: tuple[str, ...] = (
+    "publish_visual_reply",
+    "get_cbuffer_parameter_link",
+    "get_mesh_uv_link",
+    "run_shader_effect_experiment",
     "get_current_renderdoc_context",
     "get_application_ui_state",
     "control_application_ui",
@@ -252,12 +256,17 @@ READ_ONLY_TOOLS = frozenset(
         "resolve_active_unpacked_asset",
         "fingerprint_event_outputs",
         "get_post_vs_data",
+        "inspect_vertex_effect_scope",
     }
 )
 
 
 EFFECTFUL_TOOLS = frozenset(
     {
+        "publish_visual_reply",
+        "get_cbuffer_parameter_link",
+        "get_mesh_uv_link",
+        "run_shader_effect_experiment",
         "recover_replay",
         "open_capture",
         "launch_renderdoc",
@@ -414,6 +423,10 @@ WORKFLOW_EFFECTS = frozenset({"workspace", "project", "ui", "replay"})
 
 
 TOOL_EFFECTS: dict[str, frozenset[str]] = {
+    "publish_visual_reply": frozenset({"workspace", "ui"}),
+    "get_cbuffer_parameter_link": frozenset({"workspace"}),
+    "get_mesh_uv_link": frozenset({"workspace"}),
+    "run_shader_effect_experiment": frozenset({"workspace", "replay"}),
     "recover_replay": frozenset({"ui", "replay"}),
     **{
         name: frozenset({"workspace"})

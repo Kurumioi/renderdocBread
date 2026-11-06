@@ -19,6 +19,20 @@ otherwise. Missing readers or original names do not block capture-based export.
 
 ## Editable Unity delivery
 
+For a request to implement a named rendering function, calculation, feature or
+combination in an engine, resolve its destination project and rendering pipeline.
+Discover the enabled Editor MCP for that engine through the attached tool directory.
+For Unity, use the supported project-scoped setup/recovery below when needed. For
+Unreal, use the configured Editor's material graph, Blueprint and shader authoring
+tools; an asset extractor is evidence, not an Editor connection. Inspect existing
+interfaces and author only the requested asset or integration. Compile/save and
+verify the actual requested behavior in the destination. A small reusable function
+does not require restoring a whole scene. Distinguish authoring from explanation.
+
+Use chat RT comparisons, source links and mesh illustrations when they help explain
+the transfer. They do not replace the requested editable Unity project or its actual
+final-view validation. Follow the event Skill's visual-explanations.md for presentation.
+
 Before authoring or calibrating Unity restoration, read
 [unity-implementation-guidance.md](references/unity-implementation-guidance.md).
 It retains the implementation and final-view acceptance requirements, including

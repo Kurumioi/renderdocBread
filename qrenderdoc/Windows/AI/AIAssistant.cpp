@@ -23,7 +23,10 @@
  ******************************************************************************/
 
 #include "AIAssistant.h"
+#include "Windows/BufferViewer.h"
+#include "Windows/TextureViewer.h"
 #include "AIConfiguration.h"
+#include "AIVisualReply.h"
 
 #include <algorithm>
 #include <cmath>
@@ -897,6 +900,7 @@ QString htmlText(const QString &text)
 enum class AssistantActionIcon
 {
   Add,
+  Brush,
   Send,
   Stop,
 };
@@ -915,6 +919,16 @@ QIcon assistantActionIcon(const QWidget *widget, AssistantActionIcon kind)
   {
     painter.drawLine(QPointF(4.5, 9.0), QPointF(13.5, 9.0));
     painter.drawLine(QPointF(9.0, 4.5), QPointF(9.0, 13.5));
+  }
+  else if(kind == AssistantActionIcon::Brush)
+  {
+    painter.drawLine(QPointF(7, 11), QPointF(14, 3));
+    painter.drawLine(QPointF(9, 12), QPointF(15, 4));
+    QPainterPath tip;
+    tip.moveTo(8, 10);
+    tip.cubicTo(3, 8, 6, 14, 2, 15);
+    tip.cubicTo(7, 16, 11, 14, 8, 10);
+    painter.drawPath(tip);
   }
   else if(kind == AssistantActionIcon::Send)
   {
@@ -4059,6 +4073,30 @@ AIAssistant::AIAssistant(CaptureContext &ctx, QWidget *parent) : QFrame(parent),
 
   m_Transcript = new AIConversationView(mainPanel);
   m_Transcript->setLinkHandler([this](const QUrl &url) { handleTranscriptLink(url); });
+  m_Transcript->setVisualLinkHandler([this](const QUrl &url, const QJsonObject &capture) {
+    bool matches = false;
+    if(m_Ctx.IsCaptureLoaded())
+    {
+      const QFileInfo current(QString::fromUtf8(m_Ctx.GetCaptureFilename().c_str()));
+      const QFileInfo source(capture.value(QLatin1String("path")).toString());
+      if(capture.value(QLatin1String("local")).toBool() && source.exists() && current.exists())
+        matches = current.canonicalFilePath().compare(source.canonicalFilePath(),
+                                                      Qt::CaseInsensitive) == 0 &&
+                  current.size() == qint64(capture.value(QLatin1String("size")).toDouble(-1)) &&
+                  current.lastModified().toMSecsSinceEpoch() ==
+                      qint64(capture.value(QLatin1String("mtimeMs")).toDouble(-1));
+      else
+      {
+        QString session;
+        matches = findBridgeBinding(NULL, &session) && !session.isEmpty() &&
+                  session == capture.value(QLatin1String("captureSessionId")).toString();
+      }
+    }
+    if(matches)
+      handleTranscriptLink(url);
+    else
+      appendSystem(tr("Open the source capture to use this visual answer's navigation links."), true);
+  });
   m_Transcript->setActivityToggleHandler([this](const QString &messageId, bool expanded) {
     ConversationThread *thread = conversation();
     if(!thread)
@@ -4236,6 +4274,14 @@ AIAssistant::AIAssistant(CaptureContext &ctx, QWidget *parent) : QFrame(parent),
   m_AddAttachment->setAccessibleName(tr("Add attachment"));
   m_AddAttachment->setFixedSize(32, 32);
   m_AddAttachment->setFlat(true);
+  m_AnnotateRT = new QPushButton(composer);
+  // i18n-ignore: stable QObject identifier used by native UI tests.
+  m_AnnotateRT->setObjectName(QLatin1String("aiAnnotateRenderTarget"));
+  m_AnnotateRT->setIcon(assistantActionIcon(m_AnnotateRT, AssistantActionIcon::Brush));
+  m_AnnotateRT->setToolTip(tr("Draw on the selected render target to ask Bread AI about a region"));
+  m_AnnotateRT->setAccessibleName(tr("Annotate render target"));
+  m_AnnotateRT->setFixedSize(32, 32);
+  m_AnnotateRT->setFlat(true);
   m_Cancel = new QPushButton(composer);
   m_Cancel->setIcon(assistantActionIcon(m_Cancel, AssistantActionIcon::Stop));
   m_Cancel->setToolTip(tr("Stop the active chat request."));
@@ -4265,6 +4311,7 @@ AIAssistant::AIAssistant(CaptureContext &ctx, QWidget *parent) : QFrame(parent),
   sendRow->setContentsMargins(0, 0, 0, 0);
   sendRow->setSpacing(6);
   sendRow->addWidget(m_AddAttachment, 0, Qt::AlignBottom);
+  sendRow->addWidget(m_AnnotateRT, 0, Qt::AlignBottom);
   sendRow->addWidget(m_QueueStatus, 0, Qt::AlignBottom);
   sendRow->addStretch(1);
   sendRow->addWidget(m_ProfileCombo, 0, Qt::AlignBottom);
@@ -4312,6 +4359,7 @@ AIAssistant::AIAssistant(CaptureContext &ctx, QWidget *parent) : QFrame(parent),
       [this](const QString &conversationId) { deleteConversation(conversationId); });
   connect(m_AddAttachment, &QPushButton::clicked, this,
           [this]() { chooseAttachmentFiles(); });
+  connect(m_AnnotateRT, &QPushButton::clicked, this, [this]() { annotateRenderTarget(); });
   connect(m_Send, &QPushButton::clicked, this, [this]() {
     const QString prompt = m_Prompt->toPlainText().trimmed();
     // Attachments are reference data, never an implicit request. Require the user to state what
@@ -4686,7 +4734,7 @@ bool AIAssistant::addComposerAttachment(const AIChatAttachment &attachment, QStr
   for(const AIChatAttachment &existing : m_ComposerAttachments)
   {
     if(existing.kind == attachment.kind && existing.source == attachment.source &&
-       existing.content == attachment.content)
+       existing.content == attachment.content && existing.context == attachment.context)
     {
       if(error)
         *error = tr("This attachment is already in the composer.");
@@ -4730,6 +4778,200 @@ void AIAssistant::chooseAttachmentFiles()
       this, tr("Add attachments"), QString(), tr("All files (*)"));
   if(!paths.isEmpty())
     addAttachmentFiles(paths);
+}
+
+void AIAssistant::annotateRenderTarget()
+{
+  if(!m_Ctx.IsCaptureLoaded())
+  {
+    appendSystem(tr("This action requires an open capture."), true);
+    return;
+  }
+  QString session;
+  if(!findBridgeBinding(NULL, &session) || session.isEmpty())
+  {
+    appendSystem(tr("The capture connection is not ready. Try drawing again after it connects."),
+                 true);
+    return;
+  }
+  m_Ctx.ShowTextureViewer();
+  TextureViewer *viewer = dynamic_cast<TextureViewer *>(m_Ctx.GetTextureViewer()->Widget());
+  if(!viewer)
+    return;
+  QJsonObject capture;
+  capture[QLatin1String("captureSessionId")] = session;
+  // Resume the newest draft for this exact capture/view. Sent messages are immutable;
+  // editing those is an explicit transcript action that creates a fresh draft.
+  for(int i = m_ComposerAttachments.size() - 1; i >= 0; --i)
+  {
+    const AIChatAttachment &item = m_ComposerAttachments[i];
+    if(item.annotationImageRole() == QLatin1String("annotated") &&
+       item.context.value(QLatin1String("capture"))
+               .toObject()
+               .value(QLatin1String("captureSessionId"))
+               .toString() == session &&
+       viewer->MatchesAIAnnotation(item.context))
+    {
+      editRenderTargetAnnotation(item.id);
+      return;
+    }
+  }
+  QPointer<AIAssistant> self(this);
+  const QString conversationId = m_ActiveConversationId;
+  viewer->BeginAIAnnotation(
+      capture,
+      [self, conversationId](const QImage &original, const QImage &marked, const QJsonObject &context) {
+        if(!self)
+          return false;
+        if(self->m_ActiveConversationId != conversationId)
+        {
+          self->appendSystem(
+              tr("Return to the conversation where you started drawing before adding the marks."),
+              true);
+          return false;
+        }
+        return self->addRenderTargetAnnotation(original, marked, context);
+      },
+      [self](const QString &error) {
+        if(self)
+          self->appendSystem(error, true);
+      });
+}
+
+bool AIAssistant::addRenderTargetAnnotation(const QImage &original, const QImage &annotated,
+                                            const QJsonObject &context)
+{
+  const QVector<AIChatAttachment> before = m_ComposerAttachments;
+  const QString pair =
+      context.value(QLatin1String("annotation")).toObject().value(QLatin1String("pairId")).toString();
+  QVector<AIChatAttachment> remaining;
+  for(const AIChatAttachment &item : before)
+    if(item.annotationPairId() != pair || pair.isEmpty())
+      remaining.push_back(item);
+  if(remaining.size() + 2 > MaxChatAttachments)
+  {
+    appendSystem(tr("An annotation needs two attachment slots for the original and marked images. "
+                    "Remove some attachments first."),
+                 true);
+    return false;
+  }
+  QByteArray encoded[2];
+  const QImage images[] = {original, annotated};
+  bool jpeg = false;
+  for(int attempt = 0; attempt < 2; ++attempt)
+  {
+    for(int i = 0; i < 2; ++i)
+    {
+      encoded[i].clear();
+      QBuffer buffer(&encoded[i]);
+      buffer.open(QIODevice::WriteOnly);
+      if(!images[i].save(&buffer, jpeg ? "JPEG" : "PNG", jpeg ? 93 : -1))
+        return false;
+    }
+    if(encoded[0].size() + encoded[1].size() <= MaxBinaryAttachmentTotalBytes)
+      break;
+    jpeg = true;
+  }
+  const uint32_t eid = uint32_t(
+      context.value(QLatin1String("capture")).toObject().value(QLatin1String("eventId")).toDouble());
+  QString error;
+  m_ComposerAttachments = remaining;
+  for(int i = 0; i < 2; ++i)
+  {
+    AIChatAttachment attachment;
+    // i18n-ignore: stable attachment transport identifiers and MIME types.
+    attachment.id = QLatin1String("annotation-") + pair + QString::number(i);
+    attachment.kind = QLatin1String("image");
+    attachment.encoding = QLatin1String("base64");
+    attachment.mediaType = jpeg ? QLatin1String("image/jpeg") : QLatin1String("image/png");
+    attachment.source = QLatin1String("renderdoc-rt-annotation");
+    attachment.title = i == 0 ? tr("EID %1: original render target").arg(eid)
+                              : tr("EID %1: marked render target").arg(eid);
+    attachment.content = QString::fromLatin1(encoded[i].toBase64());
+    attachment.originalBytes = encoded[i].size();
+    attachment.context = context;
+    QJsonObject annotation = context.value(QLatin1String("annotation")).toObject();
+    annotation[QLatin1String("imageRole")] =
+        i == 0 ? QLatin1String("original") : QLatin1String("annotated");
+    attachment.context[QLatin1String("annotation")] = annotation;
+    if(!addComposerAttachment(attachment, &error))
+    {
+      // Keep the pair atomic, including when other attachments have consumed the byte budget.
+      m_ComposerAttachments = before;
+      rebuildAttachmentChips();
+      appendSystem(error, true);
+      return false;
+    }
+  }
+  return true;
+}
+
+void AIAssistant::editRenderTargetAnnotation(const QString &attachmentId)
+{
+  QVector<AIChatAttachment> items = m_ComposerAttachments;
+  bool fromHistory = false;
+  auto hasId = [&attachmentId](const QVector<AIChatAttachment> &rows) {
+    for(const AIChatAttachment &item : rows)
+      if(item.id == attachmentId)
+        return true;
+    return false;
+  };
+  if(!hasId(items))
+  {
+    const ConversationThread *thread = conversation();
+    if(thread)
+      for(const AIChatMessage &message : thread->messages)
+        if(hasId(message.attachments))
+        {
+          items = message.attachments;
+          fromHistory = true;
+          break;
+        }
+  }
+  AIChatAttachment selected, original;
+  for(const AIChatAttachment &item : items)
+    if(item.id == attachmentId)
+      selected = item;
+  if(selected.annotationPairId().isEmpty())
+    return;
+  for(const AIChatAttachment &item : items)
+    if(item.annotationPairId() == selected.annotationPairId() &&
+       item.annotationImageRole() == QLatin1String("original"))
+      original = item;
+  const QImage image = attachmentPreviewPixmap(original).toImage();
+  if(image.isNull())
+  {
+    appendSystem(tr("The original annotation image is unavailable. The saved marks were kept."),
+                 true);
+    return;
+  }
+  QJsonObject context = selected.context;
+  if(fromHistory)
+  {
+    QJsonObject annotation = context.value(QLatin1String("annotation")).toObject();
+    annotation[QLatin1String("pairId")] = newTaskId();
+    context[QLatin1String("annotation")] = annotation;
+  }
+  m_Ctx.ShowTextureViewer();
+  TextureViewer *viewer = dynamic_cast<TextureViewer *>(m_Ctx.GetTextureViewer()->Widget());
+  if(!viewer)
+    return;
+  QPointer<AIAssistant> self(this);
+  const QString conversationId = m_ActiveConversationId;
+  viewer->EditAIAnnotation(
+      image, selected.title, context,
+      [self, conversationId](const QImage &original, const QImage &marked, const QJsonObject &context) {
+        if(!self)
+          return false;
+        if(self->m_ActiveConversationId != conversationId)
+        {
+          self->appendSystem(
+              tr("Return to the conversation where you started drawing before adding the marks."),
+              true);
+          return false;
+        }
+        return self->addRenderTargetAnnotation(original, marked, context);
+      });
 }
 
 void AIAssistant::requestSystemThumbnail(const QString &attachmentId,
@@ -5243,9 +5485,24 @@ void AIAssistant::removeComposerAttachment(const QString &attachmentId)
   {
     if(m_ComposerAttachments[i].id == attachmentId)
     {
-      m_ComposerAttachments.remove(i);
-      m_ComposerSystemThumbnails.remove(attachmentId);
-      m_ComposerSystemAnimations.remove(attachmentId);
+      const QString pair = m_ComposerAttachments[i]
+                               .context.value(QLatin1String("annotation"))
+                               .toObject()
+                               .value(QLatin1String("pairId"))
+                               .toString();
+      for(int j = m_ComposerAttachments.size() - 1; j >= 0; --j)
+      {
+        const AIChatAttachment &item = m_ComposerAttachments[j];
+        if(item.id != attachmentId &&
+           (pair.isEmpty() || item.context.value(QLatin1String("annotation"))
+                                      .toObject()
+                                      .value(QLatin1String("pairId"))
+                                      .toString() != pair))
+          continue;
+        m_ComposerSystemThumbnails.remove(item.id);
+        m_ComposerSystemAnimations.remove(item.id);
+        m_ComposerAttachments.remove(j);
+      }
       rebuildAttachmentChips();
       return;
     }
@@ -5260,8 +5517,14 @@ void AIAssistant::previewComposerAttachment(const QString &attachmentId)
       selected = &attachment;
   if(!selected)
     return;
+  if(!selected->annotationPairId().isEmpty())
+  {
+    editRenderTargetAnnotation(attachmentId);
+    return;
+  }
 
-  QDialog dialog(this);
+  QDialog &dialog = *new QDialog(this);
+  dialog.setAttribute(Qt::WA_DeleteOnClose);
   dialog.setWindowTitle(tr("Attachment preview"));
   dialog.resize(900, 680);
   QVBoxLayout *layout = new QVBoxLayout(&dialog);
@@ -5509,7 +5772,7 @@ void AIAssistant::previewComposerAttachment(const QString &attachmentId)
   QDialogButtonBox *buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
   connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
   layout->addWidget(buttons);
-  RDDialog::show(&dialog);
+  dialog.show();
 }
 
 void AIAssistant::rebuildAttachmentChips()
@@ -5525,6 +5788,8 @@ void AIAssistant::rebuildAttachmentChips()
 
   for(const AIChatAttachment &attachment : m_ComposerAttachments)
   {
+    if(AIHideAnnotationOriginal(attachment, m_ComposerAttachments))
+      continue;
     const QSize thumbnailSize(54, 54);
     QPixmap visualThumbnail = attachmentThumbnail(attachment, thumbnailSize);
     if(visualThumbnail.isNull())
@@ -5544,6 +5809,18 @@ void AIAssistant::rebuildAttachmentChips()
 
     QFrame *chip = new QFrame(m_AttachmentStrip);
     chip->setObjectName(lit("aiAttachmentChip"));    // i18n-ignore: stylesheet object name
+    if(!attachment.annotationPairId().isEmpty())
+    {
+      chip->setContextMenuPolicy(Qt::CustomContextMenu);
+      connect(chip, &QWidget::customContextMenuRequested, this,
+              [this, chip, attachment](QPoint point) {
+                QMenu menu(chip);
+                QAction *edit = menu.addAction(tr("Edit marks"));
+                connect(edit, &QAction::triggered, this,
+                        [this, attachment]() { editRenderTargetAnnotation(attachment.id); });
+                menu.exec(chip->mapToGlobal(point));
+              });
+    }
     chip->setStyleSheet(
         // i18n-ignore: Qt stylesheet syntax contains no user-visible text.
         lit("QFrame#aiAttachmentChip { border: 1px solid palette(mid); border-radius: 14px; "
@@ -5695,6 +5972,27 @@ void AIAssistant::appendAssistant(const QString &text, const QString &conversati
   item.text = text;
   item.taskId = taskId;
   item.artifacts = artifacts;
+  if(safeTaskId(taskId))
+  {
+    QFile stateFile(QDir(taskEventRoot()).filePath(taskId + QLatin1String(".report-state.json")));
+    if(stateFile.size() <= 2 * 1024 * 1024 && stateFile.open(QIODevice::ReadOnly))
+    {
+      const QJsonObject state = QJsonDocument::fromJson(stateFile.readAll()).object();
+      if(state.value(QLatin1String("schema")).toString() ==
+             QLatin1String("replaylab-task-report-state/v1") &&
+         state.value(QLatin1String("taskId")).toString() == taskId &&
+         state.value(QLatin1String("conversationId")).toString() == thread->id)
+      {
+        const QJsonArray refs = state.value(QLatin1String("replyVisuals")).toArray();
+        for(int i = 0; i < qMin(8, refs.size()); ++i)
+        {
+          const QString id = refs[i].toObject().value(QLatin1String("id")).toString();
+          if(AIVisualReply::validIdentity(id))
+            item.visuals.append(QJsonObject{{QLatin1String("id"), id}});
+        }
+      }
+    }
+  }
   item.state = lit("completed");
   item.timestampMs = QDateTime::currentMSecsSinceEpoch();
   item.finishedTimestampMs = item.timestampMs;
@@ -7035,6 +7333,11 @@ void AIAssistant::updateComposerState()
 void AIAssistant::handleTranscriptLink(const QUrl &url)
 {
   const QString scheme = url.scheme().toLower();
+  if(scheme == QLatin1String("replaylab-annotation") && url.host() == QLatin1String("edit"))
+  {
+    editRenderTargetAnnotation(QUrl::fromPercentEncoding(url.path().mid(1).toUtf8()));
+    return;
+  }
   if(scheme == lit("http") || scheme == lit("https"))
   {
     QDesktopServices::openUrl(url);
@@ -7090,9 +7393,139 @@ void AIAssistant::handleTranscriptLink(const QUrl &url)
 
   const QString target = url.host().toLower();
   QString value = QUrl::fromPercentEncoding(url.path().mid(1).toUtf8());
+  if(target == QLatin1String("cbuffer") || target == QLatin1String("uv"))
+  {
+    const QJsonObject saved = AIVisualReply::navigationTarget(value);
+    const QJsonObject capture = saved.value(QLatin1String("capture")).toObject();
+    const QJsonObject leaf = saved.value(QLatin1String("target")).toObject();
+    const QFileInfo current(QString::fromUtf8(m_Ctx.GetCaptureFilename().c_str()));
+    const QFileInfo original(capture.value(QLatin1String("path")).toString());
+    QString activeSession;
+    const bool sameSession =
+        findBridgeBinding(NULL, &activeSession) && !activeSession.isEmpty() &&
+        activeSession == capture.value(QLatin1String("captureSessionId")).toString();
+    const bool sameCapture =
+        current.exists() && original.exists() &&
+        current.canonicalFilePath().compare(original.canonicalFilePath(), Qt::CaseInsensitive) == 0 &&
+        (sameSession || (current.size() == qint64(capture.value(QLatin1String("size")).toDouble(-1)) &&
+                         current.lastModified().toMSecsSinceEpoch() ==
+                             qint64(capture.value(QLatin1String("mtimeMs")).toDouble(-1))));
+    const uint32_t eid = uint32_t(leaf.value(QLatin1String("eventId")).toDouble());
+    if(target == QLatin1String("uv"))
+    {
+      if(sameCapture && eid && leaf.value(QLatin1String("kind")).toString() == QLatin1String("uv"))
+      {
+        const QString stageName = leaf.value(QLatin1String("stage")).toString();
+        const int stageIndex = stageName == QLatin1String("vs-out")   ? 1
+                               : stageName == QLatin1String("gs-out") ? 2
+                                                                      : 0;
+        const qulonglong raw =
+            leaf.value(QLatin1String("textureResourceId")).toString().toULongLong();
+        ResourceId texture;
+        memcpy(&texture, &raw, sizeof(texture));
+        m_Ctx.SetEventID({}, eid, eid, true);
+        if(BufferViewer *viewer = qobject_cast<BufferViewer *>(m_Ctx.GetMeshPreview()->Widget()))
+        {
+          m_Ctx.AddDockWindow(viewer, DockReference::MainToolArea, this);
+          viewer->NavigateMeshUV(stageIndex, leaf.value(QLatin1String("channel")).toString(),
+                                 leaf.value(QLatin1String("pair")).toInt() == 1 ? 2 : 0, texture);
+          m_Ctx.RaiseDockWindow(viewer);
+          viewer->show();
+        }
+      }
+      else
+        appendSystem(tr("This UV link no longer matches the source capture."), true);
+      return;
+    }
+    const QMap<QString, ShaderStage> stages = {{QLatin1String("vertex"), ShaderStage::Vertex},
+                                               {QLatin1String("fragment"), ShaderStage::Pixel},
+                                               {QLatin1String("compute"), ShaderStage::Compute},
+                                               {QLatin1String("geometry"), ShaderStage::Geometry},
+                                               {QLatin1String("hull"), ShaderStage::Hull},
+                                               {QLatin1String("domain"), ShaderStage::Domain},
+                                               {QLatin1String("task"), ShaderStage::Task},
+                                               {QLatin1String("mesh"), ShaderStage::Mesh}};
+    const ShaderStage stage =
+        stages.value(leaf.value(QLatin1String("stage")).toString(), ShaderStage::Count);
+    const int block = leaf.value(QLatin1String("blockIndex")).toInt(-1);
+    const int index = leaf.value(QLatin1String("arrayIndex")).toInt(-1);
+    if(sameCapture && stage != ShaderStage::Count && eid && block >= 0 && index >= 0)
+    {
+      // A private evidence query may have restored pixels without republishing the GUI pipeline.
+      m_Ctx.SetEventID({}, eid, eid, true);
+      const PipeState &pipe = m_Ctx.CurPipelineState();
+      const ShaderReflection *reflection = pipe.GetShaderReflection(stage);
+      const UsedDescriptor binding = pipe.GetConstantBlock(stage, uint32_t(block), uint32_t(index));
+      const QString expectedHash = leaf.value(QLatin1String("shaderRawSha256")).toString();
+      auto hashReflection = [](const ShaderReflection *shader) {
+        if(!shader || shader->rawBytes.empty())
+          return QString();
+        return QString::fromLatin1(
+            QCryptographicHash::hash(
+                QByteArray::fromRawData(reinterpret_cast<const char *>(shader->rawBytes.data()),
+                                        int(shader->rawBytes.size())),
+                QCryptographicHash::Sha256)
+                .toHex());
+      };
+      QString shaderHash = hashReflection(reflection);
+      if(shaderHash != expectedHash)
+      {
+        // Use the same exact pipeline/entry lookup as the Host's reflected target.
+        const ResourceId shader = pipe.GetShader(stage);
+        const ResourceId pipeline = stage == ShaderStage::Compute ? pipe.GetComputePipelineObject()
+                                                                  : pipe.GetGraphicsPipelineObject();
+        ShaderEntryPoint entry;
+        entry.name = pipe.GetShaderEntryPoint(stage);
+        entry.stage = stage;
+        m_Ctx.Replay().BlockInvoke([&](IReplayController *controller) {
+          shaderHash = hashReflection(controller->GetShader(pipeline, shader, entry));
+        });
+      }
+      uint64_t resource = 0;
+      memcpy(&resource, &binding.descriptor.resource, sizeof(resource));
+      if(reflection && uint32_t(block) < reflection->constantBlocks.size() &&
+         shaderHash == expectedHash &&
+         QString::number(resource) == leaf.value(QLatin1String("bufferResourceId")).toString())
+      {
+        IBufferViewer *viewer = m_Ctx.ViewConstantBuffer(stage, uint32_t(block), uint32_t(index));
+        if(BufferViewer *native = qobject_cast<BufferViewer *>(viewer->Widget()))
+        {
+          // New CBuffer viewers defer their reads until they are actually docked/shown,
+          // just as when opening one from the pipeline state. Raising an undocked
+          // widget leaves its reflected rows permanently pending.
+          m_Ctx.AddDockWindow(native, DockReference::TransientPopupArea, this, 0.3f);
+          native->NavigateCBufferVariable(
+              leaf.value(QLatin1String("path")).toString(),
+              qint64(leaf.value(QLatin1String("byteOffset")).toDouble(-1)),
+              leaf.value(QLatin1String("component")).toInt(-1));
+          m_Ctx.RaiseDockWindow(native);
+          return;
+        }
+      }
+    }
+    appendSystem(
+        tr("This CBuffer link no longer matches the source capture or reflected parameter."), true);
+    return;
+  }
   if(target == QLatin1String("shader"))
   {
     const QUrlQuery query(url);
+    const QString expectedHash = query.queryItemValue(QStringLiteral("sourceSha256"));
+    if(!expectedHash.isEmpty())
+    {
+      QFile source(query.queryItemValue(QStringLiteral("path"), QUrl::FullyDecoded));
+      if(!AIVisualReply::validIdentity(expectedHash) || source.size() > 32 * 1024 * 1024 ||
+         !source.open(QIODevice::ReadOnly) ||
+         QString::fromLatin1(
+             QCryptographicHash::hash(source.readAll(), QCryptographicHash::Sha256).toHex()) !=
+             expectedHash)
+      {
+        appendSystem(
+            tr("The saved Shader source changed. Refresh this code excerpt before navigating."),
+            true);
+        return;
+      }
+    }
     QJsonObject request;
     request[QStringLiteral("workspaceId")] = value;
     request[QStringLiteral("path")] = query.queryItemValue(QStringLiteral("path"), QUrl::FullyDecoded);
@@ -7118,13 +7551,16 @@ void AIAssistant::handleTranscriptLink(const QUrl &url)
     appendSystem(tr("The Shader source link is unavailable in the current workspace."), true);
     return;
   }
-  if(target == lit("event") || target == lit("eid"))
+  if(target == QLatin1String("event") || target == QLatin1String("eid") ||
+     target == QLatin1String("mesh"))
   {
     bool ok = false;
     const uint32_t eid = value.toUInt(&ok);
     if(ok && eid > 0)
     {
       m_Ctx.SetEventID({}, eid, eid);
+      if(target == QLatin1String("mesh"))
+        m_Ctx.ShowMeshPreview();
       return;
     }
   }
@@ -7220,6 +7656,8 @@ QJsonObject AIAssistant::conversationToJSON(const ConversationThread &thread,
     QJsonObject row;
     row[lit("id")] = item.id;
     row[lit("role")] = item.role;
+    if(!item.visuals.isEmpty())
+      row[QLatin1String("visuals")] = item.visuals;
     if(!item.artifacts.isEmpty())
       // i18n-ignore: Persisted conversation JSON field name (Host-verified artifact chips).
       row[lit("artifacts")] = item.artifacts;
@@ -7227,16 +7665,19 @@ QJsonObject AIAssistant::conversationToJSON(const ConversationThread &thread,
     if(!item.attachments.isEmpty())
     {
       bool attachmentsPersisted = false;
-      if(chatAttachmentsCouldFitPersistenceBudget(item.attachments, *remainingChars))
+      // The shared budget reserves four UTF-8 bytes per text character. Attachments
+      // already have an exact compact-JSON byte size (base64 is ASCII), so charging
+      // that byte size as characters would reserve four times their actual storage.
+      if(chatAttachmentsCouldFitPersistenceBudget(item.attachments, *remainingChars * 4))
       {
         const QJsonArray attachmentRows = chatAttachmentsToJSON(item.attachments);
         const int attachmentBytes =
             QJsonDocument(attachmentRows).toJson(QJsonDocument::Compact).size();
-        if(attachmentBytes <= *remainingChars)
+        if(attachmentBytes <= *remainingChars * 4)
         {
           // i18n-ignore: Persisted conversation attachment protocol field.
           row[lit("attachments")] = attachmentRows;
-          *remainingChars -= attachmentBytes;
+          *remainingChars -= (attachmentBytes + 3) / 4;
           attachmentsPersisted = true;
         }
       }
@@ -7356,6 +7797,13 @@ bool AIAssistant::conversationFromJSON(const QJsonObject &object, ConversationTh
     item.activityExpanded = row.value(lit("activityExpanded")).toBool();
     // i18n-ignore: Persisted conversation JSON field name (Host-verified artifact chips).
     item.artifacts = row.value(lit("artifacts")).toArray();
+    const QJsonArray visualRows = row.value(QLatin1String("visuals")).toArray();
+    for(int visualIndex = 0; visualIndex < qMin(8, visualRows.size()); ++visualIndex)
+    {
+      const QString id = visualRows[visualIndex].toObject().value(QLatin1String("id")).toString();
+      if(AIVisualReply::validIdentity(id))
+        item.visuals.append(QJsonObject{{QLatin1String("id"), id}});
+    }
     if(!safeTaskId(item.id) || (item.role != lit("user") && item.role != lit("assistant")))
       continue;
     const QJsonValue attachmentValue = row.value(lit("attachments"));    // i18n-ignore: conversation store field
@@ -7657,16 +8105,16 @@ void AIAssistant::saveConversations()
     if(!request.attachments.isEmpty())
     {
       bool attachmentsPersisted = false;
-      if(chatAttachmentsCouldFitPersistenceBudget(request.attachments, remainingChars))
+      if(chatAttachmentsCouldFitPersistenceBudget(request.attachments, remainingChars * 4))
       {
         const QJsonArray attachmentRows = chatAttachmentsToJSON(request.attachments);
         const int attachmentBytes =
             QJsonDocument(attachmentRows).toJson(QJsonDocument::Compact).size();
-        if(attachmentBytes <= remainingChars)
+        if(attachmentBytes <= remainingChars * 4)
         {
           // i18n-ignore: Persisted pending-chat attachment protocol field.
           row[lit("attachments")] = attachmentRows;
-          remainingChars -= attachmentBytes;
+          remainingChars -= (attachmentBytes + 3) / 4;
           attachmentsPersisted = true;
         }
       }
@@ -7740,6 +8188,7 @@ void AIAssistant::scheduleConversationSave()
 
 void AIAssistant::updateCaptureStatus()
 {
+  m_AnnotateRT->setEnabled(m_Ctx.IsCaptureLoaded());
   if(m_Ctx.IsCaptureLoaded())
   {
     const rdcstr captureFilename = m_Ctx.GetCaptureFilename();
@@ -8531,124 +8980,127 @@ void AIAssistant::refreshProfiles(QObject *completionOwner,
   m_ProfileRefreshPending = false;
   const QString previousProfile = m_ActiveProfile;
   const QString previousModel = m_ActiveModel;
+  // A newly deployed frozen AgentHost can take several seconds to unpack on a cold start.
+  // Keep this asynchronous, but do not mistake startup latency for an empty connection store.
   // i18n-ignore: Fixed AgentHost CLI command and option identifiers; never shown to users.
-  runCLIAsync({lit("profile"), lit("list"), lit("--json")}, QByteArray(), 5000, this,
-              [this, generation, previousProfile, previousModel](
-                  int exitCode, const QByteArray &output, const QString &error, bool) {
-  if(generation != m_ProfileRefreshGeneration)
-  {
-    m_ProfileRefreshRunning = false;
-    if(m_ProfileRefreshPending)
-    {
-      m_ProfileRefreshPending = false;
-      refreshProfiles();
-    }
-    else
-    {
-      m_ProfileComboLoading = false;
-    }
-    return;
-  }
+  runCLIAsync(
+      {lit("profile"), lit("list"), lit("--json")}, QByteArray(), 30000, this,
+      [this, generation, previousProfile, previousModel](int exitCode, const QByteArray &output,
+                                                         const QString &error, bool) {
+        if(generation != m_ProfileRefreshGeneration)
+        {
+          m_ProfileRefreshRunning = false;
+          if(m_ProfileRefreshPending)
+          {
+            m_ProfileRefreshPending = false;
+            refreshProfiles();
+          }
+          else
+          {
+            m_ProfileComboLoading = false;
+          }
+          return;
+        }
 
-  m_ProfileRefreshRunning = false;
-  QSignalBlocker blocker(m_ProfileCombo);
-  m_ProfileCombo->clear();
-  m_ProfileCombo->setToolTip(QString());
-  m_ActiveProfile.clear();
-  m_ActiveKeyEnv.clear();
-  m_ActiveModel.clear();
-  m_ProfileKeyEnvs.clear();
-  m_ProfileModels.clear();
-  m_ProfileDefaultModels.clear();
-  m_ProfileRunInputSchemas.clear();
-  m_ProfileRows = QJsonArray();
+        m_ProfileRefreshRunning = false;
+        QSignalBlocker blocker(m_ProfileCombo);
+        m_ProfileCombo->clear();
+        m_ProfileCombo->setToolTip(QString());
+        m_ActiveProfile.clear();
+        m_ActiveKeyEnv.clear();
+        m_ActiveModel.clear();
+        m_ProfileKeyEnvs.clear();
+        m_ProfileModels.clear();
+        m_ProfileDefaultModels.clear();
+        m_ProfileRunInputSchemas.clear();
+        m_ProfileRows = QJsonArray();
 
-  const QJsonDocument document = QJsonDocument::fromJson(output);
-  if(exitCode == 0 && document.isArray())
-  {
-    int persistedDefaultIndex = -1;
-    int previousIndex = -1;
-    const QJsonArray rows = document.array();
-    for(const QJsonValue &value : rows)
-    {
-      const QJsonObject row = value.toObject();
-      if(!supportedQRenderDocConnection(row))
-        continue;
-      m_ProfileRows.append(row);
-      const QString id = row.value(lit("id")).toString();    // i18n-ignore: provider protocol key
-      if(id.isEmpty())
-        continue;
-      const QString kind = row.value(lit("kind")).toString();
-      const QString loopOwner = row.value(lit("loopOwner")).toString();
-      const QString keyEnvironment = row.value(lit("apiKeyEnv")).toString();
-      m_ProfileKeyEnvs[id] = keyEnvironment;
-      QStringList enabledModels;
-      for(const QJsonValue &modelValue : row.value(lit("models")).toArray())
-        if(!modelValue.toString().trimmed().isEmpty())
-          enabledModels << modelValue.toString().trimmed();
-      const QString defaultModel =
-          row.value(lit("defaultModel")).toString(row.value(lit("model")).toString());
-      if(enabledModels.isEmpty() && !defaultModel.isEmpty())
-        enabledModels << defaultModel;
-      m_ProfileModels[id] = enabledModels;
-      m_ProfileDefaultModels[id] = defaultModel;
-      QStringList runInputSchemas;
-      for(const QJsonValue &schemaValue :
-          row.value(lit("runInputSchemas")).toArray())    // i18n-ignore: AgentHost JSON field name
-        if(!schemaValue.toString().trimmed().isEmpty())
-          runInputSchemas << schemaValue.toString().trimmed();
-      m_ProfileRunInputSchemas[id] = runInputSchemas;
-      const QString displayName = connectionDisplayName(row);
-      const QString label =
-          loopOwner == lit("replaylab") || kind == lit("model")
-              ? tr("%1 | API").arg(displayName)
-              : tr("%1 | Subscription").arg(displayName);
-      m_ProfileCombo->addItem(label, id);
-      m_ProfileCombo->setItemData(m_ProfileCombo->count() - 1, keyEnvironment, Qt::UserRole + 1);
-      if(id == previousProfile)
-        previousIndex = m_ProfileCombo->count() - 1;
-      if(row.value(lit("active")).toBool())
-        persistedDefaultIndex = m_ProfileCombo->count() - 1;
-    }
-    int selectedIndex = previousIndex >= 0 ? previousIndex : persistedDefaultIndex;
-    if(selectedIndex < 0 && m_ProfileCombo->count() > 0)
-      selectedIndex = 0;
-    if(selectedIndex >= 0)
-    {
-      m_ProfileCombo->setCurrentIndex(selectedIndex);
-      m_ActiveProfile = m_ProfileCombo->currentData().toString();
-      m_ActiveKeyEnv = m_ProfileCombo->currentData(Qt::UserRole + 1).toString();
-      if(m_ActiveProfile == previousProfile &&
-         m_ProfileModels.value(m_ActiveProfile).contains(previousModel))
-        m_ActiveModel = previousModel;
-      else
-        m_ActiveModel = m_ProfileDefaultModels.value(m_ActiveProfile);
-    }
-  }
-  if(m_ProfileCombo->count() == 0)
-  {
-    m_ProfileCombo->addItem(tr("No connection configured"), QString());
-    if(!error.isEmpty())
-      m_ProfileCombo->setToolTip(error);
-  }
-  m_ProfileComboLoading = false;
-  // A removed provider/model is repaired independently for every conversation. Existing running
-  // requests keep the immutable PendingChat copy captured when Send was pressed.
-  const bool repairedConnectionSelections = repairConversationConnectionSelections();
-  if(conversation())
-    syncConnectionSelectionFromConversation();
-  else
-    refreshModelCombo();
-  if(repairedConnectionSelections && !m_LoadingConversations)
-    scheduleConversationSave();
-  refreshConnectionStatus();
-  const QVector<ProfileRefreshCompletion> completions =
-      std::move(m_ProfileRefreshCompletions);
-  m_ProfileRefreshCompletions.clear();
-  for(const ProfileRefreshCompletion &pendingCompletion : completions)
-    if(pendingCompletion.owner && pendingCompletion.function)
-      pendingCompletion.function();
-  });
+        const QJsonDocument document = QJsonDocument::fromJson(output);
+        if(exitCode == 0 && document.isArray())
+        {
+          int persistedDefaultIndex = -1;
+          int previousIndex = -1;
+          const QJsonArray rows = document.array();
+          for(const QJsonValue &value : rows)
+          {
+            const QJsonObject row = value.toObject();
+            if(!supportedQRenderDocConnection(row))
+              continue;
+            m_ProfileRows.append(row);
+            const QString id =
+                row.value(lit("id")).toString();    // i18n-ignore: provider protocol key
+            if(id.isEmpty())
+              continue;
+            const QString kind = row.value(lit("kind")).toString();
+            const QString loopOwner = row.value(lit("loopOwner")).toString();
+            const QString keyEnvironment = row.value(lit("apiKeyEnv")).toString();
+            m_ProfileKeyEnvs[id] = keyEnvironment;
+            QStringList enabledModels;
+            for(const QJsonValue &modelValue : row.value(lit("models")).toArray())
+              if(!modelValue.toString().trimmed().isEmpty())
+                enabledModels << modelValue.toString().trimmed();
+            const QString defaultModel =
+                row.value(lit("defaultModel")).toString(row.value(lit("model")).toString());
+            if(enabledModels.isEmpty() && !defaultModel.isEmpty())
+              enabledModels << defaultModel;
+            m_ProfileModels[id] = enabledModels;
+            m_ProfileDefaultModels[id] = defaultModel;
+            QStringList runInputSchemas;
+            for(const QJsonValue &schemaValue :
+                row.value(lit("runInputSchemas")).toArray())    // i18n-ignore: AgentHost JSON field name
+              if(!schemaValue.toString().trimmed().isEmpty())
+                runInputSchemas << schemaValue.toString().trimmed();
+            m_ProfileRunInputSchemas[id] = runInputSchemas;
+            const QString displayName = connectionDisplayName(row);
+            const QString label = loopOwner == lit("replaylab") || kind == lit("model")
+                                      ? tr("%1 | API").arg(displayName)
+                                      : tr("%1 | Subscription").arg(displayName);
+            m_ProfileCombo->addItem(label, id);
+            m_ProfileCombo->setItemData(m_ProfileCombo->count() - 1, keyEnvironment,
+                                        Qt::UserRole + 1);
+            if(id == previousProfile)
+              previousIndex = m_ProfileCombo->count() - 1;
+            if(row.value(lit("active")).toBool())
+              persistedDefaultIndex = m_ProfileCombo->count() - 1;
+          }
+          int selectedIndex = previousIndex >= 0 ? previousIndex : persistedDefaultIndex;
+          if(selectedIndex < 0 && m_ProfileCombo->count() > 0)
+            selectedIndex = 0;
+          if(selectedIndex >= 0)
+          {
+            m_ProfileCombo->setCurrentIndex(selectedIndex);
+            m_ActiveProfile = m_ProfileCombo->currentData().toString();
+            m_ActiveKeyEnv = m_ProfileCombo->currentData(Qt::UserRole + 1).toString();
+            if(m_ActiveProfile == previousProfile &&
+               m_ProfileModels.value(m_ActiveProfile).contains(previousModel))
+              m_ActiveModel = previousModel;
+            else
+              m_ActiveModel = m_ProfileDefaultModels.value(m_ActiveProfile);
+          }
+        }
+        if(m_ProfileCombo->count() == 0)
+        {
+          m_ProfileCombo->addItem(tr("No connection configured"), QString());
+          if(!error.isEmpty())
+            m_ProfileCombo->setToolTip(error);
+        }
+        m_ProfileComboLoading = false;
+        // A removed provider/model is repaired independently for every conversation. Existing
+        // running requests keep the immutable PendingChat copy captured when Send was pressed.
+        const bool repairedConnectionSelections = repairConversationConnectionSelections();
+        if(conversation())
+          syncConnectionSelectionFromConversation();
+        else
+          refreshModelCombo();
+        if(repairedConnectionSelections && !m_LoadingConversations)
+          scheduleConversationSave();
+        refreshConnectionStatus();
+        const QVector<ProfileRefreshCompletion> completions = std::move(m_ProfileRefreshCompletions);
+        m_ProfileRefreshCompletions.clear();
+        for(const ProfileRefreshCompletion &pendingCompletion : completions)
+          if(pendingCompletion.owner && pendingCompletion.function)
+            pendingCompletion.function();
+      });
 }
 
 void AIAssistant::refreshModelCombo()

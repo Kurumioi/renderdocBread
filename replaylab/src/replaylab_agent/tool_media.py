@@ -26,6 +26,9 @@ What was checked, by reading the installed packages rather than guessing:
   both layers.
 * ``openai.types.chat.ChatCompletionToolMessageParam.content`` is a string or text
   parts only. The Chat Completions API cannot carry a picture in a tool result at all.
+  For explicitly vision-enabled Chat connections, ``tool_image_middleware`` instead
+  projects images into reference-only user image parts after the completed tool
+  batch. This changes only the model request, never the stored user conversation.
 
 Nothing here is a policy about what the model *should* look at. It answers one
 question -- can this connection carry this kind of content -- and when the answer is
@@ -198,7 +201,7 @@ def _unsendable_reason(item: Mapping[str, Any], protocol: str) -> str:
 
 
 def build_tool_result(text: str, media: Sequence[Mapping[str, Any]],
-                      protocol: str) -> str | list[dict[str, Any]]:
+                      protocol: str, *, chat_image_companion: bool = False) -> str | list[dict[str, Any]]:
     """The tool result to hand back, inlining what this connection can actually carry.
 
     Returns a plain string when there is nothing to inline, so a text-only result is
@@ -209,13 +212,21 @@ def build_tool_result(text: str, media: Sequence[Mapping[str, Any]],
     if not media:
         return text
 
-    builder = _BUILDERS.get(str(protocol or "").strip().lower())
+    protocol = str(protocol or "").strip().lower()
+    companion = chat_image_companion and protocol in {"openai-chat", "azure-openai"}
+    # Chat image blocks are retained internally until model middleware moves them
+    # into a reference-only user message after the complete tool-result batch.
+    # They must never be serialized inside ChatCompletionToolMessageParam.
+    builder = _openai_block if companion else _BUILDERS.get(protocol)
     usable: list[Mapping[str, Any]] = []
     skipped: list[str] = []
     spent = 0
     for item in media:
         size = int(item.get("byteSize") or 0)
-        if builder is None or not carries(protocol, item["kind"], item["mediaType"]):
+        supported = (item["kind"] == "image" and item["mediaType"] in
+                     PROTOCOL_MEDIA["openai-responses"]["image"]) if companion else carries(
+                         protocol, item["kind"], item["mediaType"])
+        if builder is None or not supported:
             skipped.append("%s: %s" % (item["mediaType"], _unsendable_reason(item, protocol)))
             continue
         if size > MAX_INLINE_ITEM_BYTES or spent + size > MAX_INLINE_TOTAL_BYTES:

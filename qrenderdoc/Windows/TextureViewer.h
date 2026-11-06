@@ -26,11 +26,14 @@
 
 #include <QDir>
 #include <QFrame>
+#include <QImage>
+#include <QJsonObject>
 #include <QMenu>
 #include <QMouseEvent>
 #include <QPointer>
 #include <QTime>
 #include <atomic>
+#include <functional>
 #include <map>
 #include <tuple>
 #include <vector>
@@ -49,6 +52,8 @@ class QFileSystemWatcher;
 class TextureViewer;
 class QSplitter;
 class RenderTargetHistoryView;
+class QStackedWidget;
+class AITextureAnnotation;
 
 struct Following
 {
@@ -174,6 +179,12 @@ public:
                                                    CompType typeCast, uint32_t anchorEID);
   void CloseRenderTargetHistory();
   void RenderTargetHistorySelectionChanged(uint32_t eventId);
+  void BeginAIAnnotation(const QJsonObject &captureBinding,
+                         std::function<bool(const QImage &, const QImage &, const QJsonObject &)> accept,
+                         std::function<void(const QString &)> error);
+  bool MatchesAIAnnotation(const QJsonObject &context) const;
+  void EditAIAnnotation(const QImage &original, const QString &title, const QJsonObject &context,
+                        std::function<bool(const QImage &, const QImage &, const QJsonObject &)> accept);
 
   // ICaptureViewer
   void OnCaptureLoaded() override;
@@ -257,6 +268,10 @@ protected:
   void showEvent(QShowEvent *event) override;
 
 private:
+  QStackedWidget *m_AIAnnotationStack = NULL;
+  QPointer<AITextureAnnotation> m_AIAnnotation;
+  uint64_t m_AIAnnotationSerial = 0;
+  void CloseAIAnnotation();
   struct ViewRequest
   {
     TextureDisplay display;
