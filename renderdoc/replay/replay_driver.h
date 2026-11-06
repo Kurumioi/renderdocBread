@@ -29,8 +29,12 @@
 #include "core/core.h"
 #include "maths/vec.h"
 
+class Matrix4f;
+
 struct MeshComponentHighlight
 {
+  Matrix4f DepthBiasedTransform(const Matrix4f &mvp) const;
+
   rdcarray<FloatVector> vertices;
   Topology topology = Topology::TriangleList;
 };

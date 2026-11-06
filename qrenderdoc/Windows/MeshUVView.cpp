@@ -608,11 +608,12 @@ void MeshUVTextureView::initializeGL()
   m_Shader.reset(new QOpenGLShaderProgram);
   const char *vertex =
       "attribute highp vec4 position; attribute highp vec2 uv;"
-      "uniform highp mat4 transform; uniform bool homogenous;"
+      "uniform highp mat4 transform; uniform bool homogenous, highlight;"
       "varying highp vec2 texcoord;"
       "void main() {"
       "  gl_Position = transform * vec4(position.xyz, homogenous ? position.w : 1.0);"
       "  gl_Position.z = gl_Position.z * 2.0 - gl_Position.w;"
+      "  if (highlight) gl_Position.z -= gl_Position.w * 0.001;"
       "  gl_PointSize = 7.0; texcoord = uv;"
       "}";
   const char *fragment =
@@ -712,6 +713,7 @@ void MeshUVTextureView::paintGL()
   m_Shader->bind();
   m_Shader->setUniformValue("transform", m_Transform);
   m_Shader->setUniformValue("homogenous", m_Homogenous);
+  m_Shader->setUniformValue("highlight", false);
   m_Shader->setUniformValue("flipY", m_Mesh->flipTexture);
   m_Shader->setUniformValue("image", 0);
   m_Shader->setUniformValue("textured", m_Texture != nullptr);
@@ -738,6 +740,7 @@ void MeshUVTextureView::paintGL()
   }
   if(!m_Selection.isEmpty())
   {
+    m_Shader->setUniformValue("highlight", true);
     m_Selected.bind();
     m_Shader->setAttributeBuffer(position, GL_FLOAT, 0, 4, sizeof(QVector4D));
     m_Shader->setUniformValue("color", QVector4D(1.0f, .61f, .20f, 1));

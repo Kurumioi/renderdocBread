@@ -775,8 +775,8 @@ void D3D12Replay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secon
     helper.topology = points ? Topology::TriangleList : components.topology;
     cache = GetDebugManager()->CacheMeshDisplayPipelines(helper, helper);
     MeshVertexCBuffer component = vertexData;
-    component.ModelViewProj =
-        projMat.Mul(camMat.Mul(cfg.position.unproject ? guessProjInv : axisMapMat));
+    component.ModelViewProj = components.DepthBiasedTransform(
+        projMat.Mul(camMat.Mul(cfg.position.unproject ? guessProjInv : axisMapMat)));
     component.homogenousInput = cfg.position.unproject;
     if(points)
       component.SpriteSize = Vec2f(-500.0f / viewport.Width, 500.0f / viewport.Height);

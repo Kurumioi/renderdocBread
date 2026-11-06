@@ -630,7 +630,8 @@ void GLReplay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secondar
     const bool points = components.topology == Topology::PointList;
     const Topology topology = points ? Topology::TriangleList : components.topology;
     MeshUBOData component = uboParams;
-    component.mvp = projMat.Mul(camMat.Mul(cfg.position.unproject ? guessProjInv : axisMapMat));
+    component.mvp = components.DepthBiasedTransform(
+        projMat.Mul(camMat.Mul(cfg.position.unproject ? guessProjInv : axisMapMat)));
     component.homogenousInput = cfg.position.unproject;
     component.color = Vec4f(1.0f, 0.36f, 0.035f, 1.0f);
     if(points)

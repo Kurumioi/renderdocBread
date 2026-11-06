@@ -1038,7 +1038,8 @@ void VulkanReplay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &seco
     const bool points = components.topology == Topology::PointList;
     helper.topology = points ? Topology::TriangleList : components.topology;
     cache = GetDebugManager()->CacheMeshDisplayPipelines(m_MeshRender.PipeLayout, helper, helper);
-    meshUniforms.mvp = projMat.Mul(camMat.Mul(cfg.position.unproject ? guessProjInv : axisMapMat));
+    meshUniforms.mvp = components.DepthBiasedTransform(
+        projMat.Mul(camMat.Mul(cfg.position.unproject ? guessProjInv : axisMapMat)));
     meshUniforms.homogenousInput = cfg.position.unproject;
     meshUniforms.color = Vec4f(1.0f, 0.36f, 0.035f, 1.0f);
     if(points)
