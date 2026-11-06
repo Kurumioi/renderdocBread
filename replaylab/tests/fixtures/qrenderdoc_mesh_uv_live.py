@@ -28,8 +28,9 @@ class Probe:
         self.timer.stop()
         self.result.update(ok=not error, error=error, phase=self.phase)
         (self.root/'mesh-uv-result.json').write_text(json.dumps(self.result, ensure_ascii=False, indent=2), encoding='utf-8')
-        pyrenderdoc.CloseCapture()
-        QtCore.QTimer.singleShot(100, self.app.quit)
+        # Run native teardown after returning from the Python timer callback.
+        window = pyrenderdoc.GetMainWindow().Widget()
+        QtCore.QMetaObject.invokeMethod(window, 'close', QtCore.Qt.QueuedConnection)
 
     def link(self, url):
         browsers = self.window.findChildren(QtWidgets.QTextBrowser)
@@ -128,10 +129,16 @@ link=save_navigation_target(observed['target'],ctx['capture'])
                             textureReady=atlas.property('uvTextureReady') if atlas else None)
                         raise RuntimeError('UV data did not reach both previews')
                     return
-                assert int(pyrenderdoc.CurEvent()) == 1291 and atlas.isVisible() and mesh.isVisible()
                 channel = view.findChild(QtWidgets.QComboBox, 'meshUVChannels')
                 texture = view.findChild(QtWidgets.QComboBox, 'meshUVTextures')
-                self.keep.extend([channel, texture])
+                mode = view.findChild(QtWidgets.QComboBox, 'visualisation')
+                self.keep.extend([channel, texture, mode])
+                if int(pyrenderdoc.CurEvent()) != 1291 or not atlas.isVisible() or not mesh.isVisible():
+                    if time.monotonic() - self.uv_started < 8:
+                        return
+                    self.result['uvVisibility'] = dict(event=int(pyrenderdoc.CurEvent()), view=view.isVisible(),
+                        atlas=atlas.isVisible(), mesh=mesh.isVisible(), visualisation=mode.currentText())
+                    raise RuntimeError('UV navigation did not expose the linked mesh/texture mode')
                 self.result.update(triangleCount=atlas.property('uvTriangleCount'), channel=channel.currentText(),
                                    texture=texture.currentText(), textureChoices=texture.count())
                 assert channel.currentIndex() >= 0 and texture.currentIndex() > 0
