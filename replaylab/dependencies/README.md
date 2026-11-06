@@ -36,7 +36,7 @@ Bread 通用 MCP 适配器与提供商专用服务应分别进行健康检查。
 | Python 文档环境 | CPython、python-docx、openpyxl、python-pptx、pypdf、Pillow、artifact_tool_v2 等 | 每个发行包的版本、许可证与原生扩展；不把本机 venv 当作唯一来源 |
 | Node 文档与图像环境 | Node、docx、pptxgenjs、pdf-lib、pdfjs-dist、sharp、tesseract.js、Playwright SDK 等 | 保留 SDK、平台 DLL 和传递依赖；Playwright SDK 与 Chromium 本体是不同输入 |
 | 桌面与辅助命令 | PowerShell、Git、Poppler、libheif、jxrlib 等 | 可再分发运行库、许可证和运行所需 DLL 一起保留 |
-| 自定义技能 | custom-skills 胶囊中的技能、脚本及依赖；Bread 内置技能在 `.agents/skills` 和 `replaylab/portable_skills` | 保留曾使用的功能、引用文件和兼容路由，不能只复制 SKILL.md；个人覆盖副本与默认技能应明确区分 |
+| 发行技能 | Bread 内置技能在 `.agents/skills` 和 `replaylab/portable_skills`；custom-skills 胶囊保留已批准的兼容路由及供应商系统技能 | 保留正式技能的参考文件、脚本及依赖；本机个人技能与用户覆盖副本留在仓库外 |
 | Shader 工具 | DXC、FXC、glslang、SPIRV-Tools、SPIRV-Cross、RenoDX decomp、DXIL-SPIRV、3Dmigoto HLSL decompiler | 编译器和相邻 DLL、固定版本、文件哈希、完整许可证；GPL 组件还需对应源码及构建说明 |
 | Shader 语言服务 | Slang 2026.20 | 归档、选用的二进制、原始通知以及 `provider.json` 中的哈希 |
 | Unity 接入 | Coplay Unity MCP v10.3.0，提交 aa5fc638d623f56178d50329d9ad8c541a57fe66；Bread 两个 Unity 包 | 上游源码、锁文件、Python 服务运行环境、Editor 包均应可恢复；不包含用户 Unity 工程 |

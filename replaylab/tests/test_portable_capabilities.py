@@ -13,6 +13,24 @@ from replaylab_agent import connection_readiness as readiness
 from replaylab_agent.portable_tools import document, execute
 
 
+@pytest.mark.parametrize("generation_length", [20, 64])
+def test_source_checkout_discovers_restored_capability_skills(tmp_path, monkeypatch, generation_length):
+    monkeypatch.delenv("BREAD_CAPABILITIES_ROOT", raising=False)
+    monkeypatch.setenv("BREAD_APP_ROOT", str(tmp_path))
+    monkeypatch.setattr(caps, "__file__", str(tmp_path / "src/replaylab_agent/portable_capabilities.py"))
+    digest = "0123456789abcdef" * 4
+    lock = tmp_path / "dependencies/inputs.lock.json"
+    lock.parent.mkdir()
+    lock.write_text(json.dumps({"archives": [{"id": "capabilities", "sha256": digest}]}), encoding="utf-8")
+    restored = tmp_path / "output/build-inputs/expanded/capabilities" / digest[:generation_length]
+    skills = restored / "custom-skills"
+    skills.mkdir(parents=True)
+    manifest = {"schema": "bread-portable-capabilities/v1", "skillRoots": ["custom-skills"]}
+    (restored / "bread-capabilities.json").write_text(json.dumps(manifest), encoding="utf-8")
+    assert caps.bundle_root() == restored
+    assert caps.skill_roots() == (skills,)
+
+
 def test_docs_runtime_is_ready_without_office_or_bundled_browser(tmp_path, monkeypatch):
     monkeypatch.setenv('BREAD_CAPABILITIES_ROOT', str(tmp_path))
     paths = ['python/python.exe', 'node/bin/node.exe'] + [

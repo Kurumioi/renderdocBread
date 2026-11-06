@@ -29,9 +29,12 @@ def bundle_root() -> Path:
     try:
         lock = json.loads((source / "dependencies/inputs.lock.json").read_text(encoding="utf-8"))
         record = next(r for r in lock["archives"] if r["id"] == "capabilities")
-        restored = source / "output/build-inputs/expanded/capabilities" / record["sha256"]
-        if (restored / "bread-capabilities.json").is_file():
-            return restored
+        digest = record["sha256"]
+        restored_root = source / "output/build-inputs/expanded/capabilities"
+        for generation in (digest, digest[:20]):
+            restored = restored_root / generation
+            if (restored / "bread-capabilities.json").is_file():
+                return restored
     except (OSError, ValueError, KeyError, StopIteration):
         pass
     # Retain development installs prepared by the former import command.

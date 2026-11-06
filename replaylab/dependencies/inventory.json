@@ -75,168 +75,6 @@
   "packages": [
     {
       "kind": "npm",
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/@img/sharp-win32-x64/package.json",
-      "name": "@img/sharp-win32-x64",
-      "version": "0.34.3",
-      "license": "Apache-2.0 AND LGPL-3.0-or-later",
-      "metadataSha256": "547483ab8172343adefa802509c8778ef018538febf0710fae8e962d2d128419"
-    },
-    {
-      "kind": "npm",
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/@xmldom/xmldom/package.json",
-      "name": "@xmldom/xmldom",
-      "version": "0.9.10",
-      "license": "MIT",
-      "metadataSha256": "375de5f24998b1772cdb4a2bcc1743c7bb1218c1a5bbb7f3504858d871bbad36"
-    },
-    {
-      "kind": "npm",
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/color/package.json",
-      "name": "color",
-      "version": "4.2.3",
-      "license": "MIT",
-      "metadataSha256": "d53949e5e17ef2fb51ba0a6221c5e71c9feae36854d6c81e8a35863f7407fd02"
-    },
-    {
-      "kind": "npm",
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/color-convert/package.json",
-      "name": "color-convert",
-      "version": "2.0.1",
-      "license": "MIT",
-      "metadataSha256": "9471d21744ca3137410448da6b3bd7b30ee91d42edce3b82ebcbf84faef74fb4"
-    },
-    {
-      "kind": "npm",
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/color-name/package.json",
-      "name": "color-name",
-      "version": "1.1.4",
-      "license": "MIT",
-      "metadataSha256": "4a557ea373907e4643badb89ff21b3f4b969d20631086d78eab2e03d05c2efa4"
-    },
-    {
-      "kind": "npm",
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/color-string/package.json",
-      "name": "color-string",
-      "version": "1.9.1",
-      "license": "MIT",
-      "metadataSha256": "30fb162f7493291dd29ced85001979f2e99fd68fbcf59ad55300a657d8352bd0"
-    },
-    {
-      "kind": "npm",
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/commander/package.json",
-      "name": "commander",
-      "version": "13.1.0",
-      "license": "MIT",
-      "metadataSha256": "7c956844374e86a9686f2c6445e868a22f21c0c5cc836c6b5060bcc77a976c9d"
-    },
-    {
-      "kind": "npm",
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/detect-libc/package.json",
-      "name": "detect-libc",
-      "version": "2.1.2",
-      "license": "Apache-2.0",
-      "metadataSha256": "ee88e5b954fdf3a8480b1d01ef767d68d8ca2c6da269f58c5cf1c5550e9aa2a7"
-    },
-    {
-      "kind": "npm",
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/esm/package.json",
-      "name": "esm",
-      "version": "3.2.25",
-      "license": "MIT",
-      "metadataSha256": "4c0ffd8e1c87672cff3e799da5169d421f89387e4a16afb577ebba4ba88cda80"
-    },
-    {
-      "kind": "npm",
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/is-arrayish/package.json",
-      "name": "is-arrayish",
-      "version": "0.3.4",
-      "license": "MIT",
-      "metadataSha256": "65c3c2e30da5d14342a79f1c19323ad336ab2d66f126990973c514aac7193dc2"
-    },
-    {
-      "kind": "npm",
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/mathjax-full/package.json",
-      "name": "mathjax-full",
-      "version": "3.2.2",
-      "license": "Apache-2.0",
-      "metadataSha256": "081d70370236219fb9caab67c9347d167ea5c645efd18197783d8c4a203a3db8"
-    },
-    {
-      "kind": "npm",
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/mhchemparser/package.json",
-      "name": "mhchemparser",
-      "version": "4.2.1",
-      "license": "Apache-2.0",
-      "metadataSha256": "434459a7c35b7b8d5e416fc9fb69981ff6922fd96fb3e0b176441652a8cc094d"
-    },
-    {
-      "kind": "npm",
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/mj-context-menu/package.json",
-      "name": "mj-context-menu",
-      "version": "0.6.1",
-      "license": "Apache-2.0",
-      "metadataSha256": "1c254f5929eb435ffe5d07ea23723ed691fdf31a78854494d6c90e972cbc9c14"
-    },
-    {
-      "kind": "npm",
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/semver/package.json",
-      "name": "semver",
-      "version": "7.8.5",
-      "license": "ISC",
-      "metadataSha256": "7c94cb7f2a53c27b20d76386ec144c062894dbcc909cfabd0f728c37874b1776"
-    },
-    {
-      "kind": "npm",
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/sharp/package.json",
-      "name": "sharp",
-      "version": "0.34.3",
-      "license": "Apache-2.0",
-      "metadataSha256": "bb884de2da8d26983d93fcb438882af77367ea434a129ebb0e9a46df1081f7b3"
-    },
-    {
-      "kind": "npm",
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/simple-swizzle/package.json",
-      "name": "simple-swizzle",
-      "version": "0.2.4",
-      "license": "MIT",
-      "metadataSha256": "87babf04f1bf696590824ef618468bada3631b38dacd032c82fdcf0cd72b6203"
-    },
-    {
-      "kind": "npm",
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/speech-rule-engine/package.json",
-      "name": "speech-rule-engine",
-      "version": "4.1.4",
-      "license": "Apache-2.0",
-      "metadataSha256": "cba66707f47dcfc3f0ad6e0548a7511040ab39ace4dc94ee76cc1a7439a3a09a"
-    },
-    {
-      "kind": "npm",
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/wicked-good-xpath/package.json",
-      "name": "wicked-good-xpath",
-      "version": "1.3.0",
-      "license": "MIT",
-      "metadataSha256": "792eb8f385530f2436ab8ebfd4ec932d96ab17099ee2b07c1a7db67f8395cd57"
-    },
-    {
-      "kind": "npm",
       "component": "node",
       "path": "node/node_modules/@img/colour/package.json",
       "name": "@img/colour",
@@ -3636,91 +3474,6 @@
       "sha256": "3ddf9be5c28fe27dad143a5dc76eea25222ad1dd68934a047064e56ed2fa40c5"
     },
     {
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/@img/sharp-win32-x64/LICENSE",
-      "sha256": "dc1f5d2d43c5531dfe0acaf4e950ea5dbe3e61e1850cf0e983bda7efc10d6693"
-    },
-    {
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/@xmldom/xmldom/LICENSE",
-      "sha256": "4da724fc305d81606b245b324d4d2586916b9d248b23d82183df753ace0fdf71"
-    },
-    {
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/color/LICENSE",
-      "sha256": "4c0844caafd3db9a4b643ea493558873710f4e9c8b257887ba066e5e80557848"
-    },
-    {
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/color-convert/LICENSE",
-      "sha256": "693866fc419c6f61c8570438ec00659d156ec2b4d4a4d04091711f5f11a365d4"
-    },
-    {
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/color-name/LICENSE",
-      "sha256": "c064f7a3e353bc1bc977f3c897941c75ef763f44f41677e0a15370ca0853d6e2"
-    },
-    {
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/color-string/LICENSE",
-      "sha256": "8984783ab2478bbee455f0eb6c375b5b62c57c86d4a55f6bf96dfd08e8d48a10"
-    },
-    {
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/commander/LICENSE",
-      "sha256": "04512a63dce4d2d506ad612dc0bd7681ccf6e3655f7b6eaef7dfac8323d1ec0b"
-    },
-    {
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/detect-libc/LICENSE",
-      "sha256": "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1"
-    },
-    {
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/esm/LICENSE",
-      "sha256": "fe315c4bce49df19bf06297ca372b2b486f4351d09a487918711c8ed624dcbe8"
-    },
-    {
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/is-arrayish/LICENSE",
-      "sha256": "92b07a2e5b0e051d37dde85042c736d6d551cfcbc0983f39d7ef903b3986bbc1"
-    },
-    {
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/mathjax-full/LICENSE",
-      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
-    },
-    {
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/mhchemparser/LICENSE.txt",
-      "sha256": "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1"
-    },
-    {
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/semver/LICENSE",
-      "sha256": "4ec3d4c66cd87f5c8d8ad911b10f99bf27cb00cdfcff82621956e379186b016b"
-    },
-    {
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/sharp/LICENSE",
-      "sha256": "73ba74dfaa520b49a401b5d21459a8523a146f3b7518a833eea5efa85130bf68"
-    },
-    {
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/simple-swizzle/LICENSE",
-      "sha256": "8f67ef1afdbd7b8ddc3e2da9968bb97af30795ae9c90a2cc4d867e5608216973"
-    },
-    {
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/speech-rule-engine/LICENSE",
-      "sha256": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594"
-    },
-    {
-      "component": "custom-skills",
-      "path": "custom-skills/migrate-zhihu-to-wechat/scripts/node_modules/wicked-good-xpath/LICENSE",
-      "sha256": "1691999de7a5de50698e735c25506ea8ab6b71d008d27ef9e1400a5075000e78"
-    },
-    {
       "component": "native",
       "path": "native/git/LICENSE.txt",
       "sha256": "454649ddc02b5cc098513cea28db6592b45ac0a906386287c4d48cf8dbde651c"
@@ -6258,18 +6011,18 @@
     {
       "id": "capabilities",
       "path": "capabilities.zip",
-      "size": 522539526,
-      "sha256": "d52b9d6759d16cca4cfd82af76ba16dde5eb0776c948ec475eca53a6017cad91",
+      "size": 503644308,
+      "sha256": "66bfdb0a1b7621a9dcf0c2789b5b4a9bd0b01edc77771d36990636c304a69f90",
       "provenance": {
         "kind": "authorized-sealed-snapshot",
-        "manifestSha256": "09f279b5cb6c9995ab39545d02593212a23b46f76e6c25893c2e4c4eb6df1e77",
+        "manifestSha256": "fa1d5324831175993b77f593802d38e99751e4a5810b643ab8dc016f287c1440",
         "profile": "standard",
         "excludes": [
           "LibreOffice",
           "Chromium"
         ]
       },
-      "fileCount": 729
+      "fileCount": 690
     },
     {
       "id": "application-tools",

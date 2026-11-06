@@ -167,7 +167,7 @@ def audit(root, config):
                 errors.append("Unrequested extension in core release: " + relative)
     else:
         from prepare_capabilities_bundle import verify
-        verify(root / "replaylab/tools/capabilities")
+        verify(root / "replaylab/tools/capabilities", public=True)
     if errors:
         raise ValueError("Release audit failed:\n" + "\n".join(errors))
 

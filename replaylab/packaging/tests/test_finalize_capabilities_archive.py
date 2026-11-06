@@ -40,9 +40,9 @@ def base_release(tmp_path, extra_files=None):
 def test_finalization_preserves_validated_dependencies_and_base(tmp_path):
     base, source, metadata = base_release(tmp_path)
     before = digest(base)
-    snapshot = source / "user-skill-snapshots/example/SKILL.md"
-    snapshot.parent.mkdir(parents=True)
-    snapshot.write_text("personal procedure", encoding="utf-8")
+    adapter = source / "bread-adapters/example/SKILL.md"
+    adapter.parent.mkdir(parents=True)
+    adapter.write_text("application adapter", encoding="utf-8")
     bundle.seal(source, metadata)
     final = tmp_path / "final.zip"
     receipt = finalize(base, source, final)
@@ -55,6 +55,18 @@ def test_finalization_preserves_validated_dependencies_and_base(tmp_path):
         manifest = json.loads(archive.read("RenderDocBread/RenderDocBread.manifest.json"))
         for record in manifest["files"]:
             assert hashlib.sha256(archive.read("RenderDocBread/" + record["path"])).hexdigest() == record["sha256"]
+
+
+def test_finalization_rejects_private_skill_overlay(tmp_path):
+    base, source, metadata = base_release(tmp_path)
+    snapshot = source / "user-skill-snapshots/example/SKILL.md"
+    snapshot.parent.mkdir(parents=True)
+    snapshot.write_text("personal procedure", encoding="utf-8")
+    bundle.seal(source, metadata)
+    output = tmp_path / "final.zip"
+    with pytest.raises(ValueError, match="Unapproved skill"):
+        finalize(base, source, output)
+    assert not output.exists()
 
 
 def test_finalization_rejects_a_changed_runtime_dependency(tmp_path):

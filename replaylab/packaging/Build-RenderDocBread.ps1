@@ -49,7 +49,7 @@ $env:PATH = (Split-Path -Parent $PythonExecutable) + ';' + $env:PATH
 if (-not $QtBin) { $QtBin = $paths.'qt-linguist' }
 if (-not $CapabilitiesDirectory) { $CapabilitiesDirectory = $paths.capabilities }
 if ($CapabilitiesDirectory) {
-    & $PythonExecutable (Join-Path $PSScriptRoot 'prepare_capabilities_bundle.py') --output $CapabilitiesDirectory
+    & $PythonExecutable (Join-Path $PSScriptRoot 'prepare_capabilities_bundle.py') --output $CapabilitiesDirectory --public
     if ($LASTEXITCODE -ne 0) { throw 'The explicitly selected capabilities snapshot failed verification.' }
 }
 function Invoke-CheckedScript([string]$Script, [string[]]$Arguments) {
