@@ -15,7 +15,7 @@ import shutil
 import tempfile
 import zipfile
 
-from prepare_capabilities_bundle import verify
+from prepare_capabilities_bundle import verify, verify_public_skill_inventory
 
 
 def digest(path):
@@ -39,8 +39,9 @@ def finalize(base: Path, capabilities: Path | None, output: Path, runtime: Path 
         # capability tree, copy, or repeated per-file filesystem scan.
         with zipfile.ZipFile(base) as previous_archive:
             source = json.loads(previous_archive.read("RenderDocBread/replaylab/tools/capabilities/bread-capabilities.json"))
+        verify_public_skill_inventory(source)
     else:
-        source = verify(capabilities)
+        source = verify(capabilities, public=True)
     source = {**source, "files": [record for record in source["files"]
                                   if not record["path"].startswith(("python/Scripts/", "browsers/.links/"))],
               "excludedBuildOnly": ["python/Scripts/", "browsers/.links/"]}
@@ -67,6 +68,7 @@ def finalize(base: Path, capabilities: Path | None, output: Path, runtime: Path 
     with zipfile.ZipFile(base) as old:
         manifest = json.loads(old.read(prefix + "RenderDocBread.manifest.json"))
         previous = json.loads(old.read(prefix + capsule + "bread-capabilities.json"))
+        verify_public_skill_inventory(previous)
         records = {record["path"]: record for record in manifest["files"]}
         next_records = {record["path"]: record for record in source["files"]}
         for record in previous["files"]:
@@ -74,8 +76,8 @@ def finalize(base: Path, capabilities: Path | None, output: Path, runtime: Path 
                 raise ValueError("Finalization cannot change a validated runtime dependency")
         for path, record in next_records.items():
             if capsule + path not in records:
-                if not path.startswith(("user-skill-snapshots/", "bread-adapters/")):
-                    raise ValueError("Only declared user skill snapshots may be added")
+                if not path.startswith("bread-adapters/"):
+                    raise ValueError("Only declared Bread adapters may be added")
                 if capabilities is None:
                     raise ValueError("New capabilities require a verified source snapshot")
                 additions[capsule + path] = (capabilities / path).read_bytes()

@@ -6,11 +6,11 @@
     {
       "id": "capabilities",
       "path": "capabilities.zip",
-      "size": 522539526,
-      "sha256": "d52b9d6759d16cca4cfd82af76ba16dde5eb0776c948ec475eca53a6017cad91",
+      "size": 503644308,
+      "sha256": "66bfdb0a1b7621a9dcf0c2789b5b4a9bd0b01edc77771d36990636c304a69f90",
       "provenance": {
         "kind": "authorized-sealed-snapshot",
-        "manifestSha256": "09f279b5cb6c9995ab39545d02593212a23b46f76e6c25893c2e4c4eb6df1e77",
+        "manifestSha256": "fa1d5324831175993b77f593802d38e99751e4a5810b643ab8dc016f287c1440",
         "profile": "standard",
         "excludes": [
           "LibreOffice",
@@ -25,13 +25,13 @@
         },
         {
           "path": "bread-capabilities.json",
-          "size": 5563253,
-          "sha256": "09f279b5cb6c9995ab39545d02593212a23b46f76e6c25893c2e4c4eb6df1e77"
+          "size": 4503619,
+          "sha256": "fa1d5324831175993b77f593802d38e99751e4a5810b643ab8dc016f287c1440"
         },
         {
           "path": "bundles/custom-skills.zip",
-          "size": 17403966,
-          "sha256": "36708a8d4de2e319ab415dc42dd8585011e87e05cc9df9d09d0ee9ca32630aa9"
+          "size": 150673,
+          "sha256": "a82cc0c392c45ed1edcafc1760d721834313a1680924cf80c6ff60230705e641"
         },
         {
           "path": "bundles/native.zip",
@@ -299,146 +299,6 @@
           "sha256": "2cd6eecbaf9be7c86e80a14d7042f95d6abb83b6baee5f17dd075fa7a71c83de"
         },
         {
-          "path": "custom-skills/endless-tide-unit-assets/SKILL.md",
-          "size": 8844,
-          "sha256": "a6b6cab2d1746e0815069f94bc37122d7dda3e9a9533ed0e6acc8940e0b7f6be"
-        },
-        {
-          "path": "custom-skills/endless-tide-unit-assets/agents/openai.yaml",
-          "size": 450,
-          "sha256": "afd4337f842eeb772c1651907ce620bdf25bfaef0ce01df15fb61366a273296a"
-        },
-        {
-          "path": "custom-skills/endless-tide-unit-assets/references/auto-shadow-fit.md",
-          "size": 2609,
-          "sha256": "2571048261428251500f92e4109500a98ff5857d4a7ad812228e4458c6989bb0"
-        },
-        {
-          "path": "custom-skills/generate2dmap/SKILL.md",
-          "size": 43129,
-          "sha256": "95c37d5ada1f1711cb840db59ada22d5d59d3aae9b7555fd148aa761e3630e0f"
-        },
-        {
-          "path": "custom-skills/generate2dmap/agents/openai.yaml",
-          "size": 1838,
-          "sha256": "a7f8e4b101269ee98faf01a864814b111a52802323b07d4d35ab13906cf286e9"
-        },
-        {
-          "path": "custom-skills/generate2dmap/references/layered-map-contract.md",
-          "size": 7972,
-          "sha256": "a0f5256c98b36a2006661c685c448df04b7c5ee4ab9d81c271b2d9fa5a2437fc"
-        },
-        {
-          "path": "custom-skills/generate2dmap/references/map-strategies.md",
-          "size": 26578,
-          "sha256": "8b95bfdc8ed7eb4c84ea11933bb1d4d61aa364e77b3a8c5f8f9bac173438db38"
-        },
-        {
-          "path": "custom-skills/generate2dmap/references/prop-pack-contract.md",
-          "size": 9799,
-          "sha256": "521c0644c75efd6eedc5336d4ede6b88c9dbf2b9e308b38a7168ced39eee929b"
-        },
-        {
-          "path": "custom-skills/generate2dmap/scripts/compose_layered_preview.py",
-          "size": 4778,
-          "sha256": "d1818c4257a4196a535041fd6e1d35c3b8f05c46d4a69bb45236e117da5f0a60"
-        },
-        {
-          "path": "custom-skills/generate2dmap/scripts/extract_prop_pack.py",
-          "size": 12348,
-          "sha256": "f5e8482abd6db573790a8471b23a7581d9e20d91c8bccb9fc53427b82610da1c"
-        },
-        {
-          "path": "custom-skills/generate2dsprite/SKILL.md",
-          "size": 18706,
-          "sha256": "769e3f9ed106bef4ac53e976e539ed91a96baae76693b8edb8ebb31ade1e1a04"
-        },
-        {
-          "path": "custom-skills/generate2dsprite/agents/openai.yaml",
-          "size": 1564,
-          "sha256": "da56f1ad09ba471c1435eb051a3de315223edf96c7e40c01fd58eff7033f9ad5"
-        },
-        {
-          "path": "custom-skills/generate2dsprite/references/modes.md",
-          "size": 5799,
-          "sha256": "88b75203732cf1e04af8d98427c2ddef617b7bbc1a844841d75efdf4c1359a39"
-        },
-        {
-          "path": "custom-skills/generate2dsprite/references/prompt-rules.md",
-          "size": 11642,
-          "sha256": "600061ffb79766fa642f771392f7157dd42197d544e9693cef8b160afd63d3e6"
-        },
-        {
-          "path": "custom-skills/generate2dsprite/scripts/generate2dsprite.py",
-          "size": 39282,
-          "sha256": "476b69813fa148661ff75c7bf8ba0146d26e995e354b9000b63443936a5f87f7"
-        },
-        {
-          "path": "custom-skills/generate2dsprite/scripts/make_layout_guide.py",
-          "size": 3575,
-          "sha256": "b613e48fb0e9a025dc3ceba35886b4689fa780499e0276783532cd3cfdf9a52d"
-        },
-        {
-          "path": "custom-skills/migrate-zhihu-to-wechat/SKILL.md",
-          "size": 8500,
-          "sha256": "0ae87be69250cee50342c71975e9206185ef3e1973196c09ddafe33f8a94fc8a"
-        },
-        {
-          "path": "custom-skills/migrate-zhihu-to-wechat/agents/openai.yaml",
-          "size": 343,
-          "sha256": "c5630f6472100b3c1ecc8ff63195b7b83c3f93edb774cf990bca8428f4287d27"
-        },
-        {
-          "path": "custom-skills/migrate-zhihu-to-wechat/references/api-and-editor.md",
-          "size": 6394,
-          "sha256": "4cd969858dbce84d0efa92fb26d3166a753dfd23e453e2d842851d57e49ceec9"
-        },
-        {
-          "path": "custom-skills/migrate-zhihu-to-wechat/references/requirements.md",
-          "size": 10161,
-          "sha256": "152225ac1b9d19a05014adabb59039c421bdea168360aceeafd07025e09089de"
-        },
-        {
-          "path": "custom-skills/migrate-zhihu-to-wechat/scripts/analyze_zhihu.py",
-          "size": 13355,
-          "sha256": "866847e6740ee524b42dfaa480012f22b6d0caa31511f45be763461f51ecf57e"
-        },
-        {
-          "path": "custom-skills/migrate-zhihu-to-wechat/scripts/apply_formula_sizes.py",
-          "size": 3508,
-          "sha256": "caabbfbc7cbb797ba218c13d927bd6bc03167a0d8e5ce58741053e2cf0594145"
-        },
-        {
-          "path": "custom-skills/migrate-zhihu-to-wechat/scripts/build_code_fallback.py",
-          "size": 8160,
-          "sha256": "294ea3e594f20f2e46b5950b54acf1953cac216938d6bc5d332658e72ce255ea"
-        },
-        {
-          "path": "custom-skills/migrate-zhihu-to-wechat/scripts/optimize_gif.py",
-          "size": 3823,
-          "sha256": "3e52f35aa7927a93b05424fae6573b5aa7d8dc855f671e7bcd454a8fe74b719c"
-        },
-        {
-          "path": "custom-skills/migrate-zhihu-to-wechat/scripts/package-lock.json",
-          "size": 22011,
-          "sha256": "62344d0f5c9d9c81e536abc3716a9e85e820314ce690aedb4e9db0953da22e53"
-        },
-        {
-          "path": "custom-skills/migrate-zhihu-to-wechat/scripts/package.json",
-          "size": 98,
-          "sha256": "c34b6b90464b4a5e1df99a33e49544d61650760b39e10efc6a0d4eda2783a0b3"
-        },
-        {
-          "path": "custom-skills/migrate-zhihu-to-wechat/scripts/render_formulas.mjs",
-          "size": 6152,
-          "sha256": "00c13729c6b65ef061422c3977834feb508d5f14b221fef241d4caf9bb2117c9"
-        },
-        {
-          "path": "custom-skills/migrate-zhihu-to-wechat/scripts/verify_wechat_html.py",
-          "size": 35685,
-          "sha256": "7bdceb01c43e328eeda767c31dd91b6e214c6659f70bf73f85bd9ef1e7e6492c"
-        },
-        {
           "path": "custom-skills/renderdoc-analyzer/SKILL.md",
           "size": 1000,
           "sha256": "b2b8ba910cd9e6606b994f789a3fbdcd45faf14b8ac463caa7c04017d8ecf171"
@@ -457,26 +317,6 @@
           "path": "custom-skills/replaylab-debugger/SKILL.md",
           "size": 947,
           "sha256": "366d2bb9a68c58a0fe02f6f2d61ac153b4e683fc1000ea36f7d1ec05d80f8894"
-        },
-        {
-          "path": "custom-skills/screenshot-to-lora/SKILL.md",
-          "size": 11109,
-          "sha256": "b0fe28b06f4a725f66b2164aa70d15f8631f229befa2f0fd8b57608a2a23fece"
-        },
-        {
-          "path": "custom-skills/screenshot-to-lora/agents/openai.yaml",
-          "size": 254,
-          "sha256": "22de39cd76490131c1699a69c7685dd6e933b4a2c697fd26a9527678839287dc"
-        },
-        {
-          "path": "custom-skills/screenshot-to-lora/references/pipeline-contract.md",
-          "size": 6190,
-          "sha256": "6496a1a5dd7e410821609332697b21cb4481cf78467bc5c605f74ff1713eb27c"
-        },
-        {
-          "path": "custom-skills/screenshot-to-lora/scripts/pipeline.py",
-          "size": 145367,
-          "sha256": "85bc1c0a5f01c1c91ac8c4694d08c5b86261530e72c51b64bc5a81553aec2eb1"
         },
         {
           "path": "custom-skills/uex-export-asset-report/SKILL.md",
@@ -3627,98 +3467,63 @@
           "path": "p/visualize/skills/visualize/widgets/waterfall.md",
           "size": 2864,
           "sha256": "4abeda32552fbcced6df971bbad9e417a0dfc5c74c785608d9e1966141d85e08"
-        },
-        {
-          "path": "user-skill-snapshots/renderdoc-explain-event/SKILL.md",
-          "size": 5365,
-          "sha256": "22944f911d70e51d208198c57e5ccc0e0cab39f69bd7283732cbe097476465c6"
-        },
-        {
-          "path": "user-skill-snapshots/renderdoc-explain-event/references/algorithm-investigation.md",
-          "size": 21986,
-          "sha256": "3d7831e53e4bd3b95a8f15b394418589a495163654204d7eb3ff302433c6cfc8"
-        },
-        {
-          "path": "user-skill-snapshots/renderdoc-explain-event/references/frame-rendering-flow.md",
-          "size": 21924,
-          "sha256": "7bb9fa1811bd011c704b4f5fddf2713efdeb0d015cdc3d0fa7d86b762a62d56b"
-        },
-        {
-          "path": "user-skill-snapshots/renderdoc-explain-event/references/module-discovery.md",
-          "size": 10550,
-          "sha256": "62881abd175eddde5928397bec012a8200cfa715046ab2afff67281c959fa40f"
-        },
-        {
-          "path": "user-skill-snapshots/renderdoc-explain-event/references/reanalysis.md",
-          "size": 8862,
-          "sha256": "8ee4fa0ecce9cd587fa58247688a154c2bfd9fd4fccf3ad19f767ab479f7c479"
-        },
-        {
-          "path": "user-skill-snapshots/renderdoc-explain-event/references/render-path-review.md",
-          "size": 8162,
-          "sha256": "6e75b7f06a96094dbb73f8e39d960bac406ee3eb5e025005ae48f7080d074ca0"
-        },
-        {
-          "path": "user-skill-snapshots/renderdoc-explain-event/references/visual-evidence.md",
-          "size": 17809,
-          "sha256": "c44dff01661cefb023e604974a2488ce1cc3e8c9a3bd981bfec1caf2a8ea269d"
         }
       ],
       "parts": [
         {
-          "path": "archives/capabilities/d52b9d6759d16cca.000.part",
+          "path": "archives/capabilities/66bfdb0a1b7621a9.000.part",
           "size": 50331648,
-          "sha256": "f1b58255660231d55a7bedec402fb6ad3fa76461a0007d0f88729c05271af7eb"
+          "sha256": "cf11385b6a5a79fead7ceca24ed9c5bf7adeb51bd0142c3cd0e431a489b359c5"
         },
         {
-          "path": "archives/capabilities/d52b9d6759d16cca.001.part",
+          "path": "archives/capabilities/66bfdb0a1b7621a9.001.part",
           "size": 50331648,
-          "sha256": "2a346a61e3e2f24b8cc38ee62b263b0f6ad9092f530040a09986896aa54be1c5"
+          "sha256": "bbe2da730f347a21c1fb9d0fcbe1a8214ac4908f077c06b68d320f4ade5c1d06"
         },
         {
-          "path": "archives/capabilities/d52b9d6759d16cca.002.part",
+          "path": "archives/capabilities/66bfdb0a1b7621a9.002.part",
           "size": 50331648,
-          "sha256": "d5fe6e526d69f9c7a09fc9ac679c078eeebc688157817c3ca21705abb7e5a866"
+          "sha256": "eb43374cf0947852c777228f12f8828718e523b04e400d1dcfdb5f4e37435bde"
         },
         {
-          "path": "archives/capabilities/d52b9d6759d16cca.003.part",
+          "path": "archives/capabilities/66bfdb0a1b7621a9.003.part",
           "size": 50331648,
-          "sha256": "ffd9e882deb9b6139b7ea6bb540d9b02d24662c5d0cf5127898097a6f0f12d42"
+          "sha256": "ceb2fbf888f739a79b43fda46b18975b61b28f080804da61b8c57f8873276c65"
         },
         {
-          "path": "archives/capabilities/d52b9d6759d16cca.004.part",
+          "path": "archives/capabilities/66bfdb0a1b7621a9.004.part",
           "size": 50331648,
-          "sha256": "1ccd288c391d25fe26a2b30f6b47dcd350b4f38b9bba96f8199e9f3d7e406445"
+          "sha256": "d31f5d53dce7838aa004899bbae951bd301ad79fdf3ed0b8130d6b0c130ce0ab"
         },
         {
-          "path": "archives/capabilities/d52b9d6759d16cca.005.part",
+          "path": "archives/capabilities/66bfdb0a1b7621a9.005.part",
           "size": 50331648,
-          "sha256": "080a08e72420424b3e2e0f744668323c5acfce91e77c4c024a6e2e2f80227df1"
+          "sha256": "4b63916c7cf560fbd800c36eca4b5315c12753f8f4030d5ccfb48697d069a6a3"
         },
         {
-          "path": "archives/capabilities/d52b9d6759d16cca.006.part",
+          "path": "archives/capabilities/66bfdb0a1b7621a9.006.part",
           "size": 50331648,
-          "sha256": "f6c4b98f3bd0a56417318c44b82b9eae69e1300b64ed65bb39297f53cbb548c1"
+          "sha256": "8019ef0588b5a7f8db0a966c0d33a8a6259925651ba5f45bc10e04ccd95f0096"
         },
         {
-          "path": "archives/capabilities/d52b9d6759d16cca.007.part",
+          "path": "archives/capabilities/66bfdb0a1b7621a9.007.part",
           "size": 50331648,
-          "sha256": "1378c36868d85bcceeef54cd823edc59269736ce9e7d5f9f53156a9f20f7938f"
+          "sha256": "4d67ac19917ec60e4d4e80f7f93fc724e8ae88bdb59ea7fafb6d9281c92f30c2"
         },
         {
-          "path": "archives/capabilities/d52b9d6759d16cca.008.part",
+          "path": "archives/capabilities/66bfdb0a1b7621a9.008.part",
           "size": 50331648,
-          "sha256": "4e04791c5c931273781b9e5b2de6da4d6aba82d6cdaa45cdce1d20e8b49fe6c9"
+          "sha256": "f5a55ac6a0a17975d4fd6993c36601d11472d4301cc51e542d54e38eee017db7"
         },
         {
-          "path": "archives/capabilities/d52b9d6759d16cca.009.part",
+          "path": "archives/capabilities/66bfdb0a1b7621a9.009.part",
           "size": 50331648,
-          "sha256": "7f2f0984624e871961df78fe14ee82c71f1859766b28c415d0370f1c6fe1e8a3"
+          "sha256": "487736010a849adf6b36db8eb50d66ae63064c86a49244962a2d249aac474349"
         },
         {
-          "path": "archives/capabilities/d52b9d6759d16cca.010.part",
-          "size": 19223046,
-          "sha256": "d4aa668f4b6e5b83ece4697dbd63511968418459c5d6dcabd781273c98ccba09"
+          "path": "archives/capabilities/66bfdb0a1b7621a9.010.part",
+          "size": 327828,
+          "sha256": "68628c3f4ed46abcae3317a27787bf4f292d219ba4f4040d36574cbf8041e001"
         }
       ]
     },

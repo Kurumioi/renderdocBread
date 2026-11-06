@@ -41,7 +41,7 @@ def compose(base, capabilities, runtime, gui, output, *, replay_bindings=None, r
         raise ValueError("A new release destination is required")
     if digest(base) != base.with_suffix(".zip.sha256").read_text().split()[0]:
         raise ValueError("Base archive checksum differs")
-    tools = verify(capabilities) if capabilities else {"files": [], "physicalFiles": []}
+    tools = verify(capabilities, public=True) if capabilities else {"files": [], "physicalFiles": []}
     profile = tools.get("distributionProfile", "extended") if capabilities else "core"
     if capabilities and profile != "rdc" and not tools.get("componentArchives"):
         raise ValueError("Compressed capabilities are required")

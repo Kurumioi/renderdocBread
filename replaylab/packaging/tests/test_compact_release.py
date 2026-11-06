@@ -14,6 +14,16 @@ def test_compact_rewrite_removes_old_payload_and_preserves_exact_dependency_inve
         folder = repo / source
         folder.mkdir(parents=True)
         (folder / "current.txt").write_text("current source")
+    skill = repo / ".agents/skills/capture-check"
+    skill_files = {
+        "SKILL.md": "---\nname: capture-check\ndescription: 检查捕获记录\n---\n读取参考资料，再说明结论依据。\n",
+        "references/check.md": "核对事件编号。\n",
+        "scripts/check.py": "print('ok')\n",
+    }
+    for relative, content in skill_files.items():
+        path = skill / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content.encode("utf-8"))
     monkeypatch.setattr(release, "REPO", repo)
     monkeypatch.setattr(release, "fingerprint", lambda: "source")
     capsule = tmp_path / "caps"; capsule.mkdir()
@@ -22,7 +32,11 @@ def test_compact_rewrite_removes_old_payload_and_preserves_exact_dependency_inve
     tools = {"componentArchives": [{"id": "python"}], "files": [dict(item, path="p/new/data")],
              "physicalFiles": [{"path": "runtime.zip"}]}
     (capsule / "bread-capabilities.json").write_text(json.dumps(tools))
-    monkeypatch.setattr(release, "verify", lambda path: tools)
+    def verify_public(path, *, public):
+        assert public
+        return tools
+
+    monkeypatch.setattr(release, "verify", verify_public)
     base = tmp_path / "base.zip"
     files = {release.CAPS + item["path"]: b"old", "unchanged.dll": b"native", "replaylab/skills/obsolete.txt": b"obsolete",
              "pymodules/renderdoc.pyd": b"previous native bindings", "renderdoc.dll": b"previous replay core"}
@@ -40,6 +54,8 @@ def test_compact_rewrite_removes_old_payload_and_preserves_exact_dependency_inve
     output = tmp_path / "result.zip"
     result = release.compose(base, capsule, runtime, gui, output, replay_bindings=bindings, replay_core=core)
     with zipfile.ZipFile(output) as z:
+        for relative, content in skill_files.items():
+            assert z.read(release.PREFIX + "replaylab/skills/capture-check/" + relative) == content.encode("utf-8")
         assert release.PREFIX + release.CAPS + item["path"] not in z.namelist()
         assert z.read(release.PREFIX + "unchanged.dll") == b"native"
         assert z.read(release.PREFIX + "pymodules/renderdoc.pyd") == bindings.read_bytes()

@@ -302,7 +302,6 @@ def test_repository_skills_are_pure_procedure_and_evidence_contracts() -> None:
         assert "allowed-tools" not in skill.metadata
         assert "replaylab-read-only" not in skill.metadata
         assert "replaylab-min-successful-tools" not in skill.metadata
-        assert skill.category != "other"
     catalog = _host_projected_catalog()
     shader = catalog.skills["renderdoc-shader-workbench"]
     event = catalog.skills["renderdoc-explain-event"]
@@ -937,14 +936,19 @@ def test_native_ui_intents_do_not_select_or_require_a_skill() -> None:
     assert not hasattr(skill_module, "INTENT_SKILLS")
 
 
-def test_every_workflow_skill_uses_evidence_without_rigid_required_tools() -> None:
+def test_workflow_skills_do_not_declare_rigid_tool_requirements() -> None:
     catalog = SkillCatalog([SKILL_ROOT]).load()
     for skill in catalog.skills.values():
         assert not hasattr(skill, "minimum_successful_tools")
         assert not hasattr(skill, "required_all_tools")
         assert not hasattr(skill, "required_any_tools")
-        lowered = skill.instructions.lower()
-        assert "evidence" in lowered
+
+
+def test_skill_without_category_or_english_instructions_loads(tmp_path: Path) -> None:
+    _write_test_skill(tmp_path, "capture-check", "先核对捕获记录，再说明结论依据。")
+    skill = SkillCatalog([tmp_path]).load().get("capture-check")
+    assert skill.category == "other"
+    assert "再说明结论依据" in skill.instructions
 
 
 def test_retired_skill_tool_metadata_is_non_authoritative_compatibility_text(

@@ -56,11 +56,11 @@ The default still stays inside the checkout, and cleanup remains limited to mark
 build sessions. Local patch deployment reuses an existing capability directory only
 after its sealed files and dependency inventory exactly match the selected bundle.
 
-The default standard edition keeps the complete configured skill inventory, document SDKs
+The default standard edition keeps the complete public skill inventory, document SDKs
 (python-docx, openpyxl, python-pptx, pypdf), Python/Node runtimes, desktop adapters,
-provider clients, Shader tools, unpackers and Unity MCP. Only Office and bundled
-Chromium are removed. Optional browser operations use an installed system browser
-or a configured browser MCP; ordinary RDC and document operations require neither.
+provider clients, Shader tools, unpackers and Unity MCP. It excludes Office and bundled
+Chromium. Optional browser operations use an installed system browser or a configured
+browser MCP; ordinary RDC and document operations require neither.
 `prepare_standard_capabilities.py` derives this inventory from a verified complete
 application-owned snapshot, with licenses and relative paths retained. Private
 provider clients still require their actual live service; login alone does not
@@ -376,14 +376,22 @@ pipe settings. `--provider-runtime` includes dedicated clients; they activate
 only with a live advertised provider service. Bread's document, browser and
 Windows adapters use a shared MCP interface on all connection types.
 
-Desktop personal skills are excluded by default. Repeat `--custom-skill NAME`
-to explicitly select directories for a new import. Selected skills retain their
-instructions, references and scripts, but omit node_modules, virtual environments
-and caches. Import metadata records this allowlist and verification rejects
-unselected skills or nested dependency caches. Required Node/Python SDKs belong
-in their dedicated runtime components; their node_modules are valid dependencies.
-Existing sealed standard snapshots retain their declared workflows and runtime
-dependencies for compatibility. This policy does not silently shrink them.
+Build public releases from a clean checkout of the release commit. To ship a new
+Bread workflow, commit its complete directory under `.agents/skills`; runtime
+freezing and portable assembly discover it automatically. The skill loader validates
+the name, frontmatter and declared references. Category is optional, and instructions
+should describe how to verify results in the language of the workflow. Register new
+MCP tools through the existing Host entry points and declare any packaged dependencies
+in the release inputs.
+
+Keep personal skills in the local user configuration outside the checkout.
+`--custom-skill NAME` selects a desktop skill for a private snapshot, and
+`--bread-skills` preserves local overrides for private use. Neither option
+approves content for a public release. Public verification accepts the existing
+approved compatibility routes and vendor system skills under `custom-skills` and
+rejects user override snapshots. It verifies physical and logical inventories,
+including the contents of nested capsules. Required Node/Python SDKs belong in
+their dedicated runtime components, where their dependencies are preserved.
 Claude task workspaces copy instructions/references/scripts with Windows extended
 paths, prune dependency/cache directories before scanning, and reject retained
 links or reparse points.

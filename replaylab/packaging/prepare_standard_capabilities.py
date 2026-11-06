@@ -54,11 +54,11 @@ def refresh_compatibility_skills(output, value):
 
 def prepare(source, output):
     if output.exists() and any(output.iterdir()):
-        value = verify(output)
+        value = verify(output, public=True)
         if value.get("distributionProfile") != "standard":
             raise ValueError("Use a new standard bundle directory")
         return value
-    value = verify(source)
+    value = verify(source, public=True)
     output.mkdir(parents=True, exist_ok=True)
     selected = [r for r in value["files"] if not r["path"].startswith(EXCLUDED)]
     archives = [r for r in value.get("componentArchives", []) if r["id"] not in {"office", "browsers"}]
@@ -77,7 +77,7 @@ def prepare(source, output):
     value["skillRoots"] = [p for p in value["skillRoots"] if not (p + "/").startswith(EXCLUDED)]
     refresh_compatibility_skills(output, value)
     (output / "bread-capabilities.json").write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return verify(output)
+    return verify(output, public=True)
 
 
 if __name__ == "__main__":

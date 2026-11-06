@@ -55,6 +55,12 @@ jobs:
       - name: Restore sealed offline build environment
         shell: pwsh
         run: ./replaylab/packaging/Restore-BuildEnvironment.ps1
+      - name: Verify public capabilities inventory
+        shell: pwsh
+        run: |
+          $inputs = Get-Content ./replaylab/output/build-inputs/paths.json -Raw | ConvertFrom-Json
+          & ./replaylab/output/build-inputs/environment/Scripts/python.exe replaylab/packaging/prepare_capabilities_bundle.py --output $inputs.capabilities --public
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Test Windows processes, configuration and subscriptions
         shell: pwsh
         run: |

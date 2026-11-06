@@ -9,7 +9,7 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shutil
 import sys
 import subprocess
@@ -22,6 +22,53 @@ REPO = Path(__file__).resolve().parents[2]
 PRIVATE = {"auth.json", "config.toml", "profiles.json", "keys.json", "agent-tools.json",
            ".env", "history.jsonl", "state.db", "cookies", "login data"}
 SKIP = {"__pycache__", ".git", ".pytest_cache", "logs", "sessions", "node_cache"}
+SKILL_CACHES = SKIP | {"node_modules", ".venv", "venv"}
+# Existing shipped compatibility routes and vendor-provided system skills.
+# First-party skills in the source checkout are discovered independently.
+PUBLIC_COMPATIBILITY_SKILLS = {
+    "renderdoc-analyzer", "replaylab-debugger", "uex-export-asset-report", "uex-export-blender",
+}
+PUBLIC_SYSTEM_SKILLS = {"imagegen", "openai-docs", "review-agent", "skill-creator", "skill-installer"}
+
+
+def is_public_capability_path(relative: str) -> bool:
+    parts = PurePosixPath(relative.replace("\\", "/")).parts
+    if not parts:
+        return False
+    scope = parts[0].casefold()
+    if scope == "user-skill-snapshots":
+        return False
+    if scope != "custom-skills" or len(parts) == 1:
+        return True
+    if any(part.casefold() in SKILL_CACHES for part in parts[1:]):
+        return False
+    if parts[1] == ".system":
+        system_path = parts[2:]
+        return system_path == (".codex-system-skills.marker",) or (
+            bool(system_path) and system_path[0] in PUBLIC_SYSTEM_SKILLS
+        )
+    return parts[1] in PUBLIC_COMPATIBILITY_SKILLS
+
+
+def verify_public_skill_inventory(metadata: dict) -> None:
+    """Keep local skill imports and user overrides out of public releases."""
+    physical = metadata.get("physicalFiles", metadata["files"])
+    capsules = {item["path"] for item in metadata.get("componentArchives", ())}
+    for record in physical:
+        path = record["path"]
+        if path.casefold().startswith("bundles/") and path not in capsules:
+            raise ValueError("Unregistered capsule in public capabilities: " + path)
+    paths = [
+        *(record["path"] for record in metadata["files"]),
+        *(record["path"] for record in physical),
+        *metadata.get("skillRoots", ()),
+        *("custom-skills/" + name for name in metadata.get("customSkillSelection", ())),
+    ]
+    for relative in paths:
+        if not is_public_capability_path(relative):
+            raise ValueError("Unapproved skill in public capabilities: " + relative)
+    if metadata.get("userSkillSnapshots"):
+        raise ValueError("User skill snapshots cannot be included in public capabilities")
 
 
 def copy_code(source: Path, target: Path, *, excluded=()):
@@ -58,11 +105,13 @@ def seal(root: Path, metadata: dict):
         json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def verify(root: Path):
+def verify(root: Path, *, public: bool = False):
     root = long_path(root)
     metadata = json.loads((root / "bread-capabilities.json").read_text(encoding="utf-8"))
     if metadata.get("schema") != "bread-portable-capabilities/v1":
         raise ValueError("Unknown capability bundle schema")
+    if public:
+        verify_public_skill_inventory(metadata)
     compressed = bool(metadata.get("componentArchives"))
     records = metadata.get("physicalFiles", []) if compressed else metadata["files"]
     expected = {record["path"] for record in records}
@@ -123,7 +172,7 @@ def stage(source: Path, target: Path):
     wheel-generated Scripts launchers and Playwright installation links retain
     build-machine paths and are not runtime inputs.
     """
-    metadata = verify(source)
+    metadata = verify(source, public=True)
     excluded = ("python/Scripts/", "browsers/.links/")
     selected = [record for record in metadata.get("physicalFiles", metadata["files"]) if not record["path"].startswith(excluded)]
     if target.exists() and any(target.iterdir()):
@@ -136,7 +185,7 @@ def stage(source: Path, target: Path):
     metadata = {**metadata, "physicalFiles" if metadata.get("componentArchives") else "files": selected,
                 "excludedBuildOnly": list(excluded)}
     (target / "bread-capabilities.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    verify(target)
+    verify(target, public=True)
 
 
 def import_desktop(root: Path, desktop: Path, dependencies: Path, *, custom_skills=()):
@@ -193,6 +242,7 @@ def main():
     parser.add_argument("--dependencies", type=Path)
     parser.add_argument("--custom-skill", action="append", default=[],
                         help="Explicit desktop skill directory to import (repeatable; default: none)")
+    parser.add_argument("--public", action="store_true", help="Verify the public release skill inventory")
     parser.add_argument("--provider-runtime", type=Path)
     parser.add_argument("--bread-skills", type=Path, help="Archive personal Bread skill overrides without replacing newer defaults")
     parser.add_argument("--office-msi", type=Path)
@@ -202,6 +252,8 @@ def main():
     if args.desktop and args.dependencies:
         metadata = import_desktop(args.output.resolve(), args.desktop.resolve(), args.dependencies.resolve(),
                                   custom_skills=args.custom_skill)
+        if args.public:
+            verify_public_skill_inventory(metadata)
     else:
         if args.bread_skills:
             copy_code(args.bread_skills, args.output / "user-skill-snapshots")
@@ -230,7 +282,7 @@ def main():
                 metadata["userSkillSnapshots"] = {"path": "user-skill-snapshots", "activation": "optional-user-override",
                     "note": "Preserved personal copies; current bundled defaults remain active on a new installation."}
             seal(args.output, metadata)
-        metadata = verify(args.output)
+        metadata = verify(args.output, public=args.public)
     print(json.dumps({"plugins": len(metadata["plugins"]), "files": len(metadata["files"]),
                       "bytes": sum(item["size"] for item in metadata["files"])}, indent=2))
 
