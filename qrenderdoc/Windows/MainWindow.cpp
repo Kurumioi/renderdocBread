@@ -3504,7 +3504,7 @@ QVariantMap MainWindow::saveState()
 bool MainWindow::restoreState(QVariantMap &state)
 {
   // i18n-ignore: persisted ToolWindowManager schema keys.
-  if(state.value(lit("toolWindowManagerStateFormat")).toInt() != 1 ||
+  if(state.value(lit("toolWindowManagerStateFormat")).toInt() != 1 ||    // i18n-ignore: persisted layout key.
      state.value(lit("mainWrapper")).toMap().isEmpty())
     return false;
 

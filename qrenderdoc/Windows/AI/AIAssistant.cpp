@@ -15078,7 +15078,7 @@ void AIAssistant::consumeTaskEvent(const QString &taskId, const QByteArray &line
     QString detail = failed ? tr("Failed") : tr("Completed");
     // i18n-ignore: structured task-event diagnostic fields, never translated.
     if(eventData.value(lit("elapsedMs")).isDouble())
-      detail +=
+      detail +=    // i18n-ignore: elapsedMs is a task-event JSON field.
           lit("\n") + tr("Tool round trip: %1 ms").arg(eventData.value(lit("elapsedMs")).toInt());
     // i18n-ignore: redacted backend task-event diagnostic field.
     const QString diagnostic = eventData.value(lit("publicDetail")).toString().left(400);
