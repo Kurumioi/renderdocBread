@@ -47,7 +47,7 @@ static uint32_t VisModeToMeshDisplayFormat(const MeshDisplay &cfg)
 }
 
 void D3D11Replay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secondaryDraws,
-                             const MeshDisplay &cfg, const MeshComponentHighlight &components)
+                             const MeshDisplay &cfg)
 {
   if(cfg.position.vertexResourceId == ResourceId() ||
      WrappedID3D11Buffer::m_BufferList.find(cfg.position.vertexResourceId) ==
@@ -393,44 +393,6 @@ void D3D11Replay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secon
     col = Vec4f(0.0f, 0.0f, 1.0f, 1.0f);
     GetDebugManager()->FillCBuffer(psCBuf, &col, sizeof(col));
     m_pImmediateContext->Draw(2, 4);
-  }
-
-  if(!components.vertices.empty())
-  {
-    if(!m_MeshRender.ComponentHighlight)
-    {
-      D3D11_BUFFER_DESC desc = {};
-      desc.ByteWidth = UINT(MaxMeshComponentHighlightVertices * sizeof(FloatVector));
-      desc.Usage = D3D11_USAGE_DYNAMIC;
-      desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-      desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-      m_pDevice->CreateBuffer(&desc, NULL, &m_MeshRender.ComponentHighlight);
-    }
-    D3D11_MAPPED_SUBRESOURCE mapped;
-    ID3D11Buffer *vb = m_MeshRender.ComponentHighlight;
-    if(vb && SUCCEEDED(m_pImmediateContext->Map(vb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
-    {
-      memcpy(mapped.pData, components.vertices.data(), components.vertices.byteSize());
-      m_pImmediateContext->Unmap(vb, 0);
-      const bool points = components.topology == Topology::PointList;
-      const Topology topology = points ? Topology::TriangleList : components.topology;
-      MeshVertexCBuffer component = vertexData;
-      component.ModelViewProj = components.DepthBiasedTransform(
-          projMat.Mul(camMat.Mul(cfg.position.unproject ? guessProjInv : axisMapMat)));
-      component.homogenousInput = cfg.position.unproject;
-      if(points)
-        component.SpriteSize = Vec2f(-500.0f / m_OutputWidth, 500.0f / m_OutputHeight);
-      GetDebugManager()->FillCBuffer(vsCBuf, &component, sizeof(component));
-      col = Vec4f(1.0f, 0.36f, 0.035f, 1.0f);
-      GetDebugManager()->FillCBuffer(psCBuf, &col, sizeof(col));
-      const UINT stride = sizeof(FloatVector), offset = 0;
-      m_pImmediateContext->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
-      m_pImmediateContext->IASetInputLayout(m_MeshRender.GenericLayout);
-      m_pImmediateContext->IASetPrimitiveTopology(MakeD3DPrimitiveTopology(topology));
-      m_pImmediateContext->OMSetDepthStencilState(m_MeshRender.LessEqualDepthState, 0);
-      m_pImmediateContext->Draw(UINT(components.vertices.size()), 0);
-      m_pImmediateContext->OMSetDepthStencilState(m_MeshRender.NoDepthState, 0);
-    }
   }
 
   if(cfg.highlightVert != ~0U)

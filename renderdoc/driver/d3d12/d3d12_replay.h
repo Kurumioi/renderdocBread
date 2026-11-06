@@ -286,7 +286,7 @@ public:
   void SetProxyBufferData(ResourceId bufid, byte *data, size_t dataSize);
 
   void RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secondaryDraws,
-                  const MeshDisplay &cfg, const MeshComponentHighlight &components);
+                  const MeshDisplay &cfg);
 
   bool RenderTexture(TextureDisplay cfg);
 

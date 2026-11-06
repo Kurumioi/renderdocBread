@@ -29,16 +29,6 @@
 #include "core/core.h"
 #include "maths/vec.h"
 
-class Matrix4f;
-
-struct MeshComponentHighlight
-{
-  Matrix4f DepthBiasedTransform(const Matrix4f &mvp) const;
-
-  rdcarray<FloatVector> vertices;
-  Topology topology = Topology::TriangleList;
-};
-
 template <typename T, BucketRecordType bucketType = T::BucketType>
 struct BucketForRecord
 {
@@ -629,7 +619,7 @@ public:
   virtual void SetProxyBufferData(ResourceId bufid, byte *data, size_t dataSize) = 0;
 
   virtual void RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secondaryDraws,
-                          const MeshDisplay &cfg, const MeshComponentHighlight &components) = 0;
+                          const MeshDisplay &cfg) = 0;
   virtual bool RenderTexture(TextureDisplay cfg) = 0;
 
   virtual void SetCustomShaderIncludes(const rdcarray<rdcstr> &directories) = 0;

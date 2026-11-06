@@ -190,9 +190,7 @@ meshV2F RENDERDOC_MeshVS(meshA2V IN, uint vid : SV_VertexID)
   }
 
   OUT.pos = mul(pos, ModelViewProj);
-  const uint corners[6] = {0, 1, 2, 2, 1, 3};
-  uint spriteCorner = SpriteSize.x < 0.0f ? corners[vid % 6] : vid % 4;
-  OUT.pos.xy += abs(SpriteSize.xy) * 0.01f * psprite[spriteCorner] * OUT.pos.w;
+  OUT.pos.xy += SpriteSize.xy * 0.01f * psprite[vid % 4] * OUT.pos.w;
   OUT.norm = float3(0, 0, 1);
   OUT.secondary = IN.secondary;
 

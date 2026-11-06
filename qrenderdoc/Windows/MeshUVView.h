@@ -2,20 +2,12 @@
 
 #include <QCoreApplication>
 #include <QImage>
-#include <QMatrix4x4>
-#include <QOpenGLBuffer>
-#include <QOpenGLFunctions>
-#include <QOpenGLWindow>
-#include <QPainterPath>
-#include <QPixmap>
 #include <QSet>
+#include <QVector3D>
 #include <QWidget>
 #include <array>
 #include <functional>
 #include <memory>
-
-class QOpenGLShaderProgram;
-class QOpenGLTexture;
 
 enum class MeshCameraGesture
 {
@@ -26,20 +18,6 @@ enum class MeshCameraGesture
 };
 MeshCameraGesture meshCameraGesture(int preset, Qt::MouseButtons buttons, Qt::KeyboardModifiers mods);
 
-struct MeshUVGeometry
-{
-  struct Vertex
-  {
-    QVector4D position;
-    QPointF uv;
-    uint32_t index = 0;
-  };
-  QVector<Vertex> vertices;
-  QVector<std::array<int, 3>> triangles;
-  QPainterPath wire;
-  QRectF bounds;
-};
-
 struct MeshUVData
 {
   enum class Selection
@@ -48,10 +26,18 @@ struct MeshUVData
     Edge,
     Face
   };
-  std::shared_ptr<const MeshUVGeometry> geometry;
+  struct Vertex
+  {
+    QVector3D position;
+    QPointF uv;
+    uint32_t index = 0;
+  };
+  QVector<Vertex> vertices;
+  QVector<std::array<int, 3>> triangles;
   QImage texture;
   Selection mode = Selection::Face;
   QSet<quint64> selected;
+  bool showTexture = false;
   bool flipTexture = false;
 
   quint64 key(int triangle, int corner) const;
@@ -62,21 +48,15 @@ class MeshUVView : public QWidget
 {
   Q_DECLARE_TR_FUNCTIONS(MeshUVView)
 public:
-  MeshUVView(std::shared_ptr<MeshUVData> mesh, QWidget *parent);
+  MeshUVView(std::shared_ptr<MeshUVData> mesh, bool atlas, QWidget *parent);
   void resetView();
-  void geometryChanged();
-  void textureChanged();
   void focusSelection();
   void selectAll();
   void selectLinked();
   void clearSelection();
   void setBoxSelect(bool enabled);
-  bool handleSelectionShortcut(QKeyEvent *event);
-  void selectMesh(const QPointF &point, const QSize &size, const QMatrix4x4 &transform, bool extend);
-  void selectMeshBox(const QRectF &rect, const QSize &size, const QMatrix4x4 &transform, bool extend);
   std::function<void()> selectionChanged;
-  std::function<void()> boxShortcut;
-  std::function<void(int)> modeShortcut;
+  std::function<int()> cameraPreset;
 
 protected:
   void paintEvent(QPaintEvent *) override;
@@ -87,54 +67,22 @@ protected:
   void keyPressEvent(QKeyEvent *event) override;
 
 private:
-  QTransform atlasTransform() const;
+  QPointF atlasPoint(const QPointF &uv) const;
+  QPointF selectionPoint(int triangle, int corner) const;
   void selectAt(const QPointF &point, bool extend);
-  void selectElement(int triangle, int corner, bool extend);
-  void selectBox(const QRectF &box, bool extend, const QVector<QPointF> &points);
+  void paintAtlas(QPainter &painter);
+  QImage rasterize(const QSize &size) const;
   void notifySelection();
-  void updateWireCache(double density);
 
   std::shared_ptr<MeshUVData> m_Mesh;
-  QPixmap m_Texture, m_Wire;
-  QRectF m_WireBounds;
-  QPainterPath m_SelectedFaces;
-  QVector<QLineF> m_SelectedEdges;
-  QVector<QPointF> m_SelectedPoints;
+  bool m_Atlas;
   bool m_BoxSelect = false;
   bool m_DraggingBox = false;
-  bool m_Panning = false;
+  MeshCameraGesture m_Gesture = MeshCameraGesture::None;
   QPointF m_Press, m_Last, m_Pan;
+  QVector3D m_Center;
   double m_Zoom = 1.0;
-  double m_WireDensity = 0.0;
-};
-
-// The explicit UV texture mode shares the native camera and mesh data. Static vertex and
-// image uploads are independent from the camera and from selection changes.
-class MeshUVTextureView : public QOpenGLWindow, protected QOpenGLFunctions
-{
-public:
-  explicit MeshUVTextureView(std::shared_ptr<MeshUVData> mesh);
-  ~MeshUVTextureView() override;
-  void setTransform(const QMatrix4x4 &transform, bool homogenous, bool wireframe);
-  void setSelection(QVector<QVector4D> vertices, unsigned int primitive);
-  std::function<void()> unavailable;
-  std::function<void(bool, bool)> rendered;
-
-protected:
-  void initializeGL() override;
-  void paintGL() override;
-
-private:
-  void releaseGL();
-  std::shared_ptr<MeshUVData> m_Mesh;
-  std::shared_ptr<const MeshUVGeometry> m_UploadedGeometry;
-  QMatrix4x4 m_Transform;
-  std::unique_ptr<QOpenGLShaderProgram> m_Shader;
-  std::unique_ptr<QOpenGLTexture> m_Texture;
-  QOpenGLBuffer m_Triangles, m_Lines, m_Selected;
-  QVector<QVector4D> m_Selection;
-  qint64 m_TextureKey = 0;
-  int m_TriangleVertices = 0;
-  unsigned int m_SelectionPrimitive = GL_TRIANGLES;
-  bool m_Homogenous = false, m_Wireframe = false, m_SelectionDirty = true;
+  double m_Radius = 1.0;
+  double m_Yaw = 0.0;
+  double m_Pitch = 0.0;
 };

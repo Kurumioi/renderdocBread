@@ -442,7 +442,7 @@ public:
   void ReloadShaderDebugInformation();
 
   void RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secondaryDraws,
-                  const MeshDisplay &cfg, const MeshComponentHighlight &components);
+                  const MeshDisplay &cfg);
 
   rdcarray<ShaderEncoding> GetCustomShaderEncodings()
   {
@@ -803,7 +803,6 @@ private:
     GPUBuffer UBO;
     GPUBuffer MeshletSSBO;
     GPUBuffer BBoxVB;
-    GPUBuffer ComponentHighlightVB;
     GPUBuffer AxisFrustumVB;
 
     VkDescriptorSetLayout DescSetLayout = VK_NULL_HANDLE;

@@ -194,36 +194,6 @@ extern "C" RENDERDOC_API uint16_t RENDERDOC_CC RENDERDOC_FloatToHalf(float f)
   return ConvertToHalf(f);
 }
 
-extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_GetMeshPreviewTransform(const MeshDisplay &cfg,
-                                                                             GraphicsAPI api,
-                                                                             float outputAspect,
-                                                                             float *transform)
-{
-  Camera *cam = (Camera *)cfg.cam;
-  const Matrix4f projection = Matrix4f::Perspective(90.0f, cam ? cam->GetNear() : 0.1f,
-                                                    cam ? cam->GetFar() : 100000.0f, outputAspect);
-  const Matrix4f view = cam ? cam->GetMatrix() : Matrix4f::Identity();
-  Matrix4f model = Matrix4f(cfg.axisMapping);
-  if(cfg.position.unproject)
-  {
-    Matrix4f guess = cfg.position.farPlane != FLT_MAX
-                         ? Matrix4f::Perspective(cfg.fov, cfg.position.nearPlane,
-                                                 cfg.position.farPlane, cfg.aspect)
-                         : Matrix4f::ReversePerspective(cfg.fov, cfg.position.nearPlane, cfg.aspect);
-    if(cfg.ortho)
-      guess = Matrix4f::Orthographic(cfg.position.nearPlane, cfg.position.farPlane);
-    if(cfg.position.flipY)
-      guess[5] *= -1.0f;
-    model = guess.Inverse();
-    if(api == GraphicsAPI::Vulkan)
-      for(size_t i = 4; i < 8; ++i)
-        model[i] *= -1.0f;
-  }
-  Matrix4f mvp = projection.Mul(view.Mul(model));
-  for(size_t i = 0; i < 16; ++i)
-    transform[i] = mvp[i];
-}
-
 extern "C" RENDERDOC_API ICamera *RENDERDOC_CC RENDERDOC_InitCamera(CameraType type)
 {
   return new Camera(type);

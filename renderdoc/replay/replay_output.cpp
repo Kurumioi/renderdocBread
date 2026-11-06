@@ -269,31 +269,6 @@ void ReplayOutput::SetMeshDisplay(const MeshDisplay &o)
   m_MainOutput.dirty = true;
 }
 
-extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_SetMeshComponentHighlight(
-    IReplayOutput *output, const FloatVector *vertices, uint32_t count, Topology topology)
-{
-  if(output)
-    static_cast<ReplayOutput *>(output)->SetMeshComponentHighlight(vertices, count, topology);
-}
-
-void ReplayOutput::SetMeshComponentHighlight(const FloatVector *vertices, uint32_t count,
-                                             Topology topology)
-{
-  CHECK_REPLAY_THREAD();
-
-  const uint32_t stride = topology == Topology::PointList      ? 6U
-                          : topology == Topology::LineList     ? 2U
-                          : topology == Topology::TriangleList ? 3U
-                                                               : 0U;
-  count = RDCMIN(count, MaxMeshComponentHighlightVertices);
-  if(vertices && stride && count >= stride)
-    m_ComponentHighlight.vertices.assign(vertices, count - count % stride);
-  else
-    m_ComponentHighlight.vertices.clear();
-  m_ComponentHighlight.topology = topology;
-  m_MainOutput.dirty = true;
-}
-
 void ReplayOutput::SetFrameEvent(int eventId)
 {
   CHECK_REPLAY_THREAD();
@@ -1887,7 +1862,7 @@ void ReplayOutput::DisplayMesh()
 
   mesh.position.meshColor = drawItself;
 
-  m_pDevice->RenderMesh(m_EventID, secondaryDraws, mesh, m_ComponentHighlight);
+  m_pDevice->RenderMesh(m_EventID, secondaryDraws, mesh);
   m_pController->FatalErrorCheck();
 }
 

@@ -5283,8 +5283,7 @@ public:
   {
     FAIL("Unexpected native SetProxyBufferData during idle maintenance");
   }
-  void RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secondaryDraws,
-                  const MeshDisplay &cfg, const MeshComponentHighlight &components) override
+  void RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secondaryDraws, const MeshDisplay &cfg) override
   {
     FAIL("Unexpected native RenderMesh during idle maintenance");
   }

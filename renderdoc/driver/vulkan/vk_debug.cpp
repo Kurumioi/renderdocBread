@@ -5185,8 +5185,6 @@ void VulkanReplay::MeshRendering::Destroy(WrappedVulkan *driver)
 
   UBO.Destroy();
   BBoxVB.Destroy();
-  if(ComponentHighlightVB.UnwrappedBuffer() != VK_NULL_HANDLE)
-    ComponentHighlightVB.Destroy();
   MeshletSSBO.Destroy();
   AxisFrustumVB.Destroy();
 

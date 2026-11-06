@@ -190,9 +190,7 @@ void main(void)
   }
 
   gl_Position = Mesh.mvp * pos;
-  const int corners[6] = int[](0, 1, 2, 2, 1, 3);
-  int spriteCorner = Mesh.pointSpriteSize.x < 0.0f ? corners[VERTEX_ID % 6] : VERTEX_ID % 4;
-  gl_Position.xy += abs(Mesh.pointSpriteSize.xy) * 0.01f * psprite[spriteCorner] * gl_Position.w;
+  gl_Position.xy += Mesh.pointSpriteSize.xy * 0.01f * psprite[VERTEX_ID % 4] * gl_Position.w;
   vsout_secondary = vec4(secondary);
   vsout_norm = vec4(0, 0, 1, 1);
 

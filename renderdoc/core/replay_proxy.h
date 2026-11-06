@@ -355,8 +355,7 @@ public:
     return false;
   }
 
-  void RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secondaryDraws,
-                  const MeshDisplay &cfg, const MeshComponentHighlight &components)
+  void RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secondaryDraws, const MeshDisplay &cfg)
   {
     if(m_Proxy && cfg.position.vertexResourceId != ResourceId())
     {
@@ -396,7 +395,7 @@ public:
         }
       }
 
-      m_Proxy->RenderMesh(eventId, secDraws, proxiedCfg, components);
+      m_Proxy->RenderMesh(eventId, secDraws, proxiedCfg);
     }
   }
 
