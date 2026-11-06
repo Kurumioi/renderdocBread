@@ -1552,12 +1552,14 @@ if HAS_QT:
                 "ReplayLabProjects", "Flow graph"))
             self.flow_button.clicked[bool].connect(self._toggle_flow_graph)
             header.addWidget(self.flow_button)
+            header.addStretch(1)
+            outer.addLayout(header)
             title = QtWidgets.QLabel(QtCore.QCoreApplication.translate(
                 "ReplayLabProjects", "Shader Workspace"), self.top)
             title_font = title.font()
             title_font.setBold(True)
             title.setFont(title_font)
-            header.addWidget(title)
+            outer.addWidget(title)
             self.subtitle = QtWidgets.QLabel(QtCore.QCoreApplication.translate(
                 "ReplayLabProjects",
                 "Validated Shader source · Ctrl+S saves and automatically compiles/replaces"),
@@ -1566,26 +1568,27 @@ if HAS_QT:
             # in several dark themes. Use the theme's readable text role for
             # this small explanatory line.
             self.subtitle.setStyleSheet("color: palette(text);")
-            header.addWidget(self.subtitle)
-            header.addStretch(1)
+            self.subtitle.setWordWrap(True)
+            outer.addWidget(self.subtitle)
+            actions = QtWidgets.QHBoxLayout()
             self.save_button = QtWidgets.QPushButton(QtCore.QCoreApplication.translate(
                 "ReplayLabProjects", "Save"), self.top)
             self.save_button.setToolTip(QtCore.QCoreApplication.translate(
                 "ReplayLabProjects", "Save the current Shader (Ctrl+S)"))
             self.save_button.clicked.connect(self._save_current)
-            header.addWidget(self.save_button)
+            actions.addWidget(self.save_button)
             self.save_all_button = QtWidgets.QPushButton(
                 QtCore.QCoreApplication.translate(
                     "ReplayLabProjects", "Save All"), self.top)
             self.save_all_button.setToolTip(QtCore.QCoreApplication.translate(
                 "ReplayLabProjects", "Save all modified Shader tabs"))
             self.save_all_button.clicked.connect(self._save_all)
-            header.addWidget(self.save_all_button)
+            actions.addWidget(self.save_all_button)
             self.refresh_button = QtWidgets.QPushButton(
                 QtCore.QCoreApplication.translate(
                     "ReplayLabProjects", "Refresh"), self.top)
             self.refresh_button.clicked.connect(lambda _checked=False: self.refresh(True))
-            header.addWidget(self.refresh_button)
+            actions.addWidget(self.refresh_button)
             self.convert_button = QtWidgets.QPushButton(QtCore.QCoreApplication.translate(
                 "ReplayLabProjects", "Convert to HLSL"), self.top)
             self.convert_button.setObjectName("replaylabShaderWorkspaceConvertHLSLButton")
@@ -1595,7 +1598,7 @@ if HAS_QT:
                 "The original source is preserved."))
             self.convert_button.clicked.connect(self._convert_current_to_hlsl)
             self.convert_button.setVisible(False)
-            header.addWidget(self.convert_button)
+            actions.addWidget(self.convert_button)
             # The switch between what the capture recorded and what this workspace
             # compiled. An unchanged source is applied as already compiled; only a
             # changed one is compiled first.
@@ -1607,13 +1610,14 @@ if HAS_QT:
                 "workspace's compiled HLSL. An unchanged source is applied without "
                 "recompiling."))
             self.replace_button.clicked.connect(self._toggle_replacement)
-            header.addWidget(self.replace_button)
+            actions.addWidget(self.replace_button)
             self._switch_results = queue.Queue()
             self.switch_result_timer = QtCore.QTimer(self.top)
             self.switch_result_timer.setInterval(SAVE_RESULT_POLL_MS)
             self.switch_result_timer.timeout.connect(self._drain_switch_results)
             self.switch_result_timer.start()
-            outer.addLayout(header)
+            actions.addStretch(1)
+            outer.addLayout(actions)
 
             self.main_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal, self.top)
             self.file_tree = QtWidgets.QTreeWidget(self.main_splitter)

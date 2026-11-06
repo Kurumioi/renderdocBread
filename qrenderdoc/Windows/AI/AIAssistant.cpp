@@ -141,6 +141,8 @@
 #include <QtCore/qt_windows.h>
 #endif
 
+static constexpr int SubscriptionStatusTimeoutMs = 30000;
+
 struct AIConfigurationProcessState
 {
   QPointer<AIAssistant> assistant;
@@ -152,6 +154,17 @@ struct AIConfigurationProcessState
   QByteArray standardOutput;
   QByteArray standardError;
   QString forcedDiagnostic;
+  QString operation;
+  QElapsedTimer elapsed;
+  int timeoutMs = 0;
+
+  void log(const char *phase, int exitCode = -1) const
+  {
+    qInfo().nospace() << "AI configuration " << phase << " operation=" << operation
+                      << " elapsedMs=" << elapsed.elapsed() << " timeoutMs=" << timeoutMs
+                      << " processState=" << (process ? int(process->state()) : -1)
+                      << " exitCode=" << exitCode;
+  }
   void *job = NULL;
   void *processInformation = NULL;
   bool completed = false;
@@ -3476,6 +3489,9 @@ static const ProviderRuntimeTranslation providerRuntimeTranslations[] = {
 // tool identifiers, and public progress notes are inserted only as bounded arguments. Unknown
 // provider IDs keep their diagnostic fallback.
 static const ProviderRuntimeTranslation taskRuntimeTranslations[] = {
+    {"task.frame-flow.waiting-for-arguments",
+     QT_TRANSLATE_NOOP3("AIAssistant", "Waiting for the model to submit frame diagram arguments",
+                        "task.frame-flow.waiting-for-arguments")},
     {"task.capabilities.codex-configured",
      QT_TRANSLATE_NOOP3("AIAssistant", "Codex configured capabilities",
                         "task.capabilities.codex-configured")},
@@ -3958,7 +3974,8 @@ private:
 AIAssistant::AIAssistant(CaptureContext &ctx, QWidget *parent) : QFrame(parent), m_Ctx(ctx)
 {
   setWindowTitle(tr("Bread AI"));
-  setMinimumSize(QSize(700, 460));
+  // The dock must be able to share a screen with the capture and event panels.
+  setMinimumSize(QSize(320, 240));
 
   m_AgentTraceStore = new AIAgentTraceStore();
   m_AgentMonitor = new AIAgentMonitorWindow(*m_AgentTraceStore, this);
@@ -4003,6 +4020,7 @@ AIAssistant::AIAssistant(CaptureContext &ctx, QWidget *parent) : QFrame(parent),
   m_Status = new QLabel(this);
   setDiagnosticStatus(m_Status, DiagnosticLevel::Info, tr("Starting..."));
   m_Status->setMinimumWidth(110);
+  m_Status->setWordWrap(true);
   m_Status->setTextInteractionFlags(Qt::TextSelectableByMouse |
                                     Qt::TextSelectableByKeyboard);
   m_Status->setFocusPolicy(Qt::StrongFocus);
@@ -4025,6 +4043,7 @@ AIAssistant::AIAssistant(CaptureContext &ctx, QWidget *parent) : QFrame(parent),
   mainLayout->addLayout(connectionRow);
 
   m_Context = new QLabel(this);
+  m_Context->setWordWrap(true);
   m_Context->setTextInteractionFlags(Qt::TextSelectableByMouse |
                                      Qt::TextSelectableByKeyboard);
   m_Context->setFocusPolicy(Qt::StrongFocus);
@@ -8199,6 +8218,19 @@ void AIAssistant::runCLIAsync(const QStringList &arguments, const QByteArray &in
   state->process = process;
   state->completion = completion;
   state->input = input;
+  state->timeoutMs = qMax(1000, timeoutMs);
+  // Only fixed protocol verbs may reach the log. Arguments can contain sensitive values.
+  state->operation = QStringLiteral("other");
+  const QString verb = arguments.value(0);
+  const QString subcommand = arguments.value(1);
+  if(verb == QStringLiteral("profile") && subcommand == QStringLiteral("subscription"))
+    state->operation = QStringLiteral("profile subscription");
+  else if(verb == QStringLiteral("profile") && subcommand == QStringLiteral("models"))
+    state->operation = QStringLiteral("profile models");
+  else if(verb == QStringLiteral("tools"))
+    state->operation = QStringLiteral("tools");
+  else if(verb == QStringLiteral("doctor"))
+    state->operation = QStringLiteral("doctor");
   QTimer *timeout = new QTimer(process);
   timeout->setSingleShot(true);
   state->timeout = timeout;
@@ -8213,6 +8245,7 @@ void AIAssistant::runCLIAsync(const QStringList &arguments, const QByteArray &in
       connect(ownerDialog, &QDialog::finished, owner, [state](int) {
         if(state->completed)
           return;
+        state->log("cancelled");
         state->completed = true;
         state->completion = CLICompletion();
         if(state->timeout)
@@ -8228,6 +8261,8 @@ void AIAssistant::runCLIAsync(const QStringList &arguments, const QByteArray &in
         m_ConfigurationProcesses.take(process);
     if(!state)
       return;
+    if(!state->completed)
+      state->log("owner destroyed");
     state->completed = true;
     state->completion = std::function<void(int, const QByteArray &, const QString &, bool)>();
     state->closeJob();
@@ -8276,6 +8311,7 @@ void AIAssistant::runCLIAsync(const QStringList &arguments, const QByteArray &in
       diagnostic = state->forcedDiagnostic;
       exitCode = -1;
     }
+    state->log(unavailable ? "start failed" : "finished", exitCode);
     const QPointer<AIAssistant> assistant = state->assistant;
     const QPointer<QObject> owner = state->owner;
     const std::function<void(int, const QByteArray &, const QString &, bool)> completion =
@@ -8295,6 +8331,7 @@ void AIAssistant::runCLIAsync(const QStringList &arguments, const QByteArray &in
                                [assistant, state]() {
     if(state->completed || !state->process)
       return;
+    state->log("process started");
     if(!assistant)
     {
       state->forcedDiagnostic =
@@ -8370,13 +8407,16 @@ void AIAssistant::runCLIAsync(const QStringList &arguments, const QByteArray &in
   connectAIConfigurationSignal(timeout, &QTimer::timeout, owner, [state, finish]() {
     if(state->completed)
       return;
+    state->log("timed out");
     state->forcedDiagnostic = QCoreApplication::translate("AIAssistant", "Command timed out");
     if(state->process)
       state->process->kill();
     (*finish)(false);
   });
 
-  timeout->start(qMax(1000, timeoutMs));
+  state->elapsed.start();
+  state->log("starting");
+  timeout->start(state->timeoutMs);
   process->start(cliPath, arguments, QIODevice::ReadWrite);
 }
 
@@ -9770,7 +9810,7 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
               // i18n-ignore: Fixed AgentHost CLI protocol command and flags; never shown to users.
               {lit("profile"), lit("subscription"), lit("status"), lit("--profile"), existingId,
                lit("--json")},    // i18n-ignore: AgentHost CLI protocol command and flags
-              QByteArray(), 7000, &dialog,
+              QByteArray(), SubscriptionStatusTimeoutMs, &dialog,
               [&, requestGeneration, requestPreset](const AIHostCommandReply &reply) {
                 if(requestGeneration != authStatusGeneration || requestPreset != selectedPresetId())
                   return;
@@ -12621,6 +12661,8 @@ void AIAssistant::cancelConfigurationProcesses()
   {
     if(!state)
       continue;
+    if(!state->completed)
+      state->log("cancelled");
     state->completed = true;
     state->completion = std::function<void(int, const QByteArray &, const QString &, bool)>();
     if(state->timeout)
@@ -15034,6 +15076,14 @@ void AIAssistant::consumeTaskEvent(const QString &taskId, const QByteArray &line
     const QString tool = event.value(lit("tool")).toString();
     const bool failed = eventData.value(lit("status")).toString() == lit("failed");
     QString detail = failed ? tr("Failed") : tr("Completed");
+    // i18n-ignore: structured task-event diagnostic fields, never translated.
+    if(eventData.value(lit("elapsedMs")).isDouble())
+      detail +=
+          lit("\n") + tr("Tool round trip: %1 ms").arg(eventData.value(lit("elapsedMs")).toInt());
+    // i18n-ignore: redacted backend task-event diagnostic field.
+    const QString diagnostic = eventData.value(lit("publicDetail")).toString().left(400);
+    if(failed && !diagnostic.isEmpty())
+      detail += lit("\n") + diagnostic;
     // i18n-ignore: Activity kind is a backend protocol identifier; the tool name is displayed separately.
     addTaskActivity(taskId, lit("tool"), tr("Tool: %1").arg(tool), detail, true, failed,
                     eventTimestampMs,

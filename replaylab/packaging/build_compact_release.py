@@ -19,6 +19,7 @@ import zipfile
 from package_portable import copy_tree, release_files, zip_compress_type
 from prepare_capabilities_bundle import verify
 from runtime_inputs import fingerprint, REPO
+from host_runtime import SUPPORT, runtime_paths
 
 PREFIX = "RenderDocBread/"
 CAPS = "replaylab/tools/capabilities/"
@@ -55,11 +56,8 @@ def compose(base, capabilities, runtime, gui, output, *, replay_bindings=None, r
         additions["renderdoc.dll"] = replay_core.resolve(strict=True)
     if replay_bindings is not None:
         additions["pymodules/renderdoc.pyd"] = replay_bindings.resolve(strict=True)
-    for record in hosts["files"]:
-        path = runtime / record["path"]
-        if path.stat().st_size != record["size"] or digest(path) != record["sha256"]:
-            raise ValueError("Frozen host differs: " + record["path"])
-        additions["replaylab/" + record["path"]] = path
+    for name, path in runtime_paths(runtime, hosts).items():
+        additions["replaylab/" + name] = path
     hosts.get("shaderTools", {}).pop("path", None)
     additions["replaylab/replaylab-runtime-manifest.json"] = encoded(hosts)
     if capabilities:
@@ -93,7 +91,7 @@ def compose(base, capabilities, runtime, gui, output, *, replay_bindings=None, r
                 return True
             return path.removeprefix("replaylab/tools/").split("/", 1)[0] in core_tools
         retained = {path: record for path, record in before.items()
-                    if not path.startswith((CAPS, *owned)) and path not in additions
+                    if not path.startswith((CAPS, "replaylab/" + SUPPORT + "/", *owned)) and path not in additions
                     and retained_tool(path)
                     and "__pycache__" not in Path(path).parts and Path(path).suffix not in {".pyc", ".pyo"}}
         if len(set(old.namelist())) != len(old.namelist()):

@@ -8,6 +8,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import build_compact_release as release
 
 
+
+def _fake_runtime(runtime):
+    from host_runtime import HOSTS
+    files = []
+    for name in HOSTS:
+        path = runtime / name
+        path.write_bytes(b"runtime")
+        files.append({"path": name, "size": path.stat().st_size, "sha256": release.digest(path)})
+    (runtime / "replaylab-runtime-manifest.json").write_text(
+        json.dumps({"sourceInputsSha256": "source", "files": files}))
+
+
 def test_compact_rewrite_removes_old_payload_and_preserves_exact_dependency_inventory(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     for source in release.SCOPES:
@@ -39,6 +51,7 @@ def test_compact_rewrite_removes_old_payload_and_preserves_exact_dependency_inve
     monkeypatch.setattr(release, "verify", verify_public)
     base = tmp_path / "base.zip"
     files = {release.CAPS + item["path"]: b"old", "unchanged.dll": b"native", "replaylab/skills/obsolete.txt": b"obsolete",
+             "replaylab/bread-host-support/obsolete.dll": b"obsolete",
              "pymodules/renderdoc.pyd": b"previous native bindings", "renderdoc.dll": b"previous replay core"}
     manifest = {"files": [{"path": p, "size": len(v), "sha256": hashlib.sha256(v).hexdigest()} for p, v in files.items()]}
     with zipfile.ZipFile(base, "w") as z:
@@ -47,7 +60,7 @@ def test_compact_rewrite_removes_old_payload_and_preserves_exact_dependency_inve
         z.writestr(release.PREFIX + release.CAPS + "bread-capabilities.json", json.dumps({"files": [item]}))
     base.with_suffix(".zip.sha256").write_text(release.digest(base))
     runtime = tmp_path / "runtime"; runtime.mkdir()
-    (runtime / "replaylab-runtime-manifest.json").write_text(json.dumps({"sourceInputsSha256": "source", "files": []}))
+    _fake_runtime(runtime)
     gui = tmp_path / "gui.exe"; gui.write_bytes(b"gui")
     bindings = tmp_path / "renderdoc.pyd"; bindings.write_bytes(b"current native bindings")
     core = tmp_path / "renderdoc.dll"; core.write_bytes(b"current replay core")
@@ -82,7 +95,7 @@ def test_core_rewrite_omits_all_optional_bytes_but_keeps_unity_and_core_tools(tm
         z.writestr(release.PREFIX + "RenderDocBread.manifest.json", json.dumps(manifest))
     base.with_suffix(".zip.sha256").write_text(release.digest(base))
     runtime = tmp_path / "runtime"; runtime.mkdir()
-    (runtime / "replaylab-runtime-manifest.json").write_text(json.dumps({"sourceInputsSha256": "source", "files": []}))
+    _fake_runtime(runtime)
     gui = tmp_path / "gui.exe"; gui.write_bytes(b"gui")
     output = tmp_path / "core.zip"
     result = release.compose(base, None, runtime, gui, output)

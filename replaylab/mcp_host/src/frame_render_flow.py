@@ -8,10 +8,12 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from bisect import bisect_left, bisect_right
+from contextlib import contextmanager
 from copy import deepcopy
 import hashlib
 import json
 import re
+import secrets
 import threading
 from typing import Any, Callable, Mapping
 
@@ -74,26 +76,36 @@ def _output_omissions(value: Any, attachments: list[dict[str, Any]]) -> list[dic
     """Keep the inventory complete without requiring an unrelated image wall."""
     if not isinstance(value, list) or len(value) > 64:
         raise ValueError("Output omissions must be a bounded list of observed attachments")
-    result, used = [], set()
-    for row in value:
-        fields = {"eventId", "resourceId", "kind", "index", "stage", "mip", "slice", "sample", "reason", "evidence"}
-        if not isinstance(row, Mapping) or set(row) - fields:
-            raise ValueError("Output omissions require an observed attachment, reason and evidence")
-        rid = _integer(row.get("resourceId"), "omitted resourceId", 1, 0xFFFFFFFFFFFFFFFF)
-        kind = _text(row.get("kind", ""), "omitted kind", 16, required=True)
-        index = _integer(row.get("index"), "omitted binding index", 0, 65535)
-        selected = [i for i, item in enumerate(attachments)
-                    if (item.get("resourceId"), item.get("kind"), item.get("index")) == (rid, kind, index)
-                    and all(item.get(key, 0 if key != "stage" else "") == row[key]
-                            for key in ("eventId", "stage", "mip", "slice", "sample") if key in row)]
-        if len(selected) != 1 or selected[0] in used:
-            raise ValueError("Output omission must identify one unique Host-observed attachment")
-        used.add(selected[0])
-        attachment = attachments[selected[0]]
-        clean = {key: attachment[key] for key in ("eventId", "resourceId", "kind", "index", "stage", "mip", "slice", "sample") if key in attachment}
-        clean.update(reason=_text(row.get("reason", ""), "omission reason", 600, required=True),
-                     evidence=_text(row.get("evidence", ""), "omission evidence", 1200, required=True))
-        result.append(clean)
+    result, used, issues = [], {}, []
+    for row_index, row in enumerate(value):
+        with _check(issues, "outputOmissions[%d]" % row_index):
+            fields = {"eventId", "resourceId", "kind", "index", "stage", "mip", "slice", "sample", "reason", "evidence"}
+            if not isinstance(row, Mapping) or set(row) - fields:
+                raise ValueError("Output omissions require an observed attachment, reason and evidence")
+            rid = _integer(row.get("resourceId"), "omitted resourceId", 1, 0xFFFFFFFFFFFFFFFF)
+            kind = _text(row.get("kind", ""), "omitted kind", 16, required=True)
+            index = _integer(row.get("index"), "omitted binding index", 0, 65535)
+            selected = [i for i, item in enumerate(attachments)
+                        if (item.get("resourceId"), item.get("kind"), item.get("index")) == (rid, kind, index)
+                        and all(item.get(key, 0 if key != "stage" else "") == row[key]
+                                for key in ("eventId", "stage", "mip", "slice", "sample") if key in row)]
+            if len(selected) != 1 or selected[0] in used:
+                if not selected:
+                    detail = "no observed match; verify the key output EID and binding"
+                elif len(selected) > 1:
+                    detail = "%d observed matches; specify eventId/stage/mip/slice/sample" % len(selected)
+                else:
+                    detail = "duplicates outputOmissions[%d]" % used[selected[0]]
+                raise ValueError("Output omission must identify one unique Host-observed attachment"
+                                 " (resourceId=%d, index=%d): %s" % (rid, index, detail))
+            attachment = attachments[selected[0]]
+            clean = {key: attachment[key] for key in ("eventId", "resourceId", "kind", "index", "stage", "mip", "slice", "sample") if key in attachment}
+            clean.update(reason=_text(row.get("reason", ""), "omission reason", 600, required=True),
+                         evidence=_text(row.get("evidence", ""), "omission evidence", 1200, required=True))
+            result.append(clean)
+            used[selected[0]] = row_index
+    if issues:
+        raise FrameFlowValidationError(issues)
     return result
 
 
@@ -283,7 +295,7 @@ def _techniques(value: Any) -> list[dict[str, str]]:
         if not isinstance(row, Mapping) or set(row) - {"name", "status", "evidence", "summary"}:
             raise ValueError("Technique findings accept name, status, evidence and summary")
         status = row.get("status", "unresolved")
-        if status not in TECHNIQUE_STATUSES:
+        if not isinstance(status, str) or status not in TECHNIQUE_STATUSES:
             raise ValueError("Technique status must be recognized, inferred, unresolved or not-observed")
         result.append({"name": _text(row.get("name", ""), "technique name", 160, required=True),
                        "status": status, "evidence": _text(row.get("evidence", ""), "technique evidence", 1200),
@@ -524,60 +536,187 @@ def _stage_quality(stage: Mapping[str, Any], last_shader_action: Mapping[str, An
     return gaps
 
 
+class FrameFlowValidationError(ValueError):
+    """Bounded, indexed issues from the cached outline and observed attachments."""
+
+    def __init__(self, issues):
+        self.issues = issues[:64]
+        self.issue_count = len(issues)
+        super().__init__("%d frame diagram validation issue(s): %s" % (
+            self.issue_count, "; ".join("%s: %s" % (issue["path"], issue["message"]) for issue in self.issues)))
+
+
+@contextmanager
+def _check(issues, path):
+    try:
+        yield
+    except FrameFlowValidationError as error:
+        issues.extend({"path": path + "." + row["path"], "message": row["message"]}
+                      for row in error.issues)
+    except ValueError as error:
+        issues.append({"path": path, "message": str(error)[:400]})
+
+
+def _stage_outputs(algorithm, navigation_event, by_eid, observations):
+    # The final navigable draw is often only a copy/cleanup. Review the
+    # actual key calculations, keeping navigation independent of evidence.
+    output_events = {row["eventId"] for row in (algorithm or {}).get("outputs", [])} or {navigation_event}
+    output_events = sorted(output_events, key=lambda event: by_eid[event]["executionIndex"])
+    observed_outputs, binding_errors, observed_event_count = [], [], 0
+    inventory_complete = True
+    for event in output_events:
+        observation = (observations or {}).get(str(event), {})
+        event_outputs = observation.get("expectedOutputs") if isinstance(observation, Mapping) else None
+        if not isinstance(event_outputs, list):
+            inventory_complete = False
+            continue
+        observed_event_count += 1
+        errors = deepcopy(observation.get("bindingErrors", []))
+        binding_errors.extend(errors)
+        inventory_complete = inventory_complete and observation.get("bindingsComplete", True) is not False and not errors
+        for item in event_outputs:
+            item = deepcopy(item)
+            if len(output_events) > 1 or event != navigation_event:
+                item["eventId"] = event
+            observed_outputs.append(item)
+    if not observed_event_count:
+        inventory_complete = None
+    expected_outputs = sorted({value for event in output_events for value in
+                               by_eid[event].get("outputs", []) + [by_eid[event].get("depthOutput", 0)] if value})
+    non_image_outputs = []
+    expected_attachments = []
+    if observed_event_count:
+        expected_attachments = [deepcopy(item) for item in observed_outputs
+            if item.get("captureSupported") is not False and item.get("resourceType", "texture") != "buffer"]
+        expected_outputs = sorted({item["resourceId"] for item in expected_attachments})
+        non_image_outputs = [deepcopy(item) for item in observed_outputs
+            if item.get("captureSupported") is False or item.get("resourceType") == "buffer"]
+    return {"expectedResourceIds": expected_outputs, "expectedAttachments": expected_attachments,
+            "keyOutputEventIds": output_events, "nonImageOutputs": non_image_outputs,
+            "inventoryComplete": inventory_complete, "bindingErrors": binding_errors,
+            "source": "stage-inspection" if observed_event_count else "action-outline"}
+
+
+def _validate_stages(stages, by_eid, gpu, gpu_order, observations, *, title, summary):
+    if not isinstance(stages, list) or not 1 <= len(stages) <= MAX_STAGES:
+        raise ValueError("Provide between 1 and %d chronological stages; combine adjacent stages if needed" % MAX_STAGES)
+    issues, validated, ids = [], [], set()
+    previous_end = -1
+    image_count = 0
+    with _check(issues, "title"):
+        _text(title, "diagram title", 160)
+    with _check(issues, "summary"):
+        _text(summary, "diagram summary", 2400)
+    for index, stage in enumerate(stages):
+        path = "stages[%d]" % index
+        if not isinstance(stage, Mapping):
+            issues.append({"path": path, "message": "Each frame stage must be an object"})
+            continue
+        allowed = {"id", "title", "summary", "confidence", "startEventId", "endEventId",
+                   "representativeEventId", "images"} | STAGE_ANNOTATION_FIELDS
+        with _check(issues, path):
+            if set(stage) - allowed:
+                raise ValueError("Unsupported stage fields: %s" % ", ".join(sorted(set(stage) - allowed)))
+        with _check(issues, path + ".id"):
+            stage_id = _text(stage.get("id", "stage-%d" % (index + 1)), "stage id", 80, required=True)
+            if not re.fullmatch(r"[a-zA-Z0-9_.-]+", stage_id) or stage_id in ids:
+                raise ValueError("Stage IDs must be unique plain identifiers")
+            ids.add(stage_id)
+        with _check(issues, path + ".title"):
+            stage_title = _text(stage.get("title", ""), "stage title", 160, required=True)
+        with _check(issues, path + ".summary"):
+            stage_summary = _text(stage.get("summary", ""), "stage summary", 1200)
+        confidence = stage.get("confidence", "inferred")
+        with _check(issues, path + ".confidence"):
+            if confidence not in ("captured", "inferred", "unknown"):
+                raise ValueError("Stage confidence must be captured, inferred or unknown")
+        category = stage.get("category", "other")
+        with _check(issues, path + ".category"):
+            if not isinstance(category, str) or category not in STAGE_CATEGORIES:
+                raise ValueError("Stage category must be one of: " + ", ".join(sorted(STAGE_CATEGORIES)))
+        with _check(issues, path + ".techniques"):
+            techniques = _techniques(stage.get("techniques", []))
+        with _check(issues, path + ".investigation"):
+            investigation = _investigation(stage.get("investigation", {}))
+        with _check(issues, path + ".images"):
+            images = stage.get("images", [])
+            if not isinstance(images, list) or len(images) > MAX_STAGE_IMAGES:
+                raise ValueError("Each stage supports at most %d evidence images" % MAX_STAGE_IMAGES)
+            image_count += len(images)
+            if image_count > MAX_IMAGES:
+                raise ValueError("Frame diagram supports at most %d evidence images" % MAX_IMAGES)
+        member_rows = []
+        with _check(issues, path + ".bounds"):
+            first = _integer(stage.get("startEventId"), "startEventId", 1)
+            last = _integer(stage.get("endEventId"), "endEventId", 1)
+            if first not in by_eid or last not in by_eid:
+                raise ValueError("Stage bounds must be actual EIDs in this frame")
+            begin, end = by_eid[first]["executionIndex"], by_eid[last]["executionIndex"]
+            if end < begin or begin <= previous_end:
+                raise ValueError("Frame stages must be chronological, non-overlapping ranges")
+            previous_end = end
+            member_rows = gpu[bisect_left(gpu_order, begin):bisect_right(gpu_order, end)]
+            if not member_rows:
+                raise ValueError("A stage must contain a draw, dispatch, copy, clear, resolve or present action")
+        if not member_rows:
+            continue
+        members = [row["eventId"] for row in member_rows]
+        with _check(issues, path + ".representativeEventId"):
+            representative = _integer(stage.get("representativeEventId", members[-1]), "representativeEventId", 1)
+            if representative not in members:
+                raise ValueError("Representative EID must be a GPU action inside its stage")
+        navigation_row, navigation_status = navigation_action(member_rows, observations)
+        algorithm = None
+        with _check(issues, path + ".algorithm"):
+            algorithm = validate_algorithm(stage.get("algorithm"), set(members), by_eid)
+        # If the submitted algorithm is invalid, its key outputs are unknown.
+        if algorithm is None and issues and issues[-1]["path"] == path + ".algorithm":
+            continue
+        outputs = _stage_outputs(algorithm, navigation_row["eventId"], by_eid, observations)
+        omissions = []
+        with _check(issues, path):
+            omissions = _output_omissions(stage.get("outputOmissions", []), outputs["expectedAttachments"])
+        if issues:
+            continue
+        header = {"id": stage_id, "title": stage_title, "summary": stage_summary, "confidence": confidence,
+                  "category": category, "techniques": techniques, "investigation": investigation,
+                  "startEventId": first, "endEventId": last, "eventIds": members, "algorithm": algorithm}
+        validated.append((header, member_rows, end, navigation_row, navigation_status, outputs, omissions))
+    if issues:
+        raise FrameFlowValidationError(issues)
+    return validated
+
+
+def validate_proposals(outline, stages, *, title="", summary="", observations=None):
+    """Validate bounded author inputs against cached evidence, with no image resolution or replay."""
+    by_eid = {row["eventId"]: row for row in outline["actions"]}
+    gpu = _gpu_actions(outline)
+    _validate_stages(stages, by_eid, gpu, [row["executionIndex"] for row in gpu],
+                     observations or {}, title=title, summary=summary)
+
+
 def build_document(outline: Mapping[str, Any], flow_id: str, snapshot_id: str,
                    stages: list[dict[str, Any]], *, title: str = "", summary: str = "",
                    image_resolver: Callable[[Mapping[str, Any], set[int]], dict[str, Any]] | None = None,
                    observations: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    if not isinstance(stages, list) or not 1 <= len(stages) <= MAX_STAGES:
-        raise ValueError("Provide between 1 and %d chronological stages; combine adjacent stages if needed" % MAX_STAGES)
     rows = outline["actions"]
     by_eid = {row["eventId"]: row for row in rows}
-    writers = write_index(by_eid, observations or {})
     gpu = _gpu_actions(outline)
     gpu_order = [row["executionIndex"] for row in gpu]
-    clean, ids, covered = [], set(), set()
-    previous_end = -1
-    image_count = 0
-    for index, stage in enumerate(stages):
-        if not isinstance(stage, Mapping):
-            raise ValueError("Each frame stage must be an object")
-        allowed = {"id", "title", "summary", "confidence", "startEventId", "endEventId", "representativeEventId", "images"} | STAGE_ANNOTATION_FIELDS
-        if set(stage) - allowed:
-            raise ValueError("Unsupported stage fields: %s" % ", ".join(sorted(set(stage) - allowed)))
-        first = _integer(stage.get("startEventId"), "startEventId", 1)
-        last = _integer(stage.get("endEventId"), "endEventId", 1)
-        if first not in by_eid or last not in by_eid:
-            raise ValueError("Stage bounds must be actual EIDs in this frame")
-        begin, end = by_eid[first]["executionIndex"], by_eid[last]["executionIndex"]
-        if end < begin or begin <= previous_end:
-            raise ValueError("Frame stages must be chronological, non-overlapping ranges")
-        member_rows = gpu[bisect_left(gpu_order, begin):bisect_right(gpu_order, end)]
-        members = [row["eventId"] for row in member_rows]
-        if not members:
-            raise ValueError("A stage must contain a draw, dispatch, copy, clear, resolve or present action")
-        representative = _integer(stage.get("representativeEventId", members[-1]), "representativeEventId", 1)
-        if representative not in members:
-            raise ValueError("Representative EID must be a GPU action inside its stage")
-        navigation_row, navigation_status = navigation_action(member_rows, observations)
-        last_shader_action = navigation_row if navigation_status in ("last-draw", "last-dispatch") else None
+    clean, covered = [], set()
+    validated = _validate_stages(stages, by_eid, gpu, gpu_order, observations or {},
+                                 title=title, summary=summary)
+    writers = write_index(by_eid, observations or {})
+    for stage, validation in zip(stages, validated):
+        header, member_rows, end, navigation_row, navigation_status, outputs, omissions = validation
+        members = header["eventIds"]
+        algorithm = header["algorithm"]
         navigation_event = navigation_row["eventId"]
-        representative = navigation_event
-        stage_id = _text(stage.get("id", "stage-%d" % (index + 1)), "stage id", 80, required=True)
-        if not re.fullmatch(r"[a-zA-Z0-9_.-]+", stage_id) or stage_id in ids:
-            raise ValueError("Stage IDs must be unique plain identifiers")
-        ids.add(stage_id)
-        confidence = stage.get("confidence", "inferred")
-        if confidence not in ("captured", "inferred", "unknown"):
-            raise ValueError("Stage confidence must be captured, inferred or unknown")
-        category = stage.get("category", "other")
-        if category not in STAGE_CATEGORIES:
-            raise ValueError("Stage category must be one of: " + ", ".join(sorted(STAGE_CATEGORIES)))
+        last_shader_action = navigation_row if navigation_status in ("last-draw", "last-dispatch") else None
+        output_events = outputs["keyOutputEventIds"]
+        expected_attachments = outputs["expectedAttachments"]
+        expected_outputs = outputs["expectedResourceIds"]
         images = stage.get("images", [])
-        if not isinstance(images, list) or len(images) > MAX_STAGE_IMAGES:
-            raise ValueError("Each stage supports at most %d evidence images" % MAX_STAGE_IMAGES)
-        image_count += len(images)
-        if image_count > MAX_IMAGES:
-            raise ValueError("Frame diagram supports at most %d evidence images" % MAX_IMAGES)
         resolved = []
         for image in images:
             if not isinstance(image, Mapping) or set(image) - ({"manifestPath", "manifest_path", "title", "description"} | IMAGE_ANNOTATION_FIELDS):
@@ -606,41 +745,6 @@ def build_document(outline: Mapping[str, Any], flow_id: str, snapshot_id: str,
                 result["channelGroups"] = channel_groups(image["channelGroups"], result.get("componentCount", 0))
             resolved.append(result)
         _channel_parents(resolved)
-        algorithm = validate_algorithm(stage.get("algorithm"), set(members), by_eid)
-        # The final navigable draw is often only a copy/cleanup. Review the
-        # actual key calculations, keeping navigation independent of evidence.
-        output_events = {row["eventId"] for row in (algorithm or {}).get("outputs", [])} or {navigation_event}
-        output_events = sorted(output_events, key=lambda event: by_eid[event]["executionIndex"])
-        observed_outputs, binding_errors, observed_event_count = [], [], 0
-        inventory_complete = True
-        for event in output_events:
-            observation = (observations or {}).get(str(event), {})
-            event_outputs = observation.get("expectedOutputs") if isinstance(observation, Mapping) else None
-            if not isinstance(event_outputs, list):
-                inventory_complete = False
-                continue
-            observed_event_count += 1
-            errors = deepcopy(observation.get("bindingErrors", []))
-            binding_errors.extend(errors)
-            inventory_complete = inventory_complete and observation.get("bindingsComplete", True) is not False and not errors
-            for item in event_outputs:
-                item = deepcopy(item)
-                if len(output_events) > 1 or event != navigation_event:
-                    item["eventId"] = event
-                observed_outputs.append(item)
-        if not observed_event_count:
-            observed_outputs = None
-            inventory_complete = None
-        expected_outputs = sorted({value for event in output_events for value in
-                                   by_eid[event].get("outputs", []) + [by_eid[event].get("depthOutput", 0)] if value})
-        non_image_outputs = []
-        expected_attachments = []
-        if isinstance(observed_outputs, list):
-            expected_attachments = [deepcopy(item) for item in observed_outputs
-                if item.get("captureSupported") is not False and item.get("resourceType", "texture") != "buffer"]
-            expected_outputs = sorted({item["resourceId"] for item in expected_attachments})
-            non_image_outputs = [deepcopy(item) for item in observed_outputs
-                if item.get("captureSupported") is False or item.get("resourceType") == "buffer"]
         represented_outputs = sorted({image["resourceId"] for image in resolved
             if image.get("resourceId") and image["group"] == "outputs"
             and image.get("eventId") in output_events and image.get("channel") in ("rgba", "depth")})
@@ -664,7 +768,6 @@ def build_document(outline: Mapping[str, Any], flow_id: str, snapshot_id: str,
                        for key in ("mip", "slice", "sample")):
                     return True
             return False
-        omissions = _output_omissions(stage.get("outputOmissions", []), expected_attachments)
         def omitted(attachment: Mapping[str, Any]) -> bool:
             return any(all(attachment.get(key) == row.get(key) for key in
                            ("eventId", "resourceId", "kind", "index", "stage", "mip", "slice", "sample")) for row in omissions)
@@ -675,34 +778,25 @@ def build_document(outline: Mapping[str, Any], flow_id: str, snapshot_id: str,
         comparisons = _comparisons(stage.get("comparisons", []), resolved)
         animations = _animations(stage.get("animations", []), resolved)
         presents = [row for row in member_rows if row["flags"] & 0x0100 and row.get("copyDestination")]
-        clean_stage = {"id": stage_id, "title": _text(stage.get("title", ""), "stage title", 160, required=True),
-                      "summary": _text(stage.get("summary", ""), "stage summary", 1200),
-                      "confidence": confidence, "startEventId": first, "endEventId": last,
-                      "eventIds": members, "representativeEventId": representative, "images": resolved,
+        clean_stage = {**header, "representativeEventId": navigation_event, "images": resolved,
                       "navigationEventId": navigation_event, "navigationPolicy": "last-effective-draw-then-dispatch-or-utility",
                       "navigationStatus": navigation_status, "navigationHasWork": navigation_row.get("hasWork"),
                       "navigationActionKind": navigation_row.get("actionKind") or (
                           "draw" if navigation_row["flags"] & (0x0002 | 0x0008) else
                           "dispatch" if navigation_row["flags"] & (0x0004 | 0x4000) else "utility"),
-                      "category": category, "techniques": _techniques(stage.get("techniques", [])),
-                      "investigation": _investigation(stage.get("investigation", {})),
                       "comparisons": comparisons, "animations": animations,
                       "processSteps": _process_steps(stage.get("processSteps", []), len(resolved), len(comparisons), len(animations)),
                       "processGraph": process_graph(stage.get("processGraph"), resolved, comparisons, animations, set(members),
                                                     allowed_events=set(members) | referenced_events(algorithm)),
                       "outputOmissions": omissions,
-                      "algorithm": algorithm,
-                      "outputCoverage": {"expectedResourceIds": expected_outputs, "representedResourceIds": represented_outputs,
-                                         "missingResourceIds": missing_outputs,
-                                         "expectedAttachments": expected_attachments, "missingAttachments": missing_attachments,
+                      "outputCoverage": {**outputs, "expectedResourceIds": expected_outputs,
+                                         "representedResourceIds": represented_outputs,
+                                         "missingResourceIds": missing_outputs, "missingAttachments": missing_attachments,
                                          "omittedAttachments": omissions,
-                                         "keyOutputEventIds": output_events,
                                          "presentEventId": presents[-1]["eventId"] if presents else 0,
                                          "presentResourceId": presents[-1]["copyDestination"] if presents else 0,
-                                         "nonImageOutputs": non_image_outputs,
-                                         "inventoryComplete": inventory_complete, "bindingErrors": binding_errors,
-                                         "source": "stage-inspection" if isinstance(observed_outputs, list) else "action-outline",
-                                         "status": "missing" if missing_outputs or missing_attachments else "complete" if expected_outputs or isinstance(observed_outputs, list) else "not-known-from-outline"}}
+                                         "status": "missing" if missing_outputs or missing_attachments else "complete"
+                                         if expected_outputs or outputs["source"] == "stage-inspection" else "not-known-from-outline"}}
         clean_stage["visualReview"] = prepare_visuals(clean_stage, by_eid, observations or {})
         clean_stage["qualityGaps"] = _stage_quality(clean_stage, last_shader_action, observations or {})
         clean_stage["qualityGaps"].extend(algorithm_gaps(clean_stage, by_eid, observations or {}, writers, flow_id=flow_id))
@@ -711,7 +805,6 @@ def build_document(outline: Mapping[str, Any], flow_id: str, snapshot_id: str,
         if any(image["group"] == "animation-frames" and index not in animated for index, image in enumerate(resolved)):
             raise ValueError("Every animation-frames image must be referenced by an animation")
         clean.append(clean_stage)
-        previous_end = end
         covered.update(members)
     source = outline["summary"]
     quality_gaps = [gap for stage in clean for gap in stage["qualityGaps"]]
@@ -824,6 +917,7 @@ class FrameRenderFlowStore:
     def __init__(self, capacity: int = 4):
         self._records: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._lock = threading.RLock()
+        self._drafts: OrderedDict[str, tuple[str, dict[str, Any]]] = OrderedDict()
         self.capacity = capacity
 
     def prepare(self, raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -839,7 +933,8 @@ class FrameRenderFlowStore:
                 self._records[flow_id] = record
             self._records.move_to_end(flow_id)
             while len(self._records) > self.capacity:
-                self._records.popitem(last=False)
+                evicted, _ = self._records.popitem(last=False)
+                self._discard_drafts(evicted)
             return deepcopy(record)
 
     def get(self, session: str, flow_id: str = "", *, copy_record: bool = True) -> dict[str, Any]:
@@ -857,6 +952,34 @@ class FrameRenderFlowStore:
             # retain the isolated-copy default.
             return deepcopy(record) if copy_record else dict(record)
 
+    def _discard_drafts(self, flow_id: str) -> None:
+        for draft_id, entry in list(self._drafts.items()):
+            if entry[0] == flow_id:
+                del self._drafts[draft_id]
+
+    def save_draft(self, flow_id: str, proposal: dict[str, Any], reanalysis_revision: int) -> str:
+        # A receipt is a capability for one immutable, in-memory revision. It
+        # contains no capture data and is unusable under a different flow.
+        if len(json.dumps(proposal, ensure_ascii=False, allow_nan=False).encode("utf-8")) > 2 * 1024 * 1024:
+            raise ValueError("Frame diagram draft exceeds the 2 MiB proposal budget")
+        with self._lock:
+            record = self._records.get(flow_id)
+            if record is None or record.get("reanalysis", {}).get("revision", 0) != reanalysis_revision:
+                raise ValueError("The prepared frame changed; validate proposals again against the current draft")
+            draft_id = secrets.token_hex(16)
+            self._drafts[draft_id] = (flow_id, deepcopy(proposal))
+            while len(self._drafts) > 8:
+                self._drafts.popitem(last=False)
+            return draft_id
+
+    def get_draft(self, flow_id: str, draft_id: str) -> dict[str, Any]:
+        with self._lock:
+            entry = self._drafts.get(draft_id)
+            if entry is None or entry[0] != flow_id or flow_id not in self._records:
+                raise ValueError("No draft revision for this prepared frame; submit proposals to preflight again")
+            self._drafts.move_to_end(draft_id)
+            return deepcopy(entry[1])
+
     def publish(self, flow_id: str, document: dict[str, Any]) -> None:
         with self._lock:
             record = self._records.get(flow_id)
@@ -869,6 +992,7 @@ class FrameRenderFlowStore:
         with self._lock:
             self.get(session, flow_id, copy_record=False)
             record = self._records[flow_id]
+            self._discard_drafts(flow_id)
             baseline = record.get("document") or record.get("baselineDocument")
             stages = (baseline or {}).get("stages", [])
             record["baselineDocument"] = deepcopy(baseline)

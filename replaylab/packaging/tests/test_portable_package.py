@@ -111,7 +111,10 @@ def test_full_assembler_core_default_ignores_installed_optional_and_unknown_tool
         (uex / name).write_text("license")
     for name in ("replaylab-ai.exe", "BreadMCP.exe", "ReplayLabInternal.exe", "ReplayLabShaderTools.exe"):
         (runtime / name).write_bytes(b"runtime")
-    package.write_json(runtime / "replaylab-runtime-manifest.json", {"version": "test", "files": []})
+    package.write_json(runtime / "replaylab-runtime-manifest.json", {"version": "test", "files": [
+        {"path": path.name, "size": path.stat().st_size, "sha256": package.digest(path)}
+        for path in runtime.glob("*.exe")
+    ]})
     for name in ("capabilities/bread-capabilities.json", "unrequested-plugin/tool.exe"):
         path = application / "replaylab/tools" / name
         path.parent.mkdir(parents=True, exist_ok=True); path.write_text("unrequested")
@@ -153,8 +156,14 @@ def test_command_line_requires_standard_functions_unless_minimal_is_explicit(tmp
 def native_audit_fixture(root):
     import runtime_inputs
     package.stage_uex_natives(root)
+    from host_runtime import HOSTS
+    files = []
+    for name in HOSTS:
+        path = root / "replaylab" / name
+        path.write_bytes(b"runtime")
+        files.append({"path": name, "size": path.stat().st_size, "sha256": package.digest(path)})
     package.write_json(root / "replaylab/replaylab-runtime-manifest.json", {
-        "files": [], "sourceInputsSha256": runtime_inputs.fingerprint()})
+        "files": files, "sourceInputsSha256": runtime_inputs.fingerprint()})
     package.write_json(root / "replaylab/tools/unpackers/uex/uex.runtimeconfig.json", {"runtimeOptions": {}})
     package.write_json(root / "replaylab/bread-distribution.json", {"profile": "core"})
     for source in (package.REPO / ".agents/skills").glob("*/SKILL.md"):

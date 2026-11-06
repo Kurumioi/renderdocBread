@@ -230,8 +230,22 @@ The bundled tools currently target Linux x86-64 hosts and are tested on Ubuntu
 Android remote replay uses the host's compiler bundle, not an Android compiler
 executable. These compiler checks do not claim Linux/Android GPU replay coverage.
 
-`Build-ReplayLabRuntime.ps1` produces four Python 3.12 executables with separate
-product boundaries:
+`Build-ReplayLabRuntime.ps1` produces four Python 3.12 executables.
+
+The portable build entry point passes `-PortableHosts` and stages the three
+Agent, Internal and MCP launchers beside one verified `bread-host-support/`
+directory under `replaylab/output/portable-runtime`. Their application-relative
+names are unchanged. The release manifest pins the support files as well as
+the four executables. Shared files must match byte for byte, except equivalent
+standard library ZIPs whose member contents match. Embedded first-party code
+is verified against the current checkout before a runtime is staged.
+
+For Development deployment, invoke the freezer without `-PortableHosts` to
+produce the existing onefile runtime under `replaylab/output/replaylab`.
+Portable Host files are installed together by the release assembler and kept
+separate from the Development deployment input.
+
+The four entry points are:
 
 - `replaylab-ai.exe` — qrenderdoc's AgentHost with deepagents model-API execution,
   vendor-native ACP/Codex subscription execution, profile/credential handling,

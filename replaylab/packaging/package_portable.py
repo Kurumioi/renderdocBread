@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from build_fs import long_path, logical_path, temporary_directory
 from file_hashes import digest, warm_digests
+from host_runtime import MANIFEST as HOST_MANIFEST, runtime_paths
 
 REPO = Path(__file__).resolve().parents[2]
 SKIP_DIRS = {"__pycache__", ".git", ".venv", "obj", ".uex-cache", ".uex-analysis",
@@ -149,10 +150,10 @@ def audit(root, config):
     from runtime_inputs import fingerprint
     if manifest.get("sourceInputsSha256") != fingerprint():
         errors.append("Frozen runtime is from different source/skill inputs; rebuild the runtime before release")
-    for record in manifest["files"]:
-        path = child(root / "replaylab", record["path"])
-        if not path.is_file() or path.stat().st_size != record["size"] or digest(path) != record["sha256"]:
-            errors.append(f"Runtime hash mismatch: {record['path']}")
+    try:
+        runtime_paths(root / "replaylab", manifest)
+    except (ValueError, OSError) as error:
+        errors.append(str(error))
     runtime_config = read_json(root / "replaylab/tools/unpackers/uex/uex.runtimeconfig.json")
     if "framework" in runtime_config["runtimeOptions"] or "frameworks" in runtime_config["runtimeOptions"]:
         errors.append("UEX requires a machine-installed .NET runtime; publish it self-contained")
@@ -284,8 +285,12 @@ def assemble(application, gui, runtime, uex, crt, destination, config, audit_onl
             if profile != "rdc":
                 compact_staging(root / "replaylab/tools/capabilities")
         copy_tree(REPO / "replaylab/unity", root / "replaylab/unity")
-        for name in ("replaylab-ai.exe", "BreadMCP.exe", "ReplayLabInternal.exe", "ReplayLabShaderTools.exe", "replaylab-runtime-manifest.json"):
-            shutil.copy2(runtime / name, root / "replaylab" / name)
+        manifest = read_json(runtime / HOST_MANIFEST)
+        for name, path in runtime_paths(runtime, manifest).items():
+            target = root / "replaylab" / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+        shutil.copy2(runtime / HOST_MANIFEST, root / "replaylab" / HOST_MANIFEST)
         if uex:
             # Start with the official unpacker files (native codecs/licenses), then overlay the
             # self-contained publish of the same patched source. Personal tool state is excluded.

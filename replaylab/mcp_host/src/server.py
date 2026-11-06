@@ -57,7 +57,13 @@ from .event_flow_artifacts import (
     _publish_no_overwrite as _publish_event_artifact_bytes,
 )
 from .event_flow_diagram import THEME_EVIDENCE_NEUTRAL_V1
-from .frame_render_flow import FrameRenderFlowStore, build_document as build_frame_render_flow_document
+from .frame_render_flow import (
+    MAX_STAGES as MAX_FRAME_FLOW_STAGES,
+    FrameFlowValidationError,
+    FrameRenderFlowStore,
+    build_document as build_frame_render_flow_document,
+    validate_proposals as validate_frame_render_flow_proposals,
+)
 from .frame_resource_usage import (
     FrameResourceUsageCache, normalize_usage as normalize_frame_resource_usage,
     usage_cache_key as frame_resource_usage_cache_key,
@@ -29013,7 +29019,7 @@ def _resume_frame_reanalysis(record: dict[str, Any]) -> dict[str, Any]:
     return record
 
 
-def _frame_render_flow_record(flow_id: str = "") -> tuple[dict[str, Any], dict[str, Any]]:
+def _frame_render_flow_record(flow_id: str = "", *, cached_only: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
     if not isinstance(flow_id, str):
         raise ValueError("flow_id must be a string")
     context = _active_live_context(allow_missing_capture_id=True)
@@ -29022,7 +29028,7 @@ def _frame_render_flow_record(flow_id: str = "") -> tuple[dict[str, Any], dict[s
     try:
         record = _frame_render_flow_store.get(session, flow_id, copy_record=False)
     except ValueError as error:
-        if flow_id and "Capture session changed" in str(error):
+        if cached_only or (flow_id and "Capture session changed" in str(error)):
             raise
         try:
             record = _restore_frame_render_flow(session, flow_id)
@@ -29040,7 +29046,7 @@ def _frame_render_flow_record(flow_id: str = "") -> tuple[dict[str, Any], dict[s
     path = str(context.get("capture", {}).get("path", "") or "")
     if path and _capture_path_key(path) != _capture_path_key(record["outline"]["capturePath"]):
         raise RuntimeError("Capture path changed after preparing the frame outline")
-    return context, _resume_frame_reanalysis(record)
+    return context, record if cached_only else _resume_frame_reanalysis(record)
 
 
 @mcp.tool()
@@ -29342,9 +29348,69 @@ def _precache_frame_flow_channels(document: dict[str, Any], context: dict[str, A
 
 
 @mcp.tool()
-def publish_frame_render_flow(flow_id: str, stages: list[dict[str, Any]], title: str = "",
-                              summary: str = "", show_in_window: bool = True) -> str:
+def validate_frame_render_flow(flow_id: str, stages: list[dict[str, Any]] | None = None,
+                               title: str | None = None, summary: str | None = None,
+                               draft_id: str = "",
+                               stage_updates: dict[str, dict[str, Any]] | None = None) -> str:
+    """Preflight proposals against a prepared frame's cached outline and output bindings.
+
+    First pass stages (up to 256) and optional title/summary. To repair, pass
+    draft_id from the last response and stage_updates keyed by zero-based stage
+    index. Each update overrides only its named stage fields. Send stages again
+    for insertion, deletion, or reorder. The receipt is a short-lived immutable
+    revision; it works only in this Host and prepared capture. A successful
+    preflight checks stage structure, algorithm references and observed output
+    omissions. It does not resolve image files, replay, write files, or change
+    the window. Publish with the valid draft_id alone. Publication rechecks
+    against current evidence and performs the remaining media validation.
+    """
+    try:
+        _, record = _frame_render_flow_record(flow_id, cached_only=True)
+        revision = record.get("reanalysis", {}).get("revision", 0)
+        if draft_id:
+            if stages is not None:
+                raise ValueError("Pass stages for a new draft or draft_id for stage updates")
+            proposal = _frame_render_flow_store.get_draft(record["flowId"], draft_id)
+        else:
+            if not isinstance(stages, list) or not 1 <= len(stages) <= MAX_FRAME_FLOW_STAGES:
+                raise ValueError("Pass between 1 and %d chronological stages" % MAX_FRAME_FLOW_STAGES)
+            if stage_updates is not None:
+                raise ValueError("stage_updates require a draft_id")
+            proposal = {"stages": stages, "title": "", "summary": ""}
+        if stage_updates is not None:
+            for key, update in stage_updates.items():
+                if not re.fullmatch(r"0|[1-9][0-9]{0,2}", key) or int(key) >= len(proposal["stages"]):
+                    raise ValueError("stage_updates keys must be existing zero-based stage indices")
+                index = int(key)
+                previous = proposal["stages"][index]
+                proposal["stages"][index] = {**(previous if isinstance(previous, dict) else {}), **update}
+        if title is not None:
+            proposal["title"] = title
+        if summary is not None:
+            proposal["summary"] = summary
+
+        issues, issue_count = [], 0
+        try:
+            validate_frame_render_flow_proposals(record["outline"], observations=record.get("observations", {}),
+                                                 **proposal)
+        except FrameFlowValidationError as error:
+            issues, issue_count = error.issues, error.issue_count
+        draft = _frame_render_flow_store.save_draft(record["flowId"], proposal, revision)
+        return _ok({"schema": "bread-frame-render-flow-preflight/v1", "flowId": record["flowId"],
+                    "snapshotId": record["snapshotId"], "draftId": draft, "valid": not issue_count,
+                    "issues": issues, "issueCount": issue_count, "saved": False, "replayed": False})
+    except Exception as error:
+        return _err(error)
+
+
+@mcp.tool()
+def publish_frame_render_flow(flow_id: str, stages: list[dict[str, Any]] | None = None,
+                              title: str = "", summary: str = "", show_in_window: bool = True,
+                              draft_id: str = "") -> str:
     """Save an AI-explained frame diagram and show it in the native dock window.
+
+    Prefer validate_frame_render_flow and publish its draft_id without resending
+    stages, title or summary. Existing callers may still pass proposals directly.
 
     Each stage has title, summary, confidence (captured/inferred/unknown), real
     startEventId/endEventId bounds, category (depth/shadow/geometry/lighting/
@@ -29436,6 +29502,11 @@ def publish_frame_render_flow(flow_id: str, stages: list[dict[str, Any]], title:
     try:
         show_in_window = _strict_bool(show_in_window, "show_in_window")
         context, record = _frame_render_flow_record(flow_id)
+        if draft_id:
+            if stages is not None or title or summary:
+                raise ValueError("Pass draft_id or stages, title and summary")
+            proposal = _frame_render_flow_store.get_draft(record["flowId"], draft_id)
+            stages, title, summary = proposal["stages"], proposal["title"], proposal["summary"]
         document = build_frame_render_flow_document(record["outline"], record["flowId"], record["snapshotId"],
             stages, title=title, summary=summary,
             image_resolver=lambda image, members: _frame_render_flow_image(image, members, record["outline"]),
@@ -29521,6 +29592,9 @@ def publish_frame_render_flow(flow_id: str, stages: list[dict[str, Any]], title:
                     "window": window, "policy": {"captureSessionGuarded": True, "perEventReplay": False,
                     "captureSidecarMutation": persistence["saved"],
                     "projectMutation": False, "replayMutation": False, "uiMutation": window["published"]}})
+    except FrameFlowValidationError as error:
+        return _ok({"error": str(error), "type": type(error).__name__,
+                    "issues": error.issues, "issueCount": error.issue_count})
     except Exception as error:
         return _err(error)
 

@@ -14,13 +14,16 @@ import logging
 import os
 import stat
 import sys
+import time
+import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any, Sequence
 
 from . import __version__
-from .agent_diagnostics import public_error
+from .agent_diagnostics import public_error, redact
 from .errors import ConfigurationError, PolicyError
 from .agent_report import TaskReportStore, TASK_ID_ENV, TASK_EVENT_ROOT_ENV, TASK_REVIEW_TOOL_SCHEMA, TASK_REVIEW_TOOL_DESCRIPTION
 from .task_review import TASK_REVIEW_TOOL, work_identity
@@ -52,7 +55,7 @@ from .skill_gateway import (
 )
 from .tool_scope import ToolCallScope
 from .tool_output import (OwnedOutputStore, OWNED_OUTPUT_READER,
-                          guard_mcp_call_result, owned_output_reader_schema)
+                          guard_mcp_call_result, mcp_result_failed, owned_output_reader_schema)
 from .owned_workspace import AGENT_WORKSPACE_ROOT_ENV, OwnedWorkspace
 
 
@@ -474,6 +477,78 @@ async def _reviewed_external_call(external: Any, name: str, arguments: dict[str,
     return result
 
 
+class _FrameFlowCalls:
+    """Task-local retry budget and actual Host roundtrip events."""
+
+    tools = frozenset({"validate_frame_render_flow", "publish_frame_render_flow"})
+
+    def __init__(self, host_env: dict[str, str]):
+        self.failures: OrderedDict[str, tuple[str, int, str]] = OrderedDict()
+        self.writer = None
+        task_id = host_env.get(TASK_ID_ENV) or os.environ.get(TASK_ID_ENV)
+        event_root = host_env.get(TASK_EVENT_ROOT_ENV) or os.environ.get(TASK_EVENT_ROOT_ENV)
+        if task_id and event_root:
+            from .events import TaskEventWriter
+            with suppress(ValueError, OSError):
+                self.writer = TaskEventWriter(event_root, task_id)
+
+    def _emit(self, kind, name, activity_id, **data):
+        if self.writer is not None:
+            with suppress(Exception):
+                self.writer.emit(kind, tool=name, data={"activityId": activity_id, **data})
+
+    @staticmethod
+    def _payload(result):
+        payload = getattr(result, "structuredContent", None)
+        if not isinstance(payload, dict):
+            payload = getattr(next(iter(result.content or ()), None), "text", "")
+        if isinstance(payload, dict) and "result" in payload:
+            payload = payload["result"]
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except ValueError:
+                return {}
+        return payload if isinstance(payload, dict) else {}
+
+    async def call(self, upstream, name, arguments):
+        flow = str(arguments.get("flow_id") or "")[:80]
+        last = self.failures.get(flow)
+        if name == "publish_frame_render_flow" and last and last[1] >= 3:
+            raise PolicyError("Publication paused after three matching validation failures. "
+                              "Correct the draft with validate_frame_render_flow before publishing again. "
+                              "If this cannot be resolved, report the remaining rule to the user. " + last[2])
+
+        activity_id = "frame-flow-host-" + uuid.uuid4().hex
+        started = time.monotonic()
+        self._emit("tool-started", name, activity_id)
+        status, detail = "failed", ""
+        try:
+            result = await upstream.call_tool(name, arguments)
+            payload = self._payload(result)
+            failed = mcp_result_failed(result) or payload.get("valid") is False
+            status = "failed" if failed else "completed"
+            issues = payload.get("issues")
+            if failed and isinstance(issues, list) and issues and isinstance(issues[0], dict):
+                first = issues[0]
+                detail = redact("%s: %s" % (first.get("path", ""), first.get("message", "")))[:400]
+            elif failed and isinstance(payload.get("error"), str):
+                detail = redact(payload["error"])[:400]
+            if name == "publish_frame_render_flow" and payload.get("type") == "FrameFlowValidationError":
+                signature = work_identity(issues)
+                self.failures[flow] = (signature, last[1] + 1 if last and last[0] == signature else 1, detail)
+                self.failures.move_to_end(flow)
+                if len(self.failures) > 16:
+                    self.failures.popitem(last=False)
+            elif status == "completed":
+                self.failures.pop(flow, None)
+            return result
+        finally:
+            self._emit("tool-completed", name, activity_id, status=status,
+                       elapsedMs=round((time.monotonic() - started) * 1000),
+                       publicDetail=detail)
+
+
 async def serve_filtered_proxy(
     host: Path | None,
     host_args: Sequence[str],
@@ -659,6 +734,8 @@ async def serve_filtered_proxy(
                 scope=scope,
             )
 
+            frame_flow_calls = _FrameFlowCalls(host_env)
+
             @server.list_tools()
             async def list_tools() -> list[Any]:
                 return [task_tools[name] for name in ordered_tool_names(visible_tools)]
@@ -779,7 +856,10 @@ async def serve_filtered_proxy(
                 admission = await call_coordinator.admit(name, arguments)
                 finished = False
                 try:
-                    result = await upstream.call_tool(name, arguments)
+                    if name in frame_flow_calls.tools:
+                        result = await frame_flow_calls.call(upstream, name, arguments)
+                    else:
+                        result = await upstream.call_tool(name, arguments)
                     await call_coordinator.finish(admission)
                     finished = True
                     return guard_mcp_call_result(result, name, store=output_store)
