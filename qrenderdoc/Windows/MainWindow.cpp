@@ -3503,9 +3503,11 @@ QVariantMap MainWindow::saveState()
 
 bool MainWindow::restoreState(QVariantMap &state)
 {
-  // i18n-ignore: persisted ToolWindowManager schema keys.
-  if(state.value(lit("toolWindowManagerStateFormat")).toInt() != 1 ||    // i18n-ignore: persisted layout key.
-     state.value(lit("mainWrapper")).toMap().isEmpty())
+  // i18n-ignore: persisted ToolWindowManager version key.
+  const bool supported = state.value(lit("toolWindowManagerStateFormat")).toInt() == 1;
+  // i18n-ignore: persisted ToolWindowManager root key.
+  const bool hasMainWrapper = !state.value(lit("mainWrapper")).toMap().isEmpty();
+  if(!supported || !hasMainWrapper)
     return false;
 
   restoreGeometry(QByteArray::fromBase64(state[lit("mainWindowGeometry")].toByteArray()));

@@ -17503,7 +17503,7 @@ Would you like to open the builds list in a browser?</source>
         <translation>无法加载布局</translation>
     </message>
     <message>
-        <location line="+124"/>
+        <location line="+126"/>
         <source>%1.
 
 Please manually allow the RenderDocCmd program storage permissions on your device to ensure correct functionality.</source>
@@ -22782,7 +22782,7 @@ The project folder and every local file will remain on disk.</source>
     </message>
     <message>
         <location line="+3"/>
-        <location filename="../Windows/MainWindow.cpp" line="-3562"/>
+        <location filename="../Windows/MainWindow.cpp" line="-3564"/>
         <source>Frame Rendering Flow</source>
         <translation>帧渲染流程图</translation>
     </message>
