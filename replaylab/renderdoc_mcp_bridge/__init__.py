@@ -1868,7 +1868,8 @@ def _selection_independent_request(request):
     if (method in ("inspect_event", "inspect_event_api_parameters",
                    "inspect_frame_render_stage", "get_draw_call_details",
                    "get_pipeline_state", "get_shader_info", "get_bound_textures",
-                   "get_constant_buffer_values", "get_post_vs_data", "get_draw_geometry") and
+                   "get_constant_buffer_values", "get_post_vs_data", "get_draw_geometry",
+                   "get_cbuffer_navigation_target") and
             isinstance(params, dict) and _safe_int(params.get("event_id", 0), 0) > 0):
         return True
     return method in (
@@ -6148,6 +6149,7 @@ def _current_texture_context(warnings):
             "name": name,
             "subresource": selected,
             "pickedPixel": picked,
+            "flipY": bool(viewer.Widget().property("textureDisplayFlipY")),
         }
     except Exception as exc:
         warnings.append("Texture Viewer context is unavailable: %s" % str(exc))
@@ -9363,6 +9365,18 @@ def _get_saved_frame_render_flow(params):
     if session != _capture_session_id:
         raise RuntimeError("Capture changed while restoring the frame flow")
     _frame_render_flow_saved = result
+    return result
+
+
+def _restore_frame_render_flow_revision(params):
+    global _frame_render_flow_saved
+    from .frame_flow_persistence import restore_revision,rebind
+    _require_capture_session_id(params.get('expected_capture_session_id'))
+    capture=_capture_identity_context()['capture']
+    bundle=restore_revision(capture['path'],_frame_flow_artifact_root(),params.get('revision_sha256'))
+    _get_frame_render_flow_outline({'expected_capture_session_id':_capture_session_id,'limit':1})
+    result=rebind(bundle,_frame_render_flow_outline_cache)
+    _frame_render_flow_saved=result
     return result
 
 
@@ -13047,6 +13061,110 @@ def _snapshot_shared_cbuffer(params):
         return _shared_cbuffer_edits.register(snapshot, ctrl)
 
     return _replay(_do)
+
+
+def _vertex_geometry_scope(ctrl, event, observation, stage):
+    from .vertex_effect_scope import inspect
+    return inspect(sys.modules[__name__], ctrl, event, observation, stage)
+
+
+def _inspect_vertex_effect_scope(params):
+    event = int(params.get('event_id', 0))
+    observation = int(params.get('observation_event_id', 0))
+    if not 0 < event <= observation <= 0xffffffff:
+        raise ValueError('A source draw and same-or-later output event are required')
+    visible = _request_visible_event_id(0)
+    session = _capture_session_id
+
+    def run(ctrl):
+        try:
+            result = _vertex_geometry_scope(ctrl, event, observation, rd.ShaderStage.Vertex)
+            if session != _capture_session_id:
+                raise RuntimeError('Capture changed during geometry inspection')
+            return dict(result, captureSessionId=session, sourceEventId=event, observationEventId=observation)
+        finally:
+            _set_frame_event(ctrl, visible, True, allow_background_preemption=False)
+
+    return _replay(run)
+
+
+def _get_cbuffer_navigation_target(params):
+    """Read reflected coordinates without registering any editing capability."""
+    event_id=int(params.get('event_id',0));block=int(params.get('block_index',-1))
+    stage_name=_normalise_stage_name(params.get('stage','fragment'))
+    stage=dict(_available_shader_stages([stage_name])).get(stage_name)
+    path=str(params.get('variable_path',''))
+    if event_id<=0 or block<0 or stage is None or not path or len(path)>2048:
+        raise ValueError('An event, block, stage and reflected variable path are required')
+    component=-1
+    if len(path)>2 and path[-2]=='.' and path[-1] in 'xyzw':
+        component='xyzw'.index(path[-1]);path=path[:-2]
+    visible=_request_visible_event_id(0)
+    session=_capture_session_id
+    def run(ctrl):
+        try:
+            state=_event_cbuffer_live_state(ctrl,event_id,stage_name,stage,block,shared=True,
+                                             array_index=int(params.get('array_index',0)))
+            matches=[f for f in state['fields'] if path in (f['path'],f.get('displayName'))]
+            if len(matches)!=1 or (component>=0 and component>=matches[0]['components']):
+                return {'resolved':False,'reason':'No unique reflected leaf matches this path',
+                        'fields':[dict(path=f['path'],displayName=f.get('displayName'),components=f['components']) for f in state['fields'][:128]]}
+            leaf=matches[0]
+            if session!=_capture_session_id:raise RuntimeError('Capture changed during CBuffer navigation lookup')
+            return {'resolved':True,'target':dict(eventId=event_id,stage=stage_name,blockIndex=block,
+                arrayIndex=int(params.get('array_index',0)),path=leaf['path'],component=component,
+                byteOffset=leaf['byteOffset'],components=leaf['components'],baseType=leaf['baseType'],
+                shaderResourceId=str(state['shaderResourceId']),shaderRawSha256=state['shaderRawSha256'],
+                bufferResourceId=str(state['bufferResourceId']))}
+        finally:_set_frame_event(ctrl,visible,True)
+    return _replay(run)
+
+
+def _get_mesh_uv_navigation_target(params):
+    event_id = int(params.get('event_id', 0))
+    mesh_stage = params.get('stage', 'vs-in')
+    channel = str(params.get('channel', ''))
+    pair = int(params.get('pair', 0))
+    texture = int(params.get('texture_resource_id', 0))
+    if not 0 < event_id <= 0xffffffff or mesh_stage not in ('vs-in', 'vs-out', 'gs-out') or pair not in (0, 1):
+        raise ValueError('A draw EID, mesh stage and UV component pair are required')
+    visible = _request_visible_event_id(0)
+
+    def run(ctrl):
+        try:
+            action = _find_action_by_event(ctrl.GetRootActions(), event_id)
+            if action is None or not (action.flags & (rd.ActionFlags.Drawcall | rd.ActionFlags.MeshDispatch)):
+                raise ValueError('UV links require an actual graphics draw')
+            _select_event_for_read(ctrl, event_id)
+            pipeline = ctrl.GetPipelineState()
+            if mesh_stage == 'vs-in':
+                inputs = [attr for attr in pipeline.GetVertexInputs() if attr.used and not attr.perInstance]
+                channels = {str(attr.name): int(attr.format.compCount) for attr in inputs}
+            else:
+                stage = rd.ShaderStage.Vertex if mesh_stage == 'vs-out' else rd.ShaderStage.Geometry
+                if mesh_stage == 'vs-out' and pipeline.GetShaderReflection(rd.ShaderStage.Mesh):
+                    stage = rd.ShaderStage.Mesh
+                if mesh_stage == 'gs-out' and not pipeline.GetShaderReflection(stage):
+                    stage = rd.ShaderStage.Domain
+                reflection = pipeline.GetShaderReflection(stage)
+                channels = {str(sig.varName or sig.semanticIdxName): int(sig.compCount)
+                            for sig in reflection.outputSignature if not sig.perPrimitiveRate} if reflection else {}
+            choices = [name for name, count in channels.items() if count >= (pair + 1) * 2]
+            textures = {int(t.resourceId): t for t in ctrl.GetTextures() if t.dimension == 2 and t.msSamp == 1}
+            bound = set()
+            for _, stage in _available_shader_stages(['vertex', 'fragment', 'geometry', 'hull', 'domain', 'mesh']):
+                for item in pipeline.GetReadOnlyResources(stage, True):
+                    rid = _resource_id_int(item.descriptor.resource)
+                    if rid in textures:
+                        bound.add(rid)
+            if not choices or (channel and channel not in choices) or (texture and texture not in bound):
+                return dict(resolved=False, channelChoices=choices, textureResourceIds=sorted(bound))
+            return dict(resolved=True, target=dict(kind='uv', eventId=event_id, stage=mesh_stage,
+                channel=channel, pair=pair, textureResourceId=str(texture)))
+        finally:
+            _set_frame_event(ctrl, visible, True, allow_background_preemption=False)
+
+    return _replay(run)
 
 
 def _shared_cbuffer_transaction(params, rollback=False):
@@ -25389,6 +25507,7 @@ METHODS = {
     "get_frame_render_flow_outline": _get_frame_render_flow_outline,
     "show_frame_render_flow": _show_frame_render_flow,
     "save_frame_render_flow": _save_frame_render_flow,
+    "restore_frame_render_flow_revision": _restore_frame_render_flow_revision,
     "capture_frame_flow_channels": _capture_frame_flow_channels,
     "capture_frame_flow_volume": _capture_frame_flow_volume,
     "get_saved_frame_render_flow": _get_saved_frame_render_flow,
@@ -25465,6 +25584,9 @@ METHODS = {
     "recover_replay": _recover_replay,
     "get_bound_textures": _get_bound_textures,
     "get_constant_buffer_values": _get_constant_buffer_values,
+    "get_cbuffer_navigation_target": _get_cbuffer_navigation_target,
+    "get_mesh_uv_navigation_target": _get_mesh_uv_navigation_target,
+    "inspect_vertex_effect_scope": _inspect_vertex_effect_scope,
     "get_texture_fingerprints": _get_texture_fingerprints,
     "release_texture_fingerprint_cache": _release_texture_fingerprint_cache,
     "release_replay_transient_caches": _release_replay_transient_caches,
@@ -26992,6 +27114,10 @@ def navigate_native_shader_source_json(request_json):
     """Native chat navigation; no replay calls, filesystem reads or arbitrary file opening."""
     request = json.loads(str(request_json or "{}"))
     accepted = False
+    created=False
+    if isinstance(request,dict) and _shader_workspace_ui is None and _shader_workspace_callbacks:
+        _shader_workspace_callbacks[0](activate_window=False)
+        created=True
     if isinstance(request, dict) and _shader_workspace_ui is not None:
         if request.get("target") is True:
             # Pipeline reflection may expose the active replacement RID. Its
@@ -27005,6 +27131,17 @@ def navigate_native_shader_source_json(request_json):
                     break
             return json.dumps(_shader_workspace_ui.navigate_shader_target(request))
         accepted = _shader_workspace_ui.navigate_source_link(request)
+        panel=_shader_workspace_ui
+        if not accepted and (created or getattr(panel,'_snapshot_running',False)):
+            session=_capture_session_id;deadline=time.monotonic()+30.
+            panel.refresh(force=False)
+            def retry():
+                if (_shader_workspace_ui is not panel or _capture_session_id!=session or
+                        not getattr(panel,'_alive',False)):return
+                if panel.navigate_source_link(request):return
+                if time.monotonic()<deadline:QtCore.QTimer.singleShot(100,retry)
+            QtCore.QTimer.singleShot(100,retry)
+            return json.dumps({'accepted':True,'status':'pending'})
     return json.dumps({"accepted": bool(accepted)})
 
 

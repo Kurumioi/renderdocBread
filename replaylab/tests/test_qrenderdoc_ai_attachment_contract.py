@@ -610,8 +610,9 @@ def test_system_thumbnails_are_async_composer_only_and_unknown_files_keep_named_
     assert "requestSystemThumbnail(" in file_ingest
     assert "validRasterImageMediaType(attachment.mediaType)" in file_ingest
     assert "AIFileThumbnail::loadSystemThumbnail" not in file_ingest
-    assert "m_ComposerSystemThumbnails.remove(attachmentId)" in remove
-    assert "m_ComposerSystemAnimations.remove(attachmentId)" in remove
+    assert "m_ComposerSystemThumbnails.remove(item.id)" in remove
+    assert "m_ComposerSystemAnimations.remove(item.id)" in remove
+    assert 'QLatin1String("pairId")' in remove
     assert "m_ComposerSystemThumbnails" not in serializer
     assert "m_ComposerSystemAnimations" not in serializer
     assert 'row[lit("systemThumbnail")]' not in persistence

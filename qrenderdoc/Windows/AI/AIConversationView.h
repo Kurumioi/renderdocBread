@@ -40,6 +40,7 @@ class AITurnRailWidget;
 class QTextBrowser;
 class QTimer;
 class QToolButton;
+class AIVisualReply;
 
 struct AIActivityItem
 {
@@ -81,7 +82,32 @@ struct AIChatAttachment
   qint64 originalBytes = 0;
   qint64 modifiedUnixMs = 0;
   bool truncated = false;
+
+  QString annotationPairId() const
+  {
+    return context.value(QLatin1String("annotation")).toObject().value(QLatin1String("pairId")).toString();
+  }
+  QString annotationImageRole() const
+  {
+    return context.value(QLatin1String("annotation"))
+        .toObject()
+        .value(QLatin1String("imageRole"))
+        .toString();
+  }
 };
+
+// Presentation only: keep both images in persistence and provider input. An orphaned
+// original remains visible so a damaged/legacy pair cannot silently hide user data.
+inline bool AIHideAnnotationOriginal(const AIChatAttachment &item,
+                                     const QVector<AIChatAttachment> &attachments)
+{
+  if(item.annotationImageRole() == QLatin1String("original") && !item.annotationPairId().isEmpty())
+    for(const AIChatAttachment &other : attachments)
+      if(other.annotationPairId() == item.annotationPairId() &&
+         other.annotationImageRole() == QLatin1String("annotated"))
+        return true;
+  return false;
+}
 
 struct AIChatMessage
 {
@@ -99,6 +125,8 @@ struct AIChatMessage
   // size/change statistics). Rendered as chips below the answer; click opens, right-click offers
   // copy path / show in folder.
   QJsonArray artifacts;
+  // Optional hash-addressed native visual answers; old history remains compatible.
+  QJsonArray visuals;
   bool activityExpanded = false;
 };
 
@@ -116,6 +144,7 @@ public:
   void followSubmittedTurn();
 
   void setLinkHandler(std::function<void(const QUrl &)> handler);
+  void setVisualLinkHandler(std::function<void(const QUrl &, const QJsonObject &)> handler);
   void setActivityToggleHandler(std::function<void(const QString &messageId, bool expanded)> handler);
   void setSelectionAttachmentHandler(std::function<void(const QString &text)> handler);
 
@@ -154,6 +183,11 @@ private:
   void updateLiveTextTimer();
   void advanceLiveText();
   void rebuildLiveTextCursors();
+  void updateVisualReplies();
+  void clearVisualReplies();
+  QHash<QString, AIVisualReply *> m_VisualReplies;
+  QHash<QString, QTextCursor> m_VisualPositions;
+  std::function<void(const QUrl &, const QJsonObject &)> m_VisualLinkHandler;
 
   struct LiveTextCursor
   {

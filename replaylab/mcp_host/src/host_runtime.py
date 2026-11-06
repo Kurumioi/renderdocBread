@@ -49,6 +49,11 @@ LONG_TOOLS = frozenset({
     "decompile_shader_workspace",
     "validate_shader_workspace_delivery",
     "diagnose_shader_organization_candidate",
+    "run_shader_effect_experiment",
+    "publish_visual_reply",
+    "get_cbuffer_parameter_link",
+    "get_mesh_uv_link",
+    "inspect_vertex_effect_scope",
 })
 
 # Tools that actually force replay / BuildTarget / texture reads. Read-only Host
@@ -61,6 +66,11 @@ REPLAY_TOUCH_TOOLS = frozenset({
     "decompile_shader_workspace",
     "validate_shader_workspace_delivery",
     "diagnose_shader_organization_candidate",
+    "run_shader_effect_experiment",
+    "publish_visual_reply",
+    "get_cbuffer_parameter_link",
+    "get_mesh_uv_link",
+    "inspect_vertex_effect_scope",
     "get_texture_fingerprints",
     "get_bound_textures",
     "get_constant_buffer_values",

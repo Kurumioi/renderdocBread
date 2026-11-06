@@ -758,6 +758,7 @@
     <ClCompile Include="Windows\APIInspector.cpp" />
     <ClCompile Include="Windows\ResourceInspector.cpp" />
     <ClCompile Include="Windows\BufferViewer.cpp" />
+    <ClCompile Include="Windows\MeshUVView.cpp" />
     <ClCompile Include="Windows\DebugMessageView.cpp" />
     <ClCompile Include="Windows\LogView.cpp" />
     <ClCompile Include="Windows\CommentView.cpp" />
@@ -818,6 +819,8 @@
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <ClCompile Include="Windows\AI\AIFileThumbnail.cpp" />
+    <ClCompile Include="Windows\AI\AITextureAnnotation.cpp" />
+    <ClCompile Include="Windows\AI\AIVisualReply.cpp" />
     <ClCompile Include="Windows\AI\AIAgentMonitorWindow.cpp" />
     <ClCompile Include="Windows\AI\AIAgentTraceStore.cpp" />
     <ClCompile Include="Windows\AI\AIConversationListView.cpp" />
@@ -1031,6 +1034,9 @@
     <ClInclude Include="Windows\AI\AIConfiguration.h" />
     <ClInclude Include="Windows\AI\AIAssistant.h" />
     <ClInclude Include="Windows\AI\AIFileThumbnail.h" />
+    <ClInclude Include="Windows\AI\AITextureAnnotation.h" />
+    <ClInclude Include="Windows\AI\AIVisualReply.h" />
+    <ClInclude Include="Windows\AI\AICodeFormatting.h" />
     <ClInclude Include="Windows\AI\AIAgentMonitorWindow.h" />
     <ClInclude Include="Windows\AI\AIAgentTraceStore.h" />
     <ClInclude Include="Windows\AI\AIConversationListView.h" />

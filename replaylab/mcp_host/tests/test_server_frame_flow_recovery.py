@@ -183,7 +183,7 @@ def test_reanalysis_proposals_roundtrip_and_quality_require_this_review(machine)
                                             "edges": [{"from": "shade", "to": "result"}]})
     proposal["algorithm"]["outputs"][0]["resourceId"] = 101
     proposal["algorithm"]["integration"][0]["resourceId"] = 101
-    initial = _json(server.publish_frame_render_flow(flow_id, [proposal], show_in_window=False))
+    initial = _json(server.publish_frame_render_flow(flow_id, [proposal], show_in_window=False, publication_scope='frame'))
     assert initial["quality"]["analysisComplete"], initial["quality"]
     raw = _json(server.get_frame_render_flow(flow_id, section="stages"))["items"][0]
     assert "navigationEventId" in raw and "path" in raw["images"][0]
@@ -199,7 +199,7 @@ def test_reanalysis_proposals_roundtrip_and_quality_require_this_review(machine)
     assert inspected
     proposal["investigation"]["evidence"] = (
         "Rechecked current Shader calculations and bindings: the surface result is blended in place; retain the module boundary.")
-    final = _json(server.publish_frame_render_flow(flow_id,[proposal],show_in_window=False))
+    final = _json(server.publish_frame_render_flow(flow_id,[proposal],show_in_window=False, publication_scope='frame'))
     assert final["savedWithCapture"] and final["quality"]["analysisComplete"], final
     assert final["reanalysis"]["semanticCorrectnessProven"] is False
     assert not _json(server.get_frame_render_flow(flow_id,section="quality"))["items"]
@@ -261,7 +261,7 @@ def test_publish_persists_precached_channels_and_proposals_republish_without_dup
                           {"channel": "a", "description": "Surface coverage"}]}])
     proposal["algorithm"]["outputs"][0]["resourceId"] = 101
     proposal["algorithm"]["integration"][0]["resourceId"] = 101
-    published = _json(server.publish_frame_render_flow(flow_id, [proposal], show_in_window=False))
+    published = _json(server.publish_frame_render_flow(flow_id, [proposal], show_in_window=False, publication_scope='frame'))
     assert published["savedWithCapture"] and published["channelCache"]["complete"]
     saved = machine.saved["document"]["stages"][0]["images"]
     assert len(saved) == 3 and saved[0]["channelCacheComplete"]
@@ -270,7 +270,7 @@ def test_publish_persists_precached_channels_and_proposals_republish_without_dup
     assert len(proposals[0]["images"]) == 3
     assert all("channelCacheComplete" not in image and "displayMapping" not in image
                for image in proposals[0]["images"])
-    repeated = _json(server.publish_frame_render_flow(flow_id, proposals, show_in_window=False))
+    repeated = _json(server.publish_frame_render_flow(flow_id, proposals, show_in_window=False, publication_scope='frame'))
     assert repeated["channelCache"]["complete"] and repeated["imageCount"] == 3
     assert len(machine.saved["document"]["stages"][0]["images"]) == 3
 

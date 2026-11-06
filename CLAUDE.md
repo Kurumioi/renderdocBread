@@ -156,6 +156,18 @@ Release content/build rules remain in
 Documentation-only workflow updates do not require a version bump or repackaging
 an already verified release.
 
+## Development update delivery
+
+The user has authorized routine updates of the current Development application:
+finish the change and checks, gracefully close the application, deploy into its
+existing entry point, reopen it, and restore the capture/EID/RT selection. Do not
+ask again just to perform those same deployment/restart steps. Preserve stored
+projects, conversations and source files; save recoverable work first. The
+authorization includes discarding transient annotation drafts when the old
+version cannot save them, as explicitly confirmed on 2026-11-05. It does not
+authorize discarding unsaved Shader/source edits or overwriting conflicting
+user-authored files. Packaging remains isolated from a running application.
+
 ## Upstream Sync Guide
 
 When syncing to a new upstream release:

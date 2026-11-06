@@ -326,6 +326,7 @@ class TaskReportStore:
         self._facts: list[dict[str, Any]] = []
         self._tool_stats: dict[str, dict[str, int | float]] = {}
         self._artifact_paths: set[str] = set()
+        self._reply_visuals: list[dict[str, str]] = []
         self._pending_shader_work: dict[str, dict[str, Any]] = {}
         self._shader_review_targets: dict[str, dict[str, Any]] = {}
         self._task_completion: dict[str, Any] = {}
@@ -370,6 +371,9 @@ class TaskReportStore:
             str(item) for item in (raw_tools if isinstance(raw_tools, list) else [])
             if isinstance(item, str) and item and item not in _NON_REPORTING_TASK_TOOLS
         )
+        self._reply_visuals = [dict(id=row["id"]) for row in state.get("replyVisuals", [])
+                              if isinstance(row, dict) and isinstance(row.get("id"), str)
+                              and re.fullmatch(r"[0-9a-f]{64}", row["id"])][-8:]
         raw_paths = state.get("artifactPaths")
         self._artifact_paths.update(
             item for item in (raw_paths if isinstance(raw_paths, list) else [])
@@ -660,10 +664,25 @@ class TaskReportStore:
             "toolFacts": self._facts[-_MAX_FACTS:],
             "toolStats": self._tool_stats,
             "artifactPaths": sorted(self._artifact_paths)[:128],
+            "replyVisuals": self._reply_visuals,
             "pendingShaderWork": self._pending_shader_work,
             "shaderOrganizationReviews": self._shader_review_targets,
             "taskCompletionReview": self._task_completion,
         })
+
+    def register_reply_visual(self, identifier: str) -> bool:
+        if not re.fullmatch(r"[0-9a-f]{64}", identifier):
+            raise ValueError("Invalid visual manifest identity")
+        if not self.enabled:
+            return False
+        with self._lock, _task_state_lock(self.event_root, self.task_id):
+            self._hydrate()
+            if not any(row["id"] == identifier for row in self._reply_visuals):
+                if len(self._reply_visuals) >= 8:
+                    raise ValueError("This answer already contains eight visual bundles")
+                self._reply_visuals.append({"id": identifier})
+            self._write_state()
+        return True
 
     def record_tool(self, name: str) -> None:
         tool = str(name or "").strip()

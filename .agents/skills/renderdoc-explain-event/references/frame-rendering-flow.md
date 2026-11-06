@@ -274,7 +274,7 @@ prepared flow ID and the explained stages. Read all returned issue paths.
 Repair only the affected fields with the returned `draft_id` and
 `stage_updates` keyed by zero-based index. A valid receipt checks the cached
 outline and output bindings. Use `publish_frame_render_flow(flow_id,
-draft_id=..., show_in_window=True)` to run full media validation and save the
+draft_id=..., publication_scope="frame", show_in_window=True)` to run full media validation and save the
 result. Never treat a preflight receipt as publication. If publication
 reports a media problem, edit the affected stage and use the new revision.
 When a repeated validation error cannot be resolved from available evidence,

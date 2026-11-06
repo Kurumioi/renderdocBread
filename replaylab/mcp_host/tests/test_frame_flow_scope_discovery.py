@@ -13,7 +13,7 @@ def test_source_candidates_remain_paged_after_broad_draft(setup):
     calls, _ = setup
     prepared = json.loads(server.prepare_frame_render_flow())
     result = json.loads(server.publish_frame_render_flow(
-        prepared["flowId"], [stage(1, 12001)], show_in_window=False))
+        prepared["flowId"], [stage(1, 12001)], show_in_window=False, publication_scope='frame'))
     assert result["coverage"]["complete"]
     authored = json.loads(server.get_frame_render_flow(prepared["flowId"]))
     assert authored["total"] == 1 and authored["sourceCandidateCount"] == 401

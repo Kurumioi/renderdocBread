@@ -63,8 +63,8 @@ def compile_trial(service: Any, workspace_path: str | Path, source_text: str,
         if (source_record.get("lane") != "executable-editable"
                 or source_record.get("compileEligible") is not True):
             raise ToolExecutionError("workspace source lane is not compile-eligible")
-        if manifest["stage"] != "fragment":
-            raise ValueError("numeric diagnostic comparison currently supports fragment shaders")
+        if manifest["stage"] not in ("vertex", "fragment"):
+            raise ValueError("numeric diagnostic comparison currently supports vertex and fragment shaders")
 
         revision = int(manifest["revision"]) + 1
         job = service._new_job_path(root, "diagnostic", revision)

@@ -358,7 +358,7 @@ class FakeBridge:
             raise RuntimeError("injected rollback failure")
         ctrl.mapping = None
 
-    def _set_frame_event(self, ctrl, event, force):
+    def _set_frame_event(self, ctrl, event, force, allow_background_preemption=True):
         ctrl.calls.append(("event", event))
         if event == 17 and self.visible_restore_failure:
             raise RuntimeError("injected visible restore failure")

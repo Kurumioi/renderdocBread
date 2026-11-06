@@ -56,6 +56,10 @@ class CollapseGroupBox;
 class CameraWrapper;
 class ArcballWrapper;
 class FlycamWrapper;
+class MeshUVView;
+class QComboBox;
+class QSplitter;
+struct MeshUVData;
 struct BufferData;
 struct PopulateBufferData;
 struct CalcBoundingBoxData;
@@ -108,6 +112,8 @@ public:
   bool IsCBufferView() const { return m_CBufferSlot.stage != ShaderStage::Count; }
   void ViewBuffer(uint64_t byteOffset, uint64_t byteSize, ResourceId id, const rdcstr &format = "");
   void ViewCBuffer(const ShaderStage stage, uint32_t slot, uint32_t idx);
+  void NavigateCBufferVariable(const QString &path, qint64 byteOffset, int component);
+  void NavigateMeshUV(int stage, const QString &channel, int component, ResourceId texture);
   void ViewTexture(ResourceId id, const Subresource &sub, const rdcstr &format = "");
 
   // IBufferViewer
@@ -205,6 +211,24 @@ private:
   MeshDisplay m_Config;
 
   MeshDataStage m_CurStage;
+  std::shared_ptr<MeshUVData> m_UVData;
+  QSplitter *m_MeshSplit = NULL;
+  QWidget *m_UVPanel = NULL;
+  MeshUVView *m_UVCanvas = NULL;
+  MeshUVView *m_UVModel = NULL;
+  QComboBox *m_UVChannels = NULL;
+  QComboBox *m_UVTextures = NULL;
+  QComboBox *m_CameraPreset = NULL;
+  QToolButton *m_UVToggle = NULL;
+  QLabel *m_UVStatus = NULL;
+  uint32_t m_UVEvent = 0;
+  uint32_t m_UVTextureSerial = 0;
+  bool m_UVLinkPending = false;
+  QString m_UVLinkChannel;
+  QString m_UVManualChannel;
+  int m_UVLinkComponent = 0;
+  ResourceId m_UVLinkTexture;
+  rdcarray<Descriptor> m_UVTextureBindings;
 
   // cached data from PostVS data
   MeshFormat m_Out1Data, m_Out2Data;
@@ -241,6 +265,11 @@ private:
   void UI_UpdateCBufferSearch();
   void UI_SelectCBufferLiveValue(RDTreeWidgetItem *item);
   void UI_RestoreCBufferLiveSelection();
+  void UI_ApplyCBufferNavigation();
+  QString m_CBufferNavigationPath;
+  qint64 m_CBufferNavigationOffset = -1;
+  int m_CBufferNavigationComponent = -1;
+  uint32_t m_CBufferNavigationEvent = 0;
   void UI_QueueCBufferLiveValue(int component);
   void UI_SubmitCBufferLiveValues();
   void UI_InvalidateCBufferLiveEdit();
@@ -407,6 +436,12 @@ private:
   bool isMeshDraw();
 
   void SetupMeshView();
+  void SetupMeshUV();
+  int UVTextureMode() const;
+  void UpdateMeshUV();
+  void UpdateMeshUVGeometry();
+  void UpdateMeshUVTexture();
+  void UpdateMeshUVPreview();
   void SetupRawView();
 
   void SetMeshFilter(MeshFilter filter, uint32_t taskGroup = ~0U, uint32_t meshGroup = ~0U);

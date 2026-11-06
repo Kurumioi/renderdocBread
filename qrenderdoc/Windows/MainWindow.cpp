@@ -2664,7 +2664,12 @@ void MainWindow::on_action_Mesh_Output_triggered()
   QWidget *meshPreview = m_Ctx.GetMeshPreview()->Widget();
 
   if(ui->toolWindowManager->toolWindows().contains(meshPreview))
-    ToolWindowManager::raiseToolWindow(meshPreview);
+  {
+    if(ui->toolWindowManager->areaOf(meshPreview))
+      ToolWindowManager::raiseToolWindow(meshPreview);
+    else
+      ui->toolWindowManager->moveToolWindow(meshPreview, mainToolArea());
+  }
   else
     ui->toolWindowManager->addToolWindow(meshPreview, mainToolArea());
 }

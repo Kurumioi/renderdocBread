@@ -81,6 +81,23 @@ def test_bundle_is_portable_and_rebinds_only_after_file_and_action_identity_chec
         storage.rebind(restored, current)
 
 
+def test_restore_prior_revision_preserves_newer_document_and_validates_media(bundle):
+    capture,document,outline_data,root=bundle
+    old=storage.save(capture,document,outline_data,root)
+    folder=Path(old['directory']);original_pointer=json.loads((folder/'current.json').read_text())
+    changed=deepcopy(document);changed['title']='Local explanation accidentally published'
+    storage.save(capture,changed,outline_data,root)
+    newer=json.loads((folder/'current.json').read_text())
+    restored=storage.restore_revision(capture,root,original_pointer['documentSha256'])
+    assert restored['document']['title']=='Frame'
+    assert (folder/(newer['documentSha256']+'.json')).is_file()
+    assert list(folder.glob('*.pointer.json'))
+    before=(folder/'current.json').read_bytes()
+    media=next((folder/'media').glob('*'));media.write_bytes(b'corrupt')
+    with pytest.raises(ValueError):storage.restore_revision(capture,root,newer['documentSha256'])
+    assert (folder/'current.json').read_bytes()==before
+
+
 def test_replaced_same_name_capture_is_not_restored_even_with_same_length(bundle):
     capture, document, data, root = bundle
     storage.save(capture, document, data, root)

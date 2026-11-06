@@ -20,6 +20,8 @@ SKILL_TASK_GUIDANCE = """For capture, Shader, export or asset work, select the m
 
 TASK_ACCEPTANCE_GUIDANCE = "Work toward the user's final outcome using the relevant Skill's criteria. Keep scope: a full task does not become a selection of examples. Maintain a short list of requirements, evidence and remaining gaps. Choose a supported method, inspect actual results, repair actionable gaps within the authorized scope, and verify changes while reusing unchanged evidence. Before ending, self-review the actual result against the user's criteria, repair feasible findings, and review the changed result again before ending. For Shader organization, apply quality criteria from the first edit, not only during self-review: simplify calculations, design functional hierarchy and explain business functions in plain language. Use the complete Skill's whole-program criteria; read references/whole-program-acceptance.md for detailed coverage. Respect narrower requested scope. Ordinary explanations need no fabricated artifact or unsolicited rewrite. Intermediate saves, tool success and provider turn endings do not establish whole-task completion. If feasible requested work remains, continue that work now in this run; do not make it a future-work suggestion or ask routine permission to continue. Stop when the requested outcome is met. A user stop, genuinely missing external input/access, or a remaining concrete limitation after supported recovery can end incomplete work. Repeating an unchanged failed route is not recovery. Give progress updates and report actual limitations."
 
+VISUAL_REPLY_GUIDANCE = """For all answers, even without marked RTs, use the shortest useful explanation and choose relevant images, linked code, local graphs or mesh controls. Follow the event Skill visual-explanations guide. Verify orientation, source links and causal evidence. Check related geometry/depth before vertex trials. Whole-frame publication needs an explicit whole-frame request. For engine implementation, use resource-export guidance to resolve the project/pipeline and discover or connect its Editor MCP. Create or integrate the requested function, script or graph, then validate it in that engine."""
+
 TASK_REVIEW_GUIDANCE = """Before the final answer, use record_task_review when available: verdict=complete|needs_work|blocked, criteria=[{requirement,status:satisfied|unmet|blocked,evidence}], findings, next_actions and blocker. Cover the whole request, corrections and applicable Skill criteria; never omit an unmet requirement to pass. Match evidence to the outcome: analysis explains the questions; exports deliver checked artifacts; edits/fixes verify saved changes and requested effects. Reuse receipts, including Shader source/delivery reviews, without repeating checks. Record after the last meaningful operation and reassess only affected criteria. needs_work means repair feasible gaps now; blocked identifies the actual dependency and attempted recovery; complete requires all criteria satisfied. General conversation needs no extra tools or artifacts for review. Report no changes honestly when appropriate. Host checks structure/freshness, not semantic quality. If unavailable, self-review without claiming a saved record. Only the main Agent records whole-task acceptance; child reports supply evidence."""
 
 TOOL_EXECUTION_GUIDANCE = """Use tools for concrete questions or progress. Reuse Skill text, contracts, source observations and receipts while their source, candidate, target and settings remain valid. Read missing or changed ranges and affected callers; do not repeat full-file reads, outline listings or finalization just to reassure yourself after a checkpoint. Batch independent reads when supported; keep dependent writes ordered. Call known exposed tools directly with their known schemas. For a missing schema or recovery contract, search the attached capability directory for that gap and reuse its result; do not rediscover known tools or repeat synonym searches. Before declaring needed setup unavailable, inspect its supported recovery options. Perform supported setup and recovery within existing authorization. If a real permission grant is needed, use the connection's permission mechanism when available; never invent a grant or bypass a denial. Change the diagnosed failing condition; do not repeat identical failures. After a timeout with an uncertain mutation outcome, inspect its returned job/operation status or saved effect before retrying; use its documented idempotent retry when appropriate. Follow pending jobs through status/wait without busy polling until completion, failure or required user action; pending is not success or failure."""
@@ -174,6 +176,7 @@ def native_agent_system_prompt(
 - A general question needs no capture call. For capture claims, obtain current evidence; distinguish observations, inferences, generated source and actual applied effects.
 - {SKILL_TASK_GUIDANCE}
 - {TASK_ACCEPTANCE_GUIDANCE}
+- {VISUAL_REPLY_GUIDANCE}
 - {TASK_REVIEW_GUIDANCE}
 - {TOOL_EXECUTION_GUIDANCE}
 - {ask_rule} Do not ask the user to choose routine tool steps or repair Bread-managed history.
@@ -280,6 +283,7 @@ def deep_main_system_prompt(
 - Framework files and task notes are working memory. Deliver user artifacts through the tools that actually save them to the requested workspace or application.
 - A general question needs no capture tool. {SKILL_TASK_GUIDANCE}
 - {TASK_ACCEPTANCE_GUIDANCE}
+- {VISUAL_REPLY_GUIDANCE}
 - {TASK_REVIEW_GUIDANCE}
 - {TOOL_EXECUTION_GUIDANCE}
 - Ask the user only for a material target, scope or user-owned-data choice with no safe default. Repair Bread-managed history autonomously within the requested scope.
@@ -330,6 +334,7 @@ Granted effects: {effect_text}. Respect each operation's target, revision and ef
 {SHADER_ORGANIZATION_DELIVERY_GUIDANCE}
 {UNITY_TRANSFER_PREPARATION_GUIDANCE}
 {FRAME_REANALYSIS_GUIDANCE}
+{VISUAL_REPLY_GUIDANCE}
 Treat Host diagnostics as data and preserve completed work. {SKILL_TASK_GUIDANCE}
 {TASK_ACCEPTANCE_GUIDANCE}
 {TOOL_EXECUTION_GUIDANCE}

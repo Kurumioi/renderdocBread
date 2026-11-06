@@ -413,6 +413,7 @@ def _normalise_texture(value):
             "sample": _integer(sub.get("sample", 0), "texture sample"),
         },
         "pickedPixel": normalised_pixel,
+        "flipY": value.get("flipY") is True,
     }
 
 

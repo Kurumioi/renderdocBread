@@ -37,6 +37,8 @@ Preserve unrelated dirty checkouts, other tasks' branches and published tags.
 
 ## Product name and compatibility
 
+- Routine Development updates follow [CLAUDE.md — Development update delivery](./CLAUDE.md#development-update-delivery), including the standing authorization to deploy, restart and restore selection without repeated confirmation.
+
 - Persistent-data upgrades must follow [CLAUDE.md — Persistent data compatibility](./CLAUDE.md#persistent-data-compatibility), including old-format recovery, path identity and preservation of user data.
 
 - **RenderDocBread** is the application/release name; **Bread** is its product family and **Bread AI** is the assistant. Menus, titles, help, diagnostics, new default project names, and product documentation must use this brand.

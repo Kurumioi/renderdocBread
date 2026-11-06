@@ -231,6 +231,7 @@ SOURCES += Code/qrenderdoc.cpp \
     Widgets/Extended/RDTreeWidget.cpp \
     Widgets/BufferFormatSpecifier.cpp \
     Windows/BufferViewer.cpp \
+    Windows/MeshUVView.cpp \
     Widgets/Extended/RDTableView.cpp \
     Windows/DebugMessageView.cpp \
     Windows/LogView.cpp \
@@ -256,6 +257,8 @@ SOURCES += Code/qrenderdoc.cpp \
     Windows/AI/AIConfiguration.cpp \
     Windows/AI/AIAssistant.cpp \
     Windows/AI/AIFileThumbnail.cpp \
+    Windows/AI/AITextureAnnotation.cpp \
+    Windows/AI/AIVisualReply.cpp \
     Windows/AI/AIAgentMonitorWindow.cpp \
     Windows/AI/AIAgentTraceStore.cpp \
     Windows/AI/AIConversationListView.cpp \
@@ -337,6 +340,7 @@ HEADERS += Code/CaptureContext.h \
     Widgets/Extended/RDTreeWidget.h \
     Widgets/BufferFormatSpecifier.h \
     Windows/BufferViewer.h \
+    Windows/MeshUVView.h \
     Widgets/Extended/RDTableView.h \
     Windows/DebugMessageView.h \
     Windows/LogView.h \
@@ -371,6 +375,9 @@ HEADERS += Code/CaptureContext.h \
     Windows/AI/AIConfiguration.h \
     Windows/AI/AIAssistant.h \
     Windows/AI/AIFileThumbnail.h \
+    Windows/AI/AITextureAnnotation.h \
+    Windows/AI/AIVisualReply.h \
+    Windows/AI/AICodeFormatting.h \
     Windows/AI/AIAgentMonitorWindow.h \
     Windows/AI/AIAgentTraceStore.h \
     Windows/AI/AIConversationListView.h \

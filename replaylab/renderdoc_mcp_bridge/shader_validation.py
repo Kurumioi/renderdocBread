@@ -180,13 +180,16 @@ def compare_bytes(before, after, descriptor):
     return result
 
 
-def _outputs(bridge, ctrl, require_color=True, allow_empty=False):
+def _outputs(bridge, ctrl, require_color=True, allow_empty=False, color_index=None, targets_override=None):
     rd = bridge.rd
     pipeline = ctrl.GetPipelineState()
     textures = {bridge._resource_id_int(t.resourceId): t for t in ctrl.GetTextures()}
     outputs, total, materialized_total = [], 0, 0
     targets = [("color", i, t) for i, t in enumerate(pipeline.GetOutputTargets() or [])]
     targets.append(("depth", 0, pipeline.GetDepthTarget()))
+    if targets_override is not None:targets=targets_override
+    if color_index is not None:
+        targets=[row for row in targets if row[0]=='color' and row[1]==color_index]
     for kind, index, target in targets:
         rid = bridge._resource_id_int(getattr(target, "resource", None))
         if not rid:
@@ -423,6 +426,73 @@ def _paired_observations(bridge, ctrl, event_id, original, baseline, candidate):
     return observations, ""
 
 
+def _effect_roi(observation, roi, flip_y=False):
+    """Crop stored bytes, never display-normalized pixels, for a stated region."""
+    result=[]
+    for desc,raw in observation:
+        width,height=desc['width'],desc['height']
+        pixel_size=len(raw)//(width*height)
+        if pixel_size*width*height!=len(raw):raise ValueError('Effect ROI requires a tightly packed color output')
+        left,top,right,bottom=roi
+        if flip_y:top,bottom=1-bottom,1-top
+        x0,y0=int(left*width),int(top*height)
+        x1,y1=min(width,max(x0+1,int(math.ceil(right*width)))),min(height,max(y0+1,int(math.ceil(bottom*height))))
+        cropped=b''.join(raw[(y*width+x0)*pixel_size:(y*width+x1)*pixel_size] for y in range(y0,y1))
+        info=dict(desc,width=x1-x0,height=y1-y0,roiPixels=[x0,y0,x1,y1])
+        result.append((info,cropped))
+    return result
+
+
+def _effect_outputs(bridge,ctrl,event_id,options):
+    """Present's output is its actual destination, never an inherited RTV."""
+    root_actions=getattr(ctrl,'GetRootActions',None)
+    action=(bridge._find_action_by_event(root_actions(),event_id)
+            if callable(root_actions) else None)
+    if callable(root_actions)and action is None:
+        raise ValueError('Effect output event is not an actual captured action')
+    if action is not None:
+        flags=int(action.flags)
+        if flags & int(bridge.rd.ActionFlags.Present):
+            if int(options.get('attachmentIndex',0))!=0:raise ValueError('Present has one destination image at index 0')
+            resource=getattr(action,'copyDestination',None)
+            if not bridge._resource_id_int(resource):raise ValueError('Present has no observed destination texture')
+            class Target(object):pass
+            target=Target();target.resource=resource
+            sub=getattr(action,'copyDestinationSubresource',None)
+            target.firstMip=int(getattr(sub,'mip',0));target.firstSlice=int(getattr(sub,'slice',0))
+            target.numSlices=1;target.format=None
+            return _outputs(bridge,ctrl,targets_override=[('color',0,target)])
+        if not(flags&int(bridge.rd.ActionFlags.Drawcall)):
+            raise ValueError('Choose a real graphics draw or Present as the effect output event; compute/utility inherited RTVs are not output evidence')
+    requested=int(options.get('attachmentIndex',0))
+    available=[i for i,t in enumerate(ctrl.GetPipelineState().GetOutputTargets())
+               if bridge._resource_id_int(t.resource)]
+    if requested not in available:
+        raise ValueError('Effect output EID %d has color target indices %s; requested attachmentIndex %d'%
+                         (event_id,available,requested))
+    return _outputs(bridge,ctrl,color_index=requested)
+
+
+def _effect_preview(bridge,ctrl,options,observation,leg):
+    import os
+    folder=options.get('artifactDir')
+    if not folder:return None
+    desc=observation[0][0]
+    resource=next(t.resourceId for t in ctrl.GetTextures() if bridge._resource_id_int(t.resourceId)==desc['resourceId'])
+    path=os.path.join(folder,leg+'.png')
+    if os.path.lexists(path):raise ValueError('Effect preview already exists')
+    rd=bridge.rd;save=rd.TextureSave();save.resourceId=resource;save.destType=rd.FileType.PNG
+    save.typeCast=rd.CompType.Typeless;save.mip=desc['mip'];save.slice.sliceIndex=desc['slice']
+    save.sample.mapToArray=False;save.sample.sampleIndex=0;save.channelExtract=-1
+    save.alpha=rd.AlphaMapping.Discard;save.comp.blackPoint=options.get('blackPoint',0.)
+    save.comp.whitePoint=options.get('whitePoint',1.)
+    result=ctrl.SaveTexture(save,path)
+    if result.code!=rd.ResultCode.Succeeded:raise RuntimeError('Effect image export failed: '+str(result))
+    with open(path,'rb')as stream:digest=hashlib.sha256(stream.read()).hexdigest()
+    return {'path':path,'sha256':digest,'resourceId':str(desc['resourceId']),
+            'width':desc['width'],'height':desc['height'],'eventId':options['eventId']}
+
+
 def compare_candidates(bridge, params):
     """Execute one isolated, restored A/B observation using exact native blobs."""
     started = time.monotonic()
@@ -438,6 +508,19 @@ def compare_candidates(bridge, params):
     if len(events) != 1:
         raise ValueError("numeric observation requires one exact event")
     event = events[0]
+    effect=params.get('effect_observation')
+    observation_event=int(effect['eventId']) if effect else event['eventId']
+    if effect:
+        import os,re
+        if stage_name not in ('vertex','fragment') or observation_event<event['eventId']:
+            raise ValueError('Effect experiments need a vertex/fragment Shader and a same-or-later output event')
+        roi=effect.get('roi',[0.,0.,1.,1.])
+        if (len(roi)!=4 or any(not isinstance(v,(int,float)) or not math.isfinite(v) or not 0<=v<=1 for v in roi)
+                or roi[0]>=roi[2] or roi[1]>=roi[3]):raise ValueError('Invalid normalized effect ROI')
+        folder=effect.get('artifactDir')
+        if folder and (not os.path.isabs(folder) or not re.match(r'^effect-[0-9a-f]{32}$',os.path.basename(folder))
+                or not os.path.isdir(folder) or os.listdir(folder) or bridge._event_texture_evidence_is_redirected(folder)):
+            raise ValueError('Effect previews require a new, ordinary Host-owned artifact directory')
     rid = event["expectedOriginalResourceId"]
     if any(r.get("expectedOriginalResourceId") == rid for r in bridge._event_shader_overrides.values()):
         raise ValueError("event overrides must be resolved before numeric observation")
@@ -468,6 +551,8 @@ def compare_candidates(bridge, params):
 
     def run(ctrl):
         targets, mutated, restored = [], False, False
+        peers = []
+        geometry_scope = None
         paired_reason = ""
         current_target = existing["targetResource"] if existing else None
         api = bridge._shader_api_token(ctrl)
@@ -478,11 +563,61 @@ def compare_candidates(bridge, params):
                 require_d3d11_state=(api == "d3d11"), owned_shared_replacement=existing)
             storage_proofs, storage_stages = _storage_stages(
                 bridge, ctrl, stage_name, stage, live["reflection"])
+            related = {}
+            if effect and stage_name == 'vertex':
+                geometry_scope = bridge._vertex_geometry_scope(ctrl, event['eventId'], observation_event, stage)
+                if not geometry_scope['complete']:
+                    raise ValueError('Vertex dependency evidence is incomplete')
+                supplied = effect.get('relatedShaders') or []
+                related = {int(item['resourceId']): item for item in supplied}
+                if len(related) != len(supplied) or len(related) > 16:
+                    raise ValueError('Related Shader replacements must be unique and bounded')
+                expected = set()
+                seen = {rid}
+                for match in geometry_scope['matches']:
+                    peer_id = match['shaderResourceId']
+                    bridge._select_event_for_read(ctrl, match['eventId'])
+                    pipe = ctrl.GetPipelineState()
+                    peer_reflection = pipe.GetShaderReflection(stage)
+                    if not peer_id or not peer_reflection:
+                        raise ValueError('A related draw has no verifiable vertex Shader')
+                    proofs, writable = _storage_stages(bridge, ctrl, stage_name, stage, peer_reflection)
+                    if writable or not all(proof['complete'] for proof in proofs):
+                        raise ValueError('A related vertex draw uses writable Shader storage')
+                    if peer_id in seen:
+                        continue
+                    seen.add(peer_id)
+                    peer_resource = pipe.GetShader(stage)
+                    digest = match['shaderRawSha256']
+                    peer_entry = match['entryPoint']
+                    shared_code = digest == event['expectedOriginalSha256'] and peer_entry == entry
+                    request = related.get(peer_id)
+                    if not shared_code:
+                        expected.add(peer_id)
+                        if not request or not any(m['eventId'] == request['eventId'] and
+                            m['shaderResourceId'] == peer_id for m in geometry_scope['matches']):
+                            raise ValueError('Related draw %d requires its own coordinated vertex edit' % match['eventId'])
+                    if any(record.get('expectedOriginalResourceId') == peer_id
+                           for record in bridge._event_shader_overrides.values()):
+                        raise ValueError('A related draw has a separate event Shader override')
+                    owned = bridge._shared_shader_replacements.get(peer_id)
+                    if owned:
+                        raise ValueError('A related Shader has an active replacement. Resolve its live edit before the trial.')
+                    bridge._require_shared_shader_ui_owner(peer_resource, None)
+                    peer_event = dict(eventId=match['eventId'], expectedOriginalResourceId=peer_id,
+                                      expectedOriginalSha256=digest)
+                    checked = bridge._validate_live_shader_event(ctrl, peer_event, stage, stage_name,
+                        peer_entry, require_d3d11_state=(api == 'd3d11'), event_already_selected=True)
+                    peer = dict(resource=peer_resource, live=checked, entry=peer_entry, originalHash=digest,
+                                targets=[], sharedCode=shared_code, request=request, current=None, touched=False)
+                    peers.append(peer)
+                if set(related) != expected or len(peers) > 16:
+                    raise ValueError('Coordinated Shader edits do not match the detected geometry scope')
             # Reserve enough orphan capacity for the whole A/B build before
             # allocating either target. Both releases can fail independently.
             bridge._require_shader_target_build_capacity(sum(
                 1 for unused_blob, digest in candidates
-                if digest != event.get("expectedOriginalSha256")))
+                if digest != event.get("expectedOriginalSha256")) + 2 * len(related))
             for blob, digest in candidates:
                 # Native DXIL creation may deduplicate an exact original to
                 # its captured ResourceId. Observe that baseline directly;
@@ -514,7 +649,57 @@ def compare_candidates(bridge, params):
                     compatible = bridge._physical_shader_interfaces_compatible(live["reflection"], reflection)
                 if not compatible:
                     raise ValueError("numeric observation cannot bypass a physical ABI mismatch")
+            for peer in peers:
+                if peer['sharedCode']:
+                    if not bridge._physical_shader_interfaces_compatible(live['reflection'], peer['live']['reflection']):
+                        raise ValueError('Identical related Shader bytes have a different physical interface')
+                    peer['targets'] = targets
+                    continue
+                request = peer['request']
+                peer_encoding_name = request['encoding']
+                peer_encoding_attr = {"dxil": "DXIL", "dxbc": "DXBC", "spirv": "SPIRV",
+                                      "opengl-spirv": "OpenGLSPIRV", "glsl": "GLSL"}.get(peer_encoding_name)
+                if not peer_encoding_attr:
+                    raise ValueError('Unsupported related Shader encoding')
+                for key in ('baseline', 'candidate'):
+                    item = request[key]
+                    unused, blob, digest = bridge._read_shader_candidate(dict(
+                        candidate_path=item['path'], expected_sha256=item['rawSha256'], encoding=peer_encoding_name))
+                    if digest == peer['originalHash']:
+                        peer['targets'].append(None)
+                        continue
+                    target, message = bridge._build_target_shader(ctrl, peer['entry'],
+                        getattr(rd.ShaderEncoding, peer_encoding_attr), blob, rd.ShaderCompileFlags(), stage)
+                    if not bridge._resource_id_int(target):
+                        raise ValueError('Related Shader build failed: %s' % message)
+                    peer['targets'].append(target)
+                    target_entry = bridge._exact_shader_entry(list(ctrl.GetShaderEntryPoints(target)), peer['entry'], stage_name)
+                    reflection = ctrl.GetShader(rd.ResourceId(), target, target_entry) if target_entry else None
+                    if not reflection or hashlib.sha256(bridge._shader_raw_bytes(reflection)).hexdigest() != digest:
+                        raise ValueError('Related Shader candidate identity changed')
+                    proof = _storage_proof(bridge, reflection)
+                    if proof.get('uncovered') or not proof['complete']:
+                        raise ValueError('Related Shader candidate uses writable or unknown storage')
+                    baseline = peer['live']
+                    if peer_encoding_name == 'dxil':
+                        compatible = bridge._dxil_ambiguous_interface_compatible(
+                            ctrl, baseline['pipelineResource'], baseline['reflection'], reflection,
+                            baseline_access=baseline.get('dxilAccessSignature'),
+                            baseline_layout_evidence=baseline.get('dxilLayoutEvidence'))
+                    else:
+                        compatible = bridge._physical_shader_interfaces_compatible(baseline['reflection'], reflection)
+                    if not compatible:
+                        raise ValueError('Related Shader candidate has a physical ABI mismatch')
+
+            def switch_peers(leg):
+                for peer in peers:
+                    previous, current = peer['current'], peer['targets'][leg]
+                    peer['current'] = current
+                    peer['touched'] |= previous is not None or current is not None
+                    _switch_target(bridge, ctrl, api, peer['resource'], previous, current)
             needs_storage = not all(proof["complete"] for proof in storage_proofs)
+            if effect and needs_storage:
+                raise ValueError('Isolated effect experiments cannot mutate writable Shader storage')
             # Candidate ABI checks above retain the same storage binding table.
             if needs_storage and not any(s == stage for s, unused in storage_stages):
                 storage_stages.append((stage, list(live["reflection"].readWriteResources)))
@@ -524,7 +709,7 @@ def compare_candidates(bridge, params):
             # RT/DS contents before each A/B/A leg. It is useful precisely where
             # replaying the entire frame independently produces a moving baseline.
             # Either side may be a captured original or an earlier compiled draft.
-            if (stage_name == "fragment" and not needs_storage
+            if (not effect and stage_name == "fragment" and not needs_storage
                     and callable(getattr(ctrl, "ComparePixelShaderPair", None))):
                 mutated = True
                 _switch_target(bridge, ctrl, api, original, current_target, None)
@@ -533,14 +718,24 @@ def compare_candidates(bridge, params):
                 paired, paired_reason = _paired_observations(
                     bridge, ctrl, event["eventId"], original, targets[0], targets[1])
             observations = paired[:2] if paired is not None else []
+            effect_images=[]
             if paired is None:
-                for target in targets:
+                for leg, target in enumerate(targets):
                     mutated = True
                     _switch_target(bridge, ctrl, api, original, current_target, target)
                     current_target = target
+                    switch_peers(leg)
                     ctrl.ClearReplayCache()
-                    _observe_event(bridge, ctrl, event["eventId"])
-                    observations.append(_observed_outputs(bridge, ctrl, storage_stage, stage_name, event["eventId"]))
+                    if effect:
+                        # Later passes require their own published pipeline/RT
+                        # binding. Analysis-only replay retains the anchor cache.
+                        bridge._set_frame_event(ctrl,observation_event,True)
+                    else:
+                        _observe_event(bridge, ctrl, observation_event)
+                    observed=(_effect_outputs(bridge,ctrl,observation_event,effect) if effect else
+                              _observed_outputs(bridge, ctrl, storage_stage, stage_name, event["eventId"]))
+                    observations.append(observed)
+                    if effect:effect_images.append(_effect_preview(bridge,ctrl,effect,observed,'before' if len(observations)==1 else 'after'))
             if len(observations[0]) != len(observations[1]):
                 raise ValueError("output attachment count changed")
             metrics = []
@@ -573,13 +768,21 @@ def compare_candidates(bridge, params):
             }
             if paired_reason:
                 result["pairedReplayUnavailable"] = paired_reason
+            if effect:
+                region_left=_effect_roi(observations[0],effect.get('roi',[0.,0.,1.,1.]),effect.get('flipY',False))
+                region_right=_effect_roi(observations[1],effect.get('roi',[0.,0.,1.,1.]),effect.get('flipY',False))
+                result['effectObservation']={'eventId':observation_event,'images':effect_images,
+                    'roi':effect.get('roi',[0.,0.,1.,1.]),'metrics':[
+                        dict(compare_bytes(a,b,desc),output=desc) for (desc,a),(_,b) in zip(region_left,region_right)],
+                    'replacementScope':'related-shader-resources' if peers else 'shared-shader-resource',
+                    'coordinatedShaderCount':1 + len(peers), 'sourceEventId':event['eventId']}
             stability = None
             if paired is not None:
                 stability = _baseline_stability(observations[0], paired[2], metrics)
                 result["baselineStability"] = stability
                 # A matching candidate cannot hide a nonrepeatable baseline.
                 result["accepted"] = result["accepted"] and stability["withinTolerance"]
-            requires_stability = needs_storage or stage_name != "fragment"
+            requires_stability = bool(effect) or needs_storage or stage_name != "fragment"
             if not result["accepted"] or requires_stability:
                 skip_reason = _baseline_repeat_permission(bridge, started) if stability is None else ""
                 if stability is None:
@@ -592,9 +795,16 @@ def compare_candidates(bridge, params):
                     observations[1] = []
                     right = None  # Drop the comparison loop's last B readback too.
                     try:
-                        stability = _repeat_baseline(bridge, ctrl, api, original, targets[0],
-                            event["eventId"], observations[0], metrics, current_target,
-                            storage_stage=storage_stage, observation_kind=stage_name)
+                        if effect:
+                            _switch_target(bridge,ctrl,api,original,current_target,targets[0]);current_target=targets[0]
+                            switch_peers(0)
+                            ctrl.ClearReplayCache();bridge._set_frame_event(ctrl,observation_event,True)
+                            repeated=_effect_outputs(bridge,ctrl,observation_event,effect)
+                            stability=_baseline_stability(observations[0],repeated,metrics)
+                        else:
+                            stability = _repeat_baseline(bridge, ctrl, api, original, targets[0],
+                                event["eventId"], observations[0], metrics, current_target,
+                                storage_stage=storage_stage, observation_kind=stage_name)
                         current_target = targets[0]
                     except Exception as error:
                         # A/B already produced usable failure coordinates. Keep
@@ -632,17 +842,34 @@ def compare_candidates(bridge, params):
         finally:
             try:
                 if mutated:
-                    if existing:
-                        bridge._replace_shared_shader_resource(ctrl, api, original, existing["targetResource"])
-                    else:
-                        bridge._remove_shared_shader_resource(ctrl, api, original)
+                    failures = []
+                    for peer in reversed(peers):
+                        if not peer['touched']:
+                            continue
+                        try:
+                            bridge._remove_shared_shader_resource(ctrl, api, peer['resource'])
+                        except Exception as error:
+                            failures.append(str(error))
+                    try:
+                        if existing:
+                            bridge._replace_shared_shader_resource(ctrl, api, original, existing["targetResource"])
+                        else:
+                            bridge._remove_shared_shader_resource(ctrl, api, original)
+                    except Exception as error:
+                        failures.append(str(error))
                     ctrl.ClearReplayCache()
-                bridge._set_frame_event(ctrl, visible_event, True)
+                    if failures:
+                        raise RuntimeError('Could not restore every Shader replacement: ' + '; '.join(failures))
+                bridge._set_frame_event(ctrl, visible_event, True, allow_background_preemption=False)
                 restored = True
             finally:
-                for target in targets:
-                    if target is None:
+                released = set()
+                peer_targets = [target for peer in peers for target in peer['targets']]
+                for target in targets + peer_targets:
+                    target_id = bridge._resource_id_int(target)
+                    if not target_id or target_id in released:
                         continue
+                    released.add(target_id)
                     if restored:
                         try:
                             ctrl.FreeTargetResource(target)
@@ -656,6 +883,11 @@ def compare_candidates(bridge, params):
                         # capture's lifetime.
                         bridge._register_orphan_shader_target(target)
         result["replayRestored"] = True
+        if geometry_scope is not None:
+            result['geometryScope'] = geometry_scope
+        if effect and result.get('effectObservation'):
+            stability=result.get('baselineStability')or{}
+            result['effectObservation']['conclusive']=bool(stability.get('checked') and stability.get('withinTolerance'))
         result["durationMilliseconds"] = round((time.monotonic() - started) * 1000)
         return result
 

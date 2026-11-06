@@ -229,20 +229,20 @@ DECLARE_REFLECTION_STRUCT(BugReport);
   DOCUMENT(                                                                                        \
       "The style to load for the UI. Possible values include 'Native', 'RDLight', 'RDDark', "      \
       "'ultra'. "                                                                                  \
-      "If empty, the Black style ('ultra') will be chosen."                                       \
+      "If empty, the Black style ('ultra') will be chosen."                                        \
       ""                                                                                           \
       ":type: str");                                                                               \
   CONFIG_SETTING_VAL(public, QString, rdcstr, UIStyle, "ultra")                                    \
                                                                                                    \
   DOCUMENT(                                                                                        \
-      "The language to load for the UI. Supported stable values are 'zh_CN' for Simplified "      \
-      "Chinese, 'en' for source English, and 'system' to follow the operating-system language. "  \
+      "The language to load for the UI. Supported stable values are 'zh_CN' for Simplified "       \
+      "Chinese, 'en' for source English, and 'system' to follow the operating-system language. "   \
       "Changes take effect the next time qrenderdoc starts.\n"                                     \
       "\n"                                                                                         \
-      "Defaults to 'system'."                                                                     \
+      "Defaults to 'system'."                                                                      \
       ""                                                                                           \
       ":type: str");                                                                               \
-  CONFIG_SETTING_VAL(public, QString, rdcstr, UILanguage, "system")                               \
+  CONFIG_SETTING_VAL(public, QString, rdcstr, UILanguage, "system")                                \
                                                                                                    \
   DOCUMENT(                                                                                        \
       "The path to the last capture to be opened, which is useful as a default location for "      \
@@ -359,6 +359,7 @@ DECLARE_REFLECTION_STRUCT(BugReport);
       ""                                                                                           \
       ":type: float");                                                                             \
   CONFIG_SETTING_VAL(public, float, float, MeshViewer_CameraNear, 0.1f)                            \
+  CONFIG_SETTING_VAL(public, int, int, MeshViewer_CameraNavigation, 0)                             \
                                                                                                    \
   DOCUMENT(                                                                                        \
       "The far plane used in the mesh viewers display."                                            \
@@ -648,11 +649,11 @@ DECLARE_REFLECTION_STRUCT(BugReport);
   CONFIG_SETTING(public, QVariantList, rdcarray<ShaderProcessingTool>, ShaderProcessors)           \
                                                                                                    \
   DOCUMENT(                                                                                        \
-      "Optional executable path for the shader editor language server. An empty value searches " \
-      "the RENDERDOC_SHADER_LANGUAGE_SERVER environment variable, shader-language-server, then " \
-      "slangd. Local completion, navigation, and diagnostics remain available without it.\n"      \
+      "Optional executable path for the shader editor language server. An empty value searches "   \
+      "the RENDERDOC_SHADER_LANGUAGE_SERVER environment variable, shader-language-server, then "   \
+      "slangd. Local completion, navigation, and diagnostics remain available without it.\n"       \
       "\n"                                                                                         \
-      "Defaults to an empty string.\n"                                                            \
+      "Defaults to an empty string.\n"                                                             \
       ""                                                                                           \
       ":type: str");                                                                               \
   CONFIG_SETTING_VAL(public, QString, rdcstr, ShaderEditor_LanguageServer, "")                     \

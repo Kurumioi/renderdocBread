@@ -34,6 +34,7 @@ from typing import Any, Mapping, Sequence
 from .conversation import (
     PROVIDER_NATIVE_DOCUMENT_MEDIA_TYPES,
     PROVIDER_NATIVE_IMAGE_MEDIA_TYPES,
+    RT_ANNOTATION_GUIDANCE,
     prepare_provider_conversation_input,
     parse_conversation_prompt,
 )
@@ -249,7 +250,8 @@ def _wants_native_input(profile: Any, option: str, protocol: str) -> bool:
 
 def _mcp_result_payload(result: Any, protocol: str, tool_name: str = "", *,
                         store: OwnedOutputStore | None = None,
-                        authority: str = "first-party-host") -> Any:
+                        authority: str = "first-party-host",
+                        chat_image_companion: bool = False) -> Any:
     """The tool result as the model should receive it on this connection.
 
     Text is what every route has always got.  When the tool also produced a picture,
@@ -268,7 +270,7 @@ def _mcp_result_payload(result: Any, protocol: str, tool_name: str = "", *,
     media = collect_media(result)
     if not media:
         return text
-    return build_tool_result(text, media, protocol)
+    return build_tool_result(text, media, protocol, chat_image_companion=chat_image_companion)
 
 
 class BreadMCPTools:
@@ -293,6 +295,8 @@ class BreadMCPTools:
         self.failed_mcp_servers: dict[str, str] = {}
         # How this provider carries an image back from a tool, if it can at all.
         self._protocol = _effective_protocol(request.profile)
+        self._chat_image_companion = (self._protocol in {"openai-chat", "azure-openai"}
+                                     and _wants_native_input(request.profile, "image_input", self._protocol))
         self._output_store = OwnedOutputStore()
         self._upstream_output_paths: set[str] = set()
         self._review_store = TaskReportStore(request.task_id, event_root)
@@ -391,6 +395,7 @@ class BreadMCPTools:
                                 self._protocol,
                                 tool_name,
                                 store=self._output_store,
+                                chat_image_companion=self._chat_image_companion,
                             )
                             if isinstance(payload, str):
                                 try:
@@ -451,6 +456,7 @@ class BreadMCPTools:
                         return _mcp_result_payload(
                             await pool.call(bound_name, arguments), self._protocol, bound_name,
                             store=self._output_store, authority="user-configured-mcp-server",
+                            chat_image_companion=self._chat_image_companion,
                         )
                     except asyncio.CancelledError:
                         raise
@@ -788,9 +794,10 @@ class _DeepRun:
                 {tool.name for tool in tools} & set(self.user_mcp_tool_names)),
             has_tools=bool(tools),
         )
+        prompt = self._annotation_guidance() + prompt
         prompt += "\n\n" + self._workspace_guidance()
         spec: dict[str, Any] = {"name": name, "description": description, "tools": tools}
-        spec["middleware"] = [self._shader_file_middleware()]
+        spec["middleware"] = [self._shader_file_middleware(), *self._tool_image_middleware()]
         spec[_subagent_prompt_key(self.engine.deepagents())] = prompt
         return spec
 
@@ -1150,6 +1157,7 @@ class _DeepRun:
                 if self.request.skill_name else None
             ),
         )
+        system_prompt = self._annotation_guidance() + system_prompt
         system_prompt += "\n\n" + self._workspace_guidance()
         if self.config.inherit_desktop_capabilities:
             from .desktop_capabilities import capability_guidance
@@ -1166,7 +1174,7 @@ class _DeepRun:
             "subagents": subagents,
             "backend": backend,
             "checkpointer": self._checkpointer,
-            "middleware": [self._shader_file_middleware(backend)],
+            "middleware": [self._shader_file_middleware(backend), *self._tool_image_middleware()],
         }
         kwargs[_create_prompt_key(create)] = system_prompt
         return create(**kwargs), listing
@@ -1179,6 +1187,23 @@ class _DeepRun:
             first_party_reader=("read_shader_workspace_file" in self.renderdoc_tool_map
                                 and "read_shader_workspace_file" not in self.user_mcp_tool_names),
         )
+
+    def _tool_image_middleware(self) -> list[Any]:
+        protocol = _effective_protocol(self.request.profile)
+        if protocol not in {"openai-chat", "azure-openai"} or not _wants_native_input(
+                self.request.profile, "image_input", protocol):
+            return []
+        from .tool_image_middleware import chat_tool_image_middleware
+        return [chat_tool_image_middleware()]
+
+    def _annotation_guidance(self) -> str:
+        envelope = parse_conversation_prompt(self.request.prompt)
+        if not any(item.context and item.context.annotation
+                   for item in envelope.request.attachments):
+            return ""
+        # Host-authored interpretation rules belong in system instructions.
+        # No attachment title, text, pixels or metadata become instructions.
+        return "RT annotation grounding for this request:\n" + RT_ANNOTATION_GUIDANCE + "\n\n"
 
     def _filesystem_backend(self) -> Any:
         from deepagents.backends import FilesystemBackend

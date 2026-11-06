@@ -292,6 +292,10 @@ private:
   void showShaderIntentMenu(QWidget *anchor);
   void clearCaptureTasks();
   void chooseAttachmentFiles();
+  void annotateRenderTarget();
+  void editRenderTargetAnnotation(const QString &attachmentId);
+  bool addRenderTargetAnnotation(const QImage &original, const QImage &annotated,
+                                 const QJsonObject &context);
   void requestSystemThumbnail(const QString &attachmentId, const QString &canonicalPath,
                               qint64 expectedBytes, qint64 expectedModifiedUnixMs,
                               bool preferRasterDecoder = false);
@@ -456,6 +460,7 @@ private:
   QWidget *m_AttachmentStrip = NULL;
   QHBoxLayout *m_AttachmentLayout = NULL;
   QPushButton *m_AddAttachment = NULL;
+  QPushButton *m_AnnotateRT = NULL;
   QPlainTextEdit *m_Prompt = NULL;
   QToolButton *m_TaskProgress = NULL;
   QMenu *m_TaskProgressMenu = NULL;

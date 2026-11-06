@@ -24,6 +24,7 @@
 
 #include "AIConversationView.h"
 #include "Code/Interface/QRDInterface.h"
+#include "AIVisualReply.h"
 
 #include <QAbstractSlider>
 #include <QAction>
@@ -43,16 +44,16 @@
 #include <QFontMetrics>
 #include <QGridLayout>
 #include <QGuiApplication>
-#include <QHideEvent>
 #include <QHBoxLayout>
+#include <QHideEvent>
 #include <QImage>
 #include <QImageReader>
 #include <QKeyEvent>
 #include <QKeySequence>
 #include <QLabel>
 #include <QLocale>
-#include <QMouseEvent>
 #include <QMenu>
+#include <QMouseEvent>
 #include <QPainter>
 #include <QPalette>
 #include <QPointer>
@@ -69,9 +70,10 @@
 #include <QUrlQuery>
 #include <QVBoxLayout>
 #include <QWheelEvent>
-#include <utility>
 #include <algorithm>
+#include <utility>
 #include "Code/Resources.h"
+#include "AICodeFormatting.h"
 #include "AIFileThumbnail.h"
 
 namespace
@@ -217,6 +219,7 @@ bool canKeepTranscriptDocument(const QVector<AIChatMessage> &current,
        oldMessage.timestampMs != newMessage.timestampMs ||
        oldMessage.finishedTimestampMs != newMessage.finishedTimestampMs ||
        oldMessage.activityExpanded != newMessage.activityExpanded ||
+       oldMessage.visuals != newMessage.visuals ||
        oldMessage.attachments.size() != newMessage.attachments.size() ||
        oldMessage.activity.size() != newMessage.activity.size())
       return false;
@@ -352,6 +355,18 @@ QString inlineMarkdown(const QString &text)
   int i = 0;
   while(i < text.size())
   {
+    if(i + 1 < text.size() && text[i] == QLatin1Char('*') && text[i + 1] == QLatin1Char('*'))
+    {
+      const int end = text.indexOf(QLatin1String("**"), i + 2);
+      if(end > i + 2)
+      {
+        html += text.mid(plainStart, i - plainStart).toHtmlEscaped();
+        html += QLatin1String("<strong>") + inlineMarkdown(text.mid(i + 2, end - i - 2)) +
+                QLatin1String("</strong>");
+        i = plainStart = end + 2;
+        continue;
+      }
+    }
     if(text[i] == QLatin1Char('`'))
     {
       const int end = text.indexOf(QLatin1Char('`'), i + 1);
@@ -446,185 +461,18 @@ bool orderedListLine(const QString &line, int &contentStart)
   return true;
 }
 
-bool sourceKeyword(const QString &word)
-{
-  static const QStringList keywords =
-      QStringList() << QLatin1String("auto") << QLatin1String("break")
-                    << QLatin1String("case") << QLatin1String("class")
-                    << QLatin1String("const") << QLatin1String("continue")
-                    << QLatin1String("discard") << QLatin1String("do")
-                    << QLatin1String("else") << QLatin1String("enum")
-                    << QLatin1String("false") << QLatin1String("for")
-                    << QLatin1String("if") << QLatin1String("in")
-                    << QLatin1String("interface")
-                    << QLatin1String("inout") << QLatin1String("precise")
-                    << QLatin1String("nointerpolation") << QLatin1String("centroid")
-                    << QLatin1String("namespace") << QLatin1String("null")
-                    << QLatin1String("nullptr") << QLatin1String("out")
-                    << QLatin1String("register") << QLatin1String("return") << QLatin1String("static")
-                    << QLatin1String("struct") << QLatin1String("switch")
-                    << QLatin1String("true") << QLatin1String("typedef")
-                    << QLatin1String("uniform") << QLatin1String("using")
-                    << QLatin1String("var") << QLatin1String("while");
-  return keywords.contains(word);
-}
-
-bool sourceType(const QString &word)
-{
-  static const QStringList types =
-      QStringList() << QLatin1String("bool") << QLatin1String("buffer")
-                    << QLatin1String("byte") << QLatin1String("cbuffer")
-                    << QLatin1String("char") << QLatin1String("double")
-                    << QLatin1String("fixed") << QLatin1String("float")
-                    << QLatin1String("half") << QLatin1String("int")
-                    << QLatin1String("long") << QLatin1String("matrix")
-                    << QLatin1String("object") << QLatin1String("short")
-                    << QLatin1String("size_t") << QLatin1String("string")
-                    << QLatin1String("uint") << QLatin1String("ulong")
-                    << QLatin1String("ushort") << QLatin1String("void");
-  if(types.contains(word))
-    return true;
-
-  // Cover shader vector/matrix spellings (float4, half3x3, ivec2, mat4, etc.) without
-  // accepting arbitrary identifiers that merely start with a primitive type name.
-  static const QStringList numericPrefixes =
-      QStringList() << QLatin1String("float") << QLatin1String("half")
-                    << QLatin1String("double") << QLatin1String("fixed")
-                    << QLatin1String("uint") << QLatin1String("int")
-                    << QLatin1String("bool") << QLatin1String("vec")
-                    << QLatin1String("ivec") << QLatin1String("uvec")
-                    << QLatin1String("bvec") << QLatin1String("dvec")
-                    << QLatin1String("mat") << QLatin1String("dmat");
-  for(const QString &prefix : numericPrefixes)
-  {
-    if(word.startsWith(prefix) && word.size() > prefix.size() && word[prefix.size()].isDigit())
-      return true;
-  }
-
-  // Rider treats named types as a distinct semantic category. An initial upper-case character
-  // gives useful, language-agnostic coverage for C++, C#, Java and shader resource types.
-  return !word.isEmpty() && word[0].isUpper();
-}
-
-QString highlightedSourceLine(const QString &line, const QString &language, bool &blockComment)
-{
-  const QString loweredLanguage = language.toLower();
-  const bool hashComment =
-      loweredLanguage == QLatin1String("python") || loweredLanguage == QLatin1String("py") ||
-      loweredLanguage == QLatin1String("bash") || loweredLanguage == QLatin1String("shell") ||
-      loweredLanguage == QLatin1String("sh") ||
-      loweredLanguage == QLatin1String("powershell") || loweredLanguage == QLatin1String("ps1");
-  QString html;
-  int i = 0;
-  while(i < line.size())
-  {
-    if(blockComment)
-    {
-      const int end = line.indexOf(QLatin1String("*/"), i);
-      const int length = end < 0 ? line.size() - i : end + 2 - i;
-      html += QLatin1String("<span class=\"source-comment\">") +
-              line.mid(i, length).toHtmlEscaped() + QLatin1String("</span>");
-      blockComment = end < 0;
-      i += length;
-      continue;
-    }
-    if(i + 1 < line.size() && line[i] == QLatin1Char('/') &&
-       line[i + 1] == QLatin1Char('/'))
-    {
-      html += QLatin1String("<span class=\"source-comment\">") + line.mid(i).toHtmlEscaped() +
-              QLatin1String("</span>");
-      break;
-    }
-    if(i + 1 < line.size() && line[i] == QLatin1Char('/') &&
-       line[i + 1] == QLatin1Char('*'))
-    {
-      const int end = line.indexOf(QLatin1String("*/"), i + 2);
-      blockComment = end < 0;
-      const int length = end < 0 ? line.size() - i : end + 2 - i;
-      html += QLatin1String("<span class=\"source-comment\">") +
-              line.mid(i, length).toHtmlEscaped() + QLatin1String("</span>");
-      i += length;
-      continue;
-    }
-    if(hashComment && line[i] == QLatin1Char('#'))
-    {
-      html += QLatin1String("<span class=\"source-comment\">") + line.mid(i).toHtmlEscaped() +
-              QLatin1String("</span>");
-      break;
-    }
-    if(line[i] == QLatin1Char('"') || line[i] == QLatin1Char('\''))
-    {
-      const QChar quote = line[i];
-      const int start = i++;
-      bool escaped = false;
-      while(i < line.size())
-      {
-        const QChar ch = line[i++];
-        if(ch == quote && !escaped)
-          break;
-        if(ch == QLatin1Char('\\') && !escaped)
-          escaped = true;
-        else
-          escaped = false;
-      }
-      int next = i;
-      while(next < line.size() && line[next].isSpace())
-        ++next;
-      const QString cssClass = next < line.size() && line[next] == QLatin1Char(':')
-                                   ? QLatin1String("source-key")
-                                   : QLatin1String("source-string");
-      html += QLatin1String("<span class=\"") + cssClass + QLatin1String("\">") +
-              line.mid(start, i - start).toHtmlEscaped() + QLatin1String("</span>");
-      continue;
-    }
-    if(line[i].isLetter() || line[i] == QLatin1Char('_'))
-    {
-      const int start = i++;
-      while(i < line.size() && (line[i].isLetterOrNumber() || line[i] == QLatin1Char('_')))
-        ++i;
-      const QString word = line.mid(start, i - start);
-      int next = i;
-      while(next < line.size() && line[next].isSpace())
-        ++next;
-      if(sourceKeyword(word))
-        html += QLatin1String("<span class=\"source-keyword\">") + word.toHtmlEscaped() +
-                QLatin1String("</span>");
-      else if(next < line.size() && line[next] == QLatin1Char(':'))
-        html += QLatin1String("<span class=\"source-key\">") + word.toHtmlEscaped() +
-                QLatin1String("</span>");
-      else if(next < line.size() && line[next] == QLatin1Char('('))
-        html += QLatin1String("<span class=\"source-function\">") + word.toHtmlEscaped() +
-                QLatin1String("</span>");
-      else if(sourceType(word))
-        html += QLatin1String("<span class=\"source-type\">") + word.toHtmlEscaped() +
-                QLatin1String("</span>");
-      else
-        html += QLatin1String("<span class=\"source-variable\">") + word.toHtmlEscaped() +
-                QLatin1String("</span>");
-      continue;
-    }
-    if(line[i].isDigit() ||
-       (line[i] == QLatin1Char('.') && i + 1 < line.size() && line[i + 1].isDigit()))
-    {
-      const int start = i++;
-      while(i < line.size() &&
-            (line[i].isLetterOrNumber() || line[i] == QLatin1Char('.') ||
-             ((line[i] == QLatin1Char('+') || line[i] == QLatin1Char('-')) &&
-              i > start && (line[i - 1].toLower() == QLatin1Char('e') ||
-                            line[i - 1].toLower() == QLatin1Char('p')))))
-        ++i;
-      html += QLatin1String("<span class=\"source-number\">") +
-              line.mid(start, i - start).toHtmlEscaped() + QLatin1String("</span>");
-      continue;
-    }
-    html += QString(line[i]).toHtmlEscaped();
-    ++i;
-  }
-  return html;
-}
+using AICodeFormatting::highlightedSourceLine;
+using AICodeFormatting::sourceType;
 
 QString renderFencedCode(const QStringList &lines, QString language)
 {
+  const QRegularExpression binding(QStringLiteral("(?:^|\\s)source=(rdoc://shader/[^\\s]+)"));
+  const QRegularExpressionMatch match = binding.match(language);
+  QUrl source = match.hasMatch() ? QUrl(match.captured(1), QUrl::StrictMode) : QUrl();
+  if(source.host() != QLatin1String("shader") || source.scheme() != QLatin1String("rdoc"))
+    source = QUrl();
+  const QUrlQuery sourceQuery(source);
+  const int startLine = qMax(1, sourceQuery.queryItemValue(QLatin1String("line")).toInt());
   language = language.trimmed().section(QLatin1Char(' '), 0, 0).left(32);
   QString label = language;
   if(label.isEmpty())
@@ -639,13 +487,70 @@ QString renderFencedCode(const QStringList &lines, QString language)
   for(int lineIndex = 0; lineIndex < lineCount; ++lineIndex)
   {
     const QString line = lineIndex < lines.size() ? lines[lineIndex] : QString();
+    QString rendered = line.isEmpty() ? QLatin1String("&nbsp;")
+                                      : highlightedSourceLine(line, language, blockComment);
+    QString number = QString::number(lineIndex + 1);
+    if(!source.isEmpty())
+    {
+      QUrl jump = source;
+      QUrlQuery query = sourceQuery;
+      query.removeAllQueryItems(QLatin1String("line"));
+      query.addQueryItem(QLatin1String("line"), QString::number(startLine));
+      jump.setQuery(query);
+      const QString prefix = QLatin1String("<a href=\"") +
+                             jump.toString(QUrl::FullyEncoded).toHtmlEscaped() +
+                             QLatin1String("\">");
+      rendered = prefix + rendered + QLatin1String("</a>");
+      number = prefix + number + QLatin1String("</a>");
+    }
     html += QLatin1String("<tr><td class=\"source-line-number\" width=\"36\" align=\"right\" ") +
-            QLatin1String("valign=\"top\">") + QString::number(lineIndex + 1) +
-            QLatin1String("</td><td class=\"source-line\" valign=\"top\">") +
-            (line.isEmpty() ? QLatin1String("&nbsp;") : highlightedSourceLine(line, language, blockComment)) +
+            QLatin1String("valign=\"top\">") + number +
+            QLatin1String("</td><td class=\"source-line\" valign=\"top\">") + rendered +
             QLatin1String("</td></tr>");
   }
   return html + QLatin1String("</table>");
+}
+
+// Respect escaped separators and pipes inside inline code.
+QStringList markdownTableCells(const QString &line)
+{
+  QStringList cells;
+  const QString trimmed = line.trimmed();
+  if(!trimmed.startsWith(QLatin1Char('|')))
+    return cells;
+  bool code = false;
+  QString cell;
+  for(int i = 1; i < trimmed.size(); ++i)
+  {
+    const QChar ch = trimmed[i];
+    if(ch == QLatin1Char('\\') && i + 1 < trimmed.size() && trimmed[i + 1] == QLatin1Char('|'))
+      cell += trimmed[++i];
+    else if(ch == QLatin1Char('|') && !code)
+    {
+      cells.push_back(cell.trimmed());
+      cell.clear();
+    }
+    else
+    {
+      if(ch == QLatin1Char('`'))
+        code = !code;
+      cell += ch;
+    }
+  }
+  if(!cell.isEmpty())
+    cells.push_back(cell.trimmed());
+  return cells;
+}
+
+bool markdownTableRule(const QStringList &cells, int columns)
+{
+  if(cells.size() != columns || columns < 2 || columns > 12)
+    return false;
+  static const QRegularExpression separator(QStringLiteral("^:?-{1,}:?$"));
+  for(const QString &cell : cells)
+    if(!separator.match(cell).hasMatch())
+      return false;
+  return true;
 }
 
 // Raw HTML and images are intentionally unsupported. This parser is small, deterministic, and
@@ -662,8 +567,9 @@ QString safeMarkdown(QString text)
   QStringList codeLines;
   int listKind = 0;
 
-  for(const QString &line : lines)
+  for(int row = 0; row < lines.size(); ++row)
   {
+    const QString &line = lines[row];
     const QString trimmed = line.trimmed();
     if(trimmed.startsWith(lit("```")))
     {
@@ -689,6 +595,30 @@ QString safeMarkdown(QString text)
     if(trimmed.isEmpty())
     {
       closeList(html, listKind);
+      continue;
+    }
+
+    const QStringList cells = markdownTableCells(line);
+    if(row + 1 < lines.size() && markdownTableRule(markdownTableCells(lines[row + 1]), cells.size()))
+    {
+      closeList(html, listKind);
+      html += QLatin1String("<table border=\"1\" cellspacing=\"0\" cellpadding=\"4\"><tr>");
+      for(const QString &cell : cells)
+        html += QLatin1String("<th>") + inlineMarkdown(cell) + QLatin1String("</th>");
+      html += QLatin1String("</tr>");
+      ++row;
+      while(row + 1 < lines.size())
+      {
+        const QStringList values = markdownTableCells(lines[row + 1]);
+        if(values.size() != cells.size())
+          break;
+        ++row;
+        html += QLatin1String("<tr>");
+        for(const QString &value : values)
+          html += QLatin1String("<td>") + inlineMarkdown(value) + QLatin1String("</td>");
+        html += QLatin1String("</tr>");
+      }
+      html += QLatin1String("</table>");
       continue;
     }
 
@@ -1617,6 +1547,15 @@ QString renderMessageAttachments(const QVector<AIChatAttachment> &attachments,
   QString html = lit("<div class=\"message-attachments\">");
   for(const AIChatAttachment &attachment : attachments)
   {
+    if(AIHideAnnotationOriginal(attachment, attachments))
+      continue;
+    const bool editableMarks = !attachment.annotationPairId().isEmpty();
+    if(editableMarks)
+    {
+      // i18n-ignore: internal action URL and structural transcript HTML.
+      html += lit("<a href=\"replaylab-annotation://edit/") +
+              QString::fromLatin1(QUrl::toPercentEncoding(attachment.id)) + lit("\">");
+    }
     QString title = attachment.title.simplified().left(160);
     if(title.isEmpty())
       title = QCoreApplication::translate("AIConversationView", "Attachment");
@@ -1640,9 +1579,13 @@ QString renderMessageAttachments(const QVector<AIChatAttachment> &attachments,
         // i18n-ignore: Structural transcript HTML contains no user-visible prose.
         html += lit("<img src=\"") + resourceUrl.toString(QUrl::FullyEncoded).toHtmlEscaped() +
                 // i18n-ignore: Structural transcript HTML dimensions contain no prose.
-                lit("\" width=\"160\" height=\"120\" title=\"") + escapedLabel +
-                lit("\" alt=\"") + escapedLabel +    // i18n-ignore: structural transcript HTML
-                lit("\"/> ");    // i18n-ignore: structural transcript HTML
+                lit("\" width=\"") + QString::number(image.width()) +
+                // i18n-ignore: structural transcript HTML dimensions contain no prose.
+                lit("\" height=\"") + QString::number(image.height()) +
+                // i18n-ignore: structural transcript HTML attribute contains no prose.
+                lit("\" title=\"") + escapedLabel + lit("\" alt=\"") +
+                escapedLabel +    // i18n-ignore: structural transcript HTML
+                lit("\"/> ");     // i18n-ignore: structural transcript HTML
         renderedThumbnail = true;
       }
     }
@@ -1663,6 +1606,8 @@ QString renderMessageAttachments(const QVector<AIChatAttachment> &attachments,
       // i18n-ignore: Structural transcript HTML contains no prose.
       html += lit("<span class=\"message-attachment\">") + icon + label.toHtmlEscaped() +
               lit("</span>");    // i18n-ignore: structural transcript HTML
+    if(editableMarks)
+      html += QLatin1String("</a>");
   }
   // i18n-ignore: Structural transcript HTML contains no user-visible prose.
   return html + lit("</div>");
@@ -2323,6 +2268,14 @@ AIConversationView::AIConversationView(QWidget *parent) : QWidget(parent)
           [this](const QPoint &position) {
             QMenu *menu = m_Browser->createStandardContextMenu();
             const QString anchorHref = m_Browser->anchorAt(position);
+            if(anchorHref.startsWith(QLatin1String("replaylab-annotation://edit/")))
+            {
+              menu->addSeparator();
+              QAction *edit = menu->addAction(
+                  QCoreApplication::translate("AIConversationView", "Edit marks in a new draft"));
+              connect(edit, &QAction::triggered, this,
+                      [this, anchorHref]() { activateLink(QUrl(anchorHref)); });
+            }
             // i18n-ignore: Internal link scheme routed to the transcript link handler.
             if(anchorHref.startsWith(lit("replaylab-artifact://")) ||
                anchorHref.startsWith(lit("rdoc://shader"))) // i18n-ignore: Captured Shader navigation URI.
@@ -2409,6 +2362,7 @@ AIConversationView::AIConversationView(QWidget *parent) : QWidget(parent)
   connect(m_ScrollToLatest, &QToolButton::clicked, this, [this]() { scrollToLatest(); });
 
   QScrollBar *scroll = m_Browser->verticalScrollBar();
+  connect(scroll, &QScrollBar::valueChanged, this, [this](int) { updateVisualReplies(); });
   // valueChanged is also emitted when QTextDocument's lazy layout changes and clamps the scroll
   // range. Treat only slider actions and input events as user intent so a layout pass cannot
   // silently re-enable tail following while the user is reading earlier content.
@@ -2668,6 +2622,7 @@ void AIConversationView::setMessages(const QVector<AIChatMessage> &messages)
 
 void AIConversationView::clear()
 {
+  clearVisualReplies();
   ++m_RenderGeneration;
   ++m_TailResetGeneration;
   m_Messages.clear();
@@ -3126,6 +3081,77 @@ void AIConversationView::setLinkHandler(std::function<void(const QUrl &)> handle
   m_LinkHandler = std::move(handler);
 }
 
+void AIConversationView::setVisualLinkHandler(
+    std::function<void(const QUrl &, const QJsonObject &)> handler)
+{
+  m_VisualLinkHandler = std::move(handler);
+}
+
+void AIConversationView::clearVisualReplies()
+{
+  qDeleteAll(m_VisualReplies);
+  m_VisualReplies.clear();
+  m_VisualPositions.clear();
+}
+
+void AIConversationView::updateVisualReplies()
+{
+  if(!m_Browser)
+    return;
+  const QRect viewport = m_Browser->viewport()->rect();
+  for(auto it = m_VisualPositions.begin(); it != m_VisualPositions.end(); ++it)
+  {
+    QTextCursor cursor = it.value();
+    if(cursor.isNull())
+      continue;
+    QTextImageFormat format = cursor.charFormat().toImageFormat();
+    const int width = qMax(180, viewport.width() - 28);
+    const int height = qBound(220, int(format.height()), 600);
+    if(int(format.width()) != width)
+    {
+      format.setWidth(width);
+      cursor.setCharFormat(format);
+    }
+    QTextCursor start = cursor;
+    start.setPosition(cursor.selectionStart());
+    QRect area = m_Browser->cursorRect(start);
+    area.setSize(QSize(width, height));
+    const bool visible = area.intersects(viewport);
+    AIVisualReply *widget = m_VisualReplies.value(it.key(), NULL);
+    if(!widget && visible)
+    {
+      const QString identity = it.key().section(QLatin1Char(':'), -1);
+      widget = new AIVisualReply(
+          identity,
+          [this](const QUrl &url, const QJsonObject &capture) {
+            if(m_VisualLinkHandler)
+              m_VisualLinkHandler(url, capture);
+          },
+          m_Browser->viewport());
+      m_VisualReplies.insert(it.key(), widget);
+    }
+    if(widget)
+    {
+      widget->setGeometry(area);
+      widget->setVisible(visible);
+      if(visible)
+        widget->raise();
+    }
+  }
+  // Bound retained renderers while preserving nearby camera/divider state.
+  for(auto it = m_VisualReplies.begin(); it != m_VisualReplies.end();)
+  {
+    if(!m_VisualPositions.contains(it.key()) ||
+       (m_VisualReplies.size() > 12 && !it.value()->isVisible()))
+    {
+      delete it.value();
+      it = m_VisualReplies.erase(it);
+    }
+    else
+      ++it;
+  }
+}
+
 void AIConversationView::setActivityToggleHandler(
     std::function<void(const QString &messageId, bool expanded)> handler)
 {
@@ -3219,6 +3245,9 @@ void AIConversationView::changeEvent(QEvent *event)
 
 bool AIConversationView::eventFilter(QObject *watched, QEvent *event)
 {
+  if(event && m_Browser && watched == m_Browser->viewport() &&
+     (event->type() == QEvent::Resize || event->type() == QEvent::Show))
+    QTimer::singleShot(0, this, [this]() { updateVisualReplies(); });
   if(event && m_Browser &&
      (watched == m_Browser || watched == m_Browser->viewport() ||
       watched == m_Browser->verticalScrollBar()))
@@ -3714,6 +3743,23 @@ void AIConversationView::render(bool preserveScroll)
               // i18n-ignore: Structural transcript HTML contains no user-visible prose.
               lit("</div>") + safeMarkdown(message.provisionalText) + lit("</div>");
     }
+    for(int visualIndex = 0; visualIndex < qMin(8, message.visuals.size()); ++visualIndex)
+    {
+      const QString identity =
+          message.visuals[visualIndex].toObject().value(QLatin1String("id")).toString();
+      if(!AIVisualReply::validIdentity(identity))
+        continue;
+      const QString slot =
+          QLatin1String("bread-visual-slot:") + message.id + QLatin1Char(':') + identity;
+      QImage transparent(1, 1, QImage::Format_ARGB32);
+      transparent.fill(Qt::transparent);
+      document->addResource(QTextDocument::ImageResource, QUrl(slot), transparent);
+      // i18n-ignore: Native visual placeholder HTML contains only a verified identity and dimensions.
+      html += QStringLiteral("<p><img src=\"%1\" width=\"%2\" height=\"%3\" /></p>")
+                  .arg(slot.toHtmlEscaped())
+                  .arg(qMax(180, m_Browser->viewport()->width() - 28))
+                  .arg(AIVisualReply::inlineHeight(identity));
+    }
   }
   html += lit("</body></html>");
 
@@ -3730,6 +3776,21 @@ void AIConversationView::render(bool preserveScroll)
   QPointer<QTextDocument> previousDocument = m_Browser->document();
   m_Browser->setDocument(document);
   delete previousDocument.data();
+  m_VisualPositions.clear();
+  for(QTextBlock block = document->begin(); block.isValid(); block = block.next())
+    for(QTextBlock::iterator it = block.begin(); !it.atEnd(); ++it)
+    {
+      const QTextFragment fragment = it.fragment();
+      if(!fragment.charFormat().isImageFormat())
+        continue;
+      const QString name = fragment.charFormat().toImageFormat().name();
+      if(!name.startsWith(QLatin1String("bread-visual-slot:")))
+        continue;
+      QTextCursor cursor(document);
+      cursor.setPosition(fragment.position());
+      cursor.setPosition(fragment.position() + 1, QTextCursor::KeepAnchor);
+      m_VisualPositions.insert(name.mid(18), cursor);
+    }
   rebuildLiveTextCursors();
   rebuildElapsedCursors();
   updateLiveTextTimer();
@@ -3752,5 +3813,6 @@ void AIConversationView::render(bool preserveScroll)
     // owns its own generation and will release this flag from its corresponding callback.
     m_AdjustingScroll = false;
     updateTailControl();
+    updateVisualReplies();
   });
 }

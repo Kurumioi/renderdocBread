@@ -587,7 +587,9 @@ rdcarray<ShaderEntryPoint> D3D11Replay::GetShaderEntryPoints(ResourceId shader)
 
   ShaderReflection &ret = it->second->GetDetails();
 
-  return {{"main", ret.stage}};
+  // Debug information can preserve a named HLSL entry. Match the reflection returned by
+  // GetShader; callers use this name to select and validate the exact bound shader.
+  return {{ret.entryPoint.empty() ? "main" : ret.entryPoint, ret.stage}};
 }
 
 ShaderReflection *D3D11Replay::GetShader(ResourceId pipeline, ResourceId shader,
