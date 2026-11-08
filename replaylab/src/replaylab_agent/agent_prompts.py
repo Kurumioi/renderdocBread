@@ -36,6 +36,8 @@ TASK_REVIEW_GUIDANCE += """ If only a real user decision about indispensable ext
 
 UNITY_TRANSFER_PREPARATION_GUIDANCE = 'For Unity restoration, load renderdoc-resource-export and its references/unity-implementation-guidance.md before authoring or calibrating effects. It retains the per-camera Scene/Game, dynamic-resolution, stability, fidelity localization and final-output criteria. Prefer preparing captured source in Bread, reusing unchanged checks; transfer exact files and unresolved diagnostics when a tool limitation requires finishing in Unity. Work in the connected interactive Editor without stealing focus. Follow references/unity-final-handoff.md before completion: serialize a directly openable .unity with its real objects and bindings, keep a simple final asset tree and required runtime rendering code, remove task-generated builders/setup scripts, validators, comparison images and intermediate exports after successful verification, and reopen the saved scene normally without a setup command to inspect final Scene/Game output after cleanup. Keep evidence in Bread task storage outside the final Unity tree, preserve existing user files and unfinished recovery checkpoints, and retain requested final renders.'
 
+UNREAL_TRANSFER_GUIDANCE = """For Unreal effect restoration or reassessment, load the current renderdoc-resource-export Skill and its references/unreal-restoration.md before authoring or reviewing the project, including when resuming an existing conversation. Use the requested project's installed UE version. The Agent chooses the implementation and test route. Apply the current standard to saved work and prior acceptance evidence."""
+
 FRAME_REANALYSIS_GUIDANCE = """An explicit request to redraw, regenerate or reanalyse a frame diagram (such as 重新绘制, 重新生成 or 重新分析) requests fresh analysis, unless the user limits it to presentation. Follow the domain Skill's prepare_frame_render_flow(reanalyze=True) path, which starts an empty authoring draft. Examine raw evidence before consulting the old baseline; never seed proposals by copying old nodes and rewriting evidence notes. Re-derive module boundaries, purposes, resource-version dependencies and key images across the requested scope; compare the old diagram as a baseline, not an accepted partition. Republishing it, relabelling it or checking only old gaps does not satisfy this request. Reuse unchanged raw bytes, source, bindings and images with valid provenance; do not flush caches or force fresh GPU reads merely to appear new. Reassess old blockers; a historical blocker is not a current refusal. Repair supported gaps within authorization, or change the failing evidence route; do not repeat an unchanged failure. Select stages and evidence from actual draw order and resource use, without required technologies, EIDs or module counts. Preserve useful results if a current dependency truly prevents completion, and state the specific remaining limitation. Reanalysis may confirm a prior conclusion; document the renewed evidence-based judgment without inventing changes."""
 
 
@@ -172,6 +174,7 @@ def native_agent_system_prompt(
 - {ON_DEMAND_DRAW_GUIDANCE}
 - {SHADER_ORGANIZATION_DELIVERY_GUIDANCE}
 - {UNITY_TRANSFER_PREPARATION_GUIDANCE}
+- {UNREAL_TRANSFER_GUIDANCE}
 - {FRAME_REANALYSIS_GUIDANCE}
 - A general question needs no capture call. For capture claims, obtain current evidence; distinguish observations, inferences, generated source and actual applied effects.
 - {SKILL_TASK_GUIDANCE}
@@ -277,6 +280,7 @@ def deep_main_system_prompt(
 - {ON_DEMAND_DRAW_GUIDANCE}
 - {SHADER_ORGANIZATION_DELIVERY_GUIDANCE}
 - {UNITY_TRANSFER_PREPARATION_GUIDANCE}
+- {UNREAL_TRANSFER_GUIDANCE}
 - {FRAME_REANALYSIS_GUIDANCE}
 - Use available Bread tools directly. Search `list_bread_capabilities` or load an exact contract only when a needed operation is not already available or its arguments are unclear. `invoke_bread_tool` executes a discovered Host or attached configured MCP operation by its exact name; no sub-agent is required to call an external server. Do not invent tool names.
 - Use current Host observations for capture facts. Tool diagnostics describe an operation and its limits; they do not assign your next step. Respect concrete effect grants, source revision and current-target checks.
