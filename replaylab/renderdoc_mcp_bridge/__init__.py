@@ -6145,12 +6145,17 @@ def _current_texture_context(warnings):
             x = _safe_int(getattr(location, "first", -1), -1)
             y = _safe_int(getattr(location, "second", -1), -1)
         picked = {"x": int(x), "y": int(y)} if int(x) >= 0 and int(y) >= 0 else None
+        try:
+            flip_y = bool(viewer.Widget().property("textureDisplayFlipY"))
+        except (AttributeError, RuntimeError):
+            # An unavailable display flag must not discard the captured RT binding.
+            flip_y = False
         return {
             "resourceId": resource_id,
             "name": name,
             "subresource": selected,
             "pickedPixel": picked,
-            "flipY": bool(viewer.Widget().property("textureDisplayFlipY")),
+            "flipY": flip_y,
         }
     except Exception as exc:
         warnings.append("Texture Viewer context is unavailable: %s" % str(exc))

@@ -360,7 +360,7 @@ def test_background_replay_and_shader_catalog_have_no_foreground_lane_fallback()
     assert foreground_calls == []
 
     shader_catalog = _function_source("_begin_export_shader_catalog")
-    assert "SHADER_CATALOG_REPLAY_TAG_PREFIX + job_id, callback" in shader_catalog
+    assert "callback, SHADER_CATALOG_REPLAY_TAG_PREFIX + job_id" in shader_catalog
     assert "except TypeError" not in shader_catalog
 
 
