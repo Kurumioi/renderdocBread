@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import json
 import os
 from pathlib import Path
 import sys
@@ -742,6 +743,43 @@ def test_current_context_freeze_barrier_owns_fixed_eid_and_restores_it() -> None
     assert stale_capture["status"] == "failed"
     assert "capture changed" in stale_capture["error"]
     assert set_events == []
+
+
+@pytest.mark.parametrize("rollback_confirmed", [True, False])
+def test_chat_context_waits_for_its_project_restore_rollback(tmp_path, monkeypatch, rollback_confirmed):
+    bridge = _load_bridge()
+    session = "a" * 32
+    timers, queued, cancelled = [], [], []
+    restore = types.SimpleNamespace(cancel_for_inspection=lambda: cancelled.append(True),
+                                    replay_inspection_safe=False)
+    bridge._project_auto_restore_client = restore
+    bridge.QtCore = types.SimpleNamespace(QTimer=types.SimpleNamespace(
+        singleShot=lambda _, callback: timers.append(callback)))
+    bridge._ctx = types.SimpleNamespace(Replay=lambda: types.SimpleNamespace(
+        AsyncInvoke=lambda tag, callback: queued.append((tag, callback))))
+    bridge._capture_current_renderdoc_context_facts = lambda **_: (
+        {"capture": {"loaded": True, "captureSessionId": session}, "events": {"currentEventId": 77}},
+        (), ("loaded", "test"), 77)
+    bridge._current_context_freeze_result_path = lambda job_id: str(tmp_path / (job_id + ".json"))
+    bridge._write_current_context_freeze_terminal = lambda _: None
+    monkeypatch.setattr(bridge.threading, "Timer", lambda *args: types.SimpleNamespace(start=lambda: None))
+
+    # Project Host context queries use this same primitive without the chat flag.
+    bridge._begin_current_context_freeze(expected_capture_session_id=session)
+    assert len(queued) == 1 and not cancelled
+    queued.clear()
+    job = json.loads(bridge.begin_native_context_freeze_json(expected_capture_session_id=session))
+    assert job["status"] == "queued" and len(cancelled) == 1 and not queued
+    timers.pop()()
+    assert not queued
+    restore.replay_inspection_safe = rollback_confirmed
+    bridge._project_auto_restore_client = None
+    timers.pop()()
+    if rollback_confirmed:
+        assert len(queued) == 1
+    else:
+        assert not queued
+        assert "rollback could not be verified" in bridge._poll_current_context_freeze(job["jobId"])["error"]
 
 
 def test_ipc_current_context_reuses_native_fixed_eid_barrier() -> None:

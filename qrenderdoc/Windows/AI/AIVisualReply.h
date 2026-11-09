@@ -2,6 +2,8 @@
 
 #include <QCoreApplication>
 #include <QJsonObject>
+#include <QJsonArray>
+#include <QImage>
 #include <QUrl>
 #include <QWidget>
 #include <functional>
@@ -16,6 +18,13 @@ public:
   AIVisualReply(const QString &identity, Navigate navigate, QWidget *parent = NULL);
   static bool validIdentity(const QString &identity);
   static QString storageRoot();
+  static QImage verifiedImage(const QJsonObject &asset);
+  static QStringList visibleIdentities(const QJsonArray &references);
   static QJsonObject navigationTarget(const QString &identity);
+  static QUrl resolveLegacyTextureLink(const QUrl &url, const QString &identity, QJsonObject &capture);
   static int inlineHeight(const QString &identity);
+
+private:
+  void setComparisonMode(int mode);
+  int m_ComparisonMode = 2;
 };

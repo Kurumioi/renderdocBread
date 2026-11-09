@@ -8,17 +8,10 @@ Do not copy another frame's object categories, algorithms or pass order.
 ## Find where surfaces become lit color
 
 Follow how geometry/material data reaches the final scene. Determine where surface
-properties are evaluated and where illumination is applied. A geometry draw that
-evaluates material and lighting together supports a forward path; stored surface
-properties read later to compute scene lighting support a deferred path. These can
-coexist for different objects or effects. Trace the actual values and consumers:
-MRT count, a fullscreen draw, a Shader name or a familiar-looking texture alone
-does not decide the rendering path. Depth preparation or stored normals alone do
-not prove deferred lighting; a fullscreen composition is not necessarily lighting.
-Some captures resolve visibility or material data in other arrangements. Describe
-the representation and where the actual shading occurs instead of forcing either
-label. Geometry preparation, material evaluation, visibility, light transport and
-final composition can also cross the boundaries of named engine passes.
+properties are evaluated and where illumination is applied. Describe the actual representation and the operations that consume it. Derive
+technical names only after examining those calculations and their integration.
+Do not force a rendering-path label from target count, geometry, names or a
+familiar appearance. Different operations can coexist in the same capture.
 
 Follow the distinct object/material branches actually present. Ask what geometry
 they draw, where their surface color and lighting are evaluated, what controls
@@ -67,8 +60,9 @@ media to explain the operation, not to decorate every edge with a duplicate.
 Keep compact observations in the existing investigation/evidence records: what
 the binding/operation proves, the supported functional interpretation, and any
 consequential open question. Binding correctness and semantic understanding are
-different claims. Reuse verified observations and read-only source/IR; no editable
-Shader workspace or compilation is needed to understand a rendering operation.
+different claims. Reuse matching observations and read-only source/IR. Prepare
+managed source or a temporary compiled variant when it helps distinguish the
+remaining hypotheses; choose the method from the question and evidence.
 
 ## Review the explanation the user will actually see
 

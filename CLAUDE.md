@@ -62,6 +62,10 @@ This fork renames/hides RenderDoc identifiers to avoid detection. Key customizat
 
 ## Release Build Guide
 
+The user must explicitly authorize building a release package for the current
+task before running the packaging entry point. A local Development update
+follows [Development update delivery](#development-update-delivery).
+
 **Before every packaging/release task, read
 [`replaylab/packaging/RELEASE_REQUIREMENTS.md`](./replaylab/packaging/RELEASE_REQUIREMENTS.md),
 [`replaylab/packaging/README.md`](./replaylab/packaging/README.md), and
@@ -107,49 +111,49 @@ Use `/m:2` and an explicit `SolutionDir` for the GUI; do not run concurrent nati
 
 ## Branch and release completion
 
-For completed implementation/release work, committing and pushing a task branch
-is an intermediate step. The user's standing instruction is to merge the work
-into the GitHub default branch and then delete that task branch, without another
-confirmation. An explicit request to keep a branch, prepare only a draft, or defer
-merging takes precedence. Discussion or read-only inspection alone does not
-authorize a merge or a release.
+Develop and validate features on a local task branch. Leave the changes
+uncommitted and keep the branch available for further review. A task can be
+complete for local testing while still awaiting the user's approval to submit.
+Development deployment and successful checks grant no Git or release authority.
 
-1. Verify `origin` and query its GitHub repository's `default_branch`; this project
-   uses `Straw1997/renderdocBread` and currently `v1.x`. Do not assume `main` or
-   `master`, or use the `upstream` fork as the publishing destination. Pass
-   `--repo Straw1997/renderdocBread` to every repository-scoped `gh` command;
-   `gh api` paths must name the same verified repository. Fetch `origin` and tags,
-   inspect current releases before choosing a version, and base new task branches
-   on the current default branch unless the user selected another baseline.
-2. Preserve unrelated user work. Use an isolated worktree when the original
-   checkout is dirty. Commit only the task's intended changes; do not reset,
-   auto-stash, force-push or include another task's uncommitted edits to finish
-   delivery. Integrate intervening default-branch changes and resolve conflicts
-   while retaining both intended behaviors. Recheck affected code after a repair.
-3. Complete relevant validation, commit and push, then open a PR targeting the
-   verified default branch. Wait for required checks and fix actionable failures;
-   respect branch protection. Merge when the work and checks are ready. Prefer a
-   merge commit so existing release/source commits stay in the default branch's
-   history. Do not bypass checks with an administrator override.
-4. For releases, build and validate a concrete candidate and use a draft while
-   checks/uploads are pending. Before public publication, verify that the default
-   branch contains the released implementation and that the tag/package identify
-   the tested source. Rebuild affected artifacts if integration changes their
-   inputs. Verify uploaded file sizes and SHA-256 before publishing. Never move
-   an existing published tag or silently replace a published archive. If a release
-   was already published before a documentation-only follow-up, merge that
-   follow-up while preserving the release, its tag and its checked binaries.
-5. After GitHub reports the PR merged, fetch the default branch and verify that
-   the task head is included (normally `git merge-base --is-ancestor <task-head>
-   origin/<default-branch>`). Only then delete this task's remote and local branch.
-   Switch its clean worktree to the updated default branch or detach at that
-   commit before deleting a checked-out branch. Keep deliverables and reports;
-   preserve any worktree with user changes and every unrelated branch. Never use
-   forced branch/worktree deletion to conceal unmerged or unsaved work.
-6. Verify the remote default-branch commit, PR merged state, and absence of both
-   branch refs. Report the PR/merge and release links, branch-cleanup outcome and
-   any actual remaining blocker. A branch push, published release or queued merge
-   alone does not complete the requested merge-and-cleanup workflow.
+Wait for the user to confirm the work and explicitly authorize the intended
+step for the current task. The gates cover local commits, remote pushes, PR
+creation, merging, local or remote branch deletion, release packaging, tagging,
+uploading and publishing. A request to commit alone authorizes a local commit.
+The user may authorize multiple named steps together. Apply the same rule to
+documentation-only changes and draft releases. A requested rollback authorizes
+only the targeted correction. Use a history-preserving revert for a published
+merge and retain the local development work.
+
+1. Use an isolated worktree when the original checkout is dirty. Preserve user
+   changes and unrelated branches. Base new task branches on the current
+   default branch unless the user selected another baseline. Never reset,
+   auto-stash or force-push to complete delivery.
+2. For an authorized remote operation, verify `origin` and query the repository's
+   `default_branch`. This project uses `Straw1997/renderdocBread` and currently
+   `v1.x`. Pass `--repo Straw1997/renderdocBread` to repository-scoped `gh`
+   commands and use the same repository in `gh api` paths. Fetch before
+   integrating changes. Never publish to the `upstream` fork by default.
+3. Commit only the intended changes after validation. When separately authorized,
+   push or open the PR against the verified default branch. Before an authorized
+   merge, wait for required checks and respect branch protection. For work whose
+   earlier merge was reverted, verify the new diff actually reapplies the
+   reviewed changes. The old commits alone may already be in the default
+   branch's history.
+4. When authorized to package, verify the candidate and check that its tag,
+   source and binary inputs agree before any separately authorized public release.
+   Rebuild affected artifacts when integration changes their inputs. Verify the
+   size and SHA-256 of uploaded files. Preserve published tags and archives.
+5. Keep the task branch after a merge unless the user explicitly authorizes
+   its deletion. Before authorized cleanup, fetch the default branch and verify
+   inclusion with `git merge-base --is-ancestor <task-head> origin/<default-branch>`.
+   Switch away from a clean checked-out task branch before deleting it. Keep
+   deliverables, reports and any worktree with user changes. Never force deletion
+   to conceal unsaved or unmerged work.
+6. Verify and report only the operations actually completed. For a local
+   delivery, report the branch, pending changes and validation. For an
+   authorized remote delivery, report the relevant commit, PR, release or
+   cleanup result.
 
 Release content/build rules remain in
 [RELEASE_REQUIREMENTS.md](./replaylab/packaging/RELEASE_REQUIREMENTS.md).
@@ -167,6 +171,20 @@ authorization includes discarding transient annotation drafts when the old
 version cannot save them, as explicitly confirmed on 2026-11-05. It does not
 authorize discarding unsaved Shader/source edits or overwriting conflicting
 user-authored files. Packaging remains isolated from a running application.
+
+Use `x64/Development/RenderDocBread.exe` as the Windows Development entry point.
+A deployed copy selects the AgentHost beside it using the runtime manifest.
+The repository virtual environment is a fallback for undeployed builds and
+`REPLAYLAB_AI_CLI` remains available for an explicit test override.
+
+When built-in Skills change, also synchronize their persistent application-owned
+copies at `<app>/replaylab/skills` from `.agents/skills`, including references.
+The frozen CLI prefers this installed directory over its embedded files, so
+matching executable bytes alone do not prove the active Skills were updated.
+Back up replaced first-party files, preserve user overlay roots and unrelated
+Skills, and verify the effective Skill paths/versions with `replaylab-ai tools
+list` after deployment. Existing running tasks retain their loaded catalog;
+new tasks load the synchronized versions.
 
 ## Upstream Sync Guide
 

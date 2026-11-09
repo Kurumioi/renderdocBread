@@ -180,7 +180,13 @@ def compare_bytes(before, after, descriptor):
     return result
 
 
-def _outputs(bridge, ctrl, require_color=True, allow_empty=False, color_index=None, targets_override=None):
+def _swapchain_texture(bridge, texture):
+    flag = getattr(getattr(bridge.rd, 'TextureCategory', None), 'SwapBuffer', 0)
+    return bool(int(getattr(texture, 'creationFlags', 0)) & int(flag))
+
+
+def _outputs(bridge, ctrl, require_color=True, allow_empty=False, color_index=None,
+             targets_override=None, present=False):
     rd = bridge.rd
     pipeline = ctrl.GetPipelineState()
     textures = {bridge._resource_id_int(t.resourceId): t for t in ctrl.GetTextures()}
@@ -227,6 +233,9 @@ def _outputs(bridge, ctrl, require_color=True, allow_empty=False, color_index=No
                       "componentType": _enum(fmt.compType),
                       "componentByteWidth": int(fmt.compByteWidth),
                       "componentCount": int(fmt.compCount)}
+        if present or (color_index is not None and _swapchain_texture(bridge, texture)):
+            descriptor['presentationTarget'] = True
+        if callable(getattr(fmt,"BGRAOrder",None)) and fmt.BGRAOrder():descriptor['bgraOrder']=True
         raw = bytes(ctrl.GetTextureData(target.resource, rd.Subresource(mip, array_slice, 0)))
         materialized_total += len(raw)
         if not raw or len(raw) > OUTPUT_LIMIT or materialized_total > TOTAL_LIMIT:
@@ -415,6 +424,8 @@ def _paired_observations(bridge, ctrl, event_id, original, baseline, candidate):
                 "componentType": _enum(fmt.compType),
                 "componentByteWidth": int(fmt.compByteWidth),
                 "componentCount": int(fmt.compCount)}
+        if callable(getattr(fmt, "BGRAOrder", None)) and fmt.BGRAOrder():
+            desc["bgraOrder"] = True
         for leg, field in enumerate(("baseline", "candidate", "baselineRepeat")):
             value = getattr(snapshot, field)
             if not value or len(value) > OUTPUT_LIMIT or totals[leg] + len(value) > TOTAL_LIMIT:
@@ -443,6 +454,49 @@ def _effect_roi(observation, roi, flip_y=False):
     return result
 
 
+def _captured_present(bridge, action):
+    # Drivers also mark synthetic CaptureEnd actions as Present. Those may
+    # reference the last backbuffer without recording an actual presentation.
+    return (int(action.flags) & int(bridge.rd.ActionFlags.Present)
+            and getattr(action, "customName", "") != "End of Capture")
+
+
+def resolve_effect_presentation(bridge, params):
+    """Resolve the actual presentation target without changing the replay event."""
+    capture_id = bridge._require_capture_identity(params.get("expected_capture_id"))
+    session = params.get("expected_capture_session_id")
+    if not session or session != bridge._capture_session_id:
+        raise ValueError("Capture session changed before resolving the final output")
+    anchor = params["source_event_id"]
+    requested = params.get("observation_event_id", 0)
+
+    def resolve(ctrl):
+        pending = list(ctrl.GetRootActions())
+        candidates = []
+        count = 0
+        while pending:
+            action = pending.pop()
+            if count % 256 == 0:
+                bridge._background_replay_checkpoint()
+            count += 1
+            pending.extend(getattr(action, "children", None) or [])
+            event_id = int(action.eventId)
+            if event_id >= anchor and _captured_present(bridge, action):
+                resource_id = bridge._resource_id_int(getattr(action, "copyDestination", None))
+                if resource_id:
+                    candidates.append(dict(eventId=event_id, resourceId=str(resource_id)))
+        candidates.sort(key=lambda candidate: candidate["eventId"])
+        target = next((candidate for candidate in candidates if candidate["eventId"] == requested), None)
+        if target is None and len(candidates) == 1:
+            target = candidates[0]
+        return dict(target=target, candidates=candidates[:32], candidateCount=len(candidates))
+
+    result = bridge._replay(resolve)
+    if session != bridge._capture_session_id:
+        raise ValueError("Capture session changed while resolving the final output")
+    return dict(result, captureId=capture_id, captureSessionId=session, sourceEventId=anchor)
+
+
 def _effect_outputs(bridge,ctrl,event_id,options):
     """Present's output is its actual destination, never an inherited RTV."""
     root_actions=getattr(ctrl,'GetRootActions',None)
@@ -461,7 +515,10 @@ def _effect_outputs(bridge,ctrl,event_id,options):
             sub=getattr(action,'copyDestinationSubresource',None)
             target.firstMip=int(getattr(sub,'mip',0));target.firstSlice=int(getattr(sub,'slice',0))
             target.numSlices=1;target.format=None
-            return _outputs(bridge,ctrl,targets_override=[('color',0,target)])
+            outputs = _outputs(bridge, ctrl, targets_override=[('color', 0, target)], present=True)
+            if _captured_present(bridge, action):
+                outputs[0][0]["capturedPresent"] = True
+            return outputs
         if not(flags&int(bridge.rd.ActionFlags.Drawcall)):
             raise ValueError('Choose a real graphics draw or Present as the effect output event; compute/utility inherited RTVs are not output evidence')
     requested=int(options.get('attachmentIndex',0))
@@ -474,23 +531,103 @@ def _effect_outputs(bridge,ctrl,event_id,options):
 
 
 def _effect_preview(bridge,ctrl,options,observation,leg):
-    import os
+    return _snapshot_preview(options,observation,leg,source='full-replay-snapshot')
+
+
+def _display_transfer(descriptor,requested):
+    if requested not in ('auto','identity','linear-to-srgb'):
+        raise ValueError('Unknown effect display transfer')
+    if _enum(descriptor['componentType'])=='unormsrgb':return 'identity'
+    return ('linear-to-srgb' if _enum(descriptor['componentType'])=='float' else 'identity') if requested=='auto' else requested
+
+
+def _observe_effect_event(bridge,ctrl,event_id):
+    roots=getattr(ctrl,'GetRootActions',None)
+    action=bridge._find_action_by_event(roots(),event_id) if callable(roots) else None
+    if action is not None and int(action.flags)&int(bridge.rd.ActionFlags.Present):
+        # Present has an explicit destination, so no cached pipeline binding is
+        # needed. Bypass scrub checkpoints and viewer-side redraws for each leg.
+        _observe_event(bridge,ctrl,event_id)
+    else:
+        bridge._set_frame_event(ctrl,event_id,True)
+
+
+def _snapshot_rgb(descriptor, raw, black=0., white=1., transfer='auto'):
+    """Display immutable stored output bytes; never read the currently replayed texture.
+
+    Preserve the same range and display transfer on both legs. The numeric A/B/A
+    comparison still covers the full original precision and resolution.
+    """
+    width, height = descriptor['width'], descriptor['height']
+    count, size = descriptor['componentCount'], descriptor['componentByteWidth']
+    kind, packed = _enum(descriptor['componentType']), _enum(descriptor['formatType'])
+    transfer=_display_transfer(descriptor,transfer)
+    formats = {'float': {2:'e',4:'f'}, 'unorm': {1:'B',2:'H'},
+               'unormsrgb': {1:'B',2:'H'}, 'snorm': {1:'b',2:'h'},
+               'uint': {1:'B',2:'H',4:'I'}, 'sint': {1:'b',2:'h',4:'i'}}
+    if not 1 <= count <= 4 or not 0 < width * height <= 16000000 or not white > black:
+        raise ValueError('Invalid paired snapshot display dimensions or range')
+    if packed == 'regular' and size in formats.get(kind, {}):
+        pixel_bytes = size * count
+        fmt = '<' + formats[kind][size] * count
+        def pixel(offset):
+            values = struct.unpack_from(fmt, raw, offset)
+            if kind in ('unorm', 'unormsrgb'):
+                return tuple(v / float((1 << (size * 8))-1) for v in values)
+            if kind == 'snorm':
+                return tuple(max(-1.,v / float((1 << (size * 8-1))-1)) for v in values)
+            return values
+    elif packed == 'r11g11b10' and kind == 'float':
+        pixel_bytes = 4
+        def pixel(offset):
+            word = struct.unpack_from('<I',raw,offset)[0]
+            return (_UNSIGNED_FLOAT11[word & 2047], _UNSIGNED_FLOAT11[(word >> 11) & 2047],
+                    _UNSIGNED_FLOAT10[word >> 22])
+    elif packed == 'r10g10b10a2' and kind in ('unorm','unormsrgb','uint'):
+        pixel_bytes = 4
+        def pixel(offset):
+            word = struct.unpack_from('<I',raw,offset)[0]
+            values = (word & 1023,(word >> 10) & 1023,(word >> 20) & 1023,word >> 30)
+            return tuple(v / float(3 if i == 3 else 1023) for i,v in enumerate(values)) if kind != 'uint' else values
+    else:
+        raise ValueError('Paired snapshot PNG conversion does not support '+descriptor['format'])
+    if len(raw) != width * height * pixel_bytes:
+        raise ValueError('Paired snapshot byte extent does not match its format')
+    scale = min(1.,1600. / max(width,height))
+    w,h = max(1,int(width*scale)),max(1,int(height*scale))
+    rgb = bytearray(w*h*3)
+    for y in range(h):
+        for x in range(w):
+            values = pixel((min(height-1,int(y/scale))*width+min(width-1,int(x/scale)))*pixel_bytes)
+            values = values[:3] if len(values)>1 else values*3
+            if descriptor.get('bgraOrder'):values=tuple(reversed(values))
+            for c in range(3):
+                v = values[c] if c < len(values) else 0.
+                if not math.isfinite(v):v=0.
+                v=max(0.,min(1.,(v-black)/(white-black)))
+                if transfer=='linear-to-srgb':v=12.92*v if v<=.0031308 else 1.055*v**(1./2.4)-.055
+                rgb[(y*w+x)*3+c] = int(v*255+.5)
+    return w,h,bytes(rgb)
+
+
+def _snapshot_preview(options, observation, leg, source='same-input-paired-snapshot'):
+    import os,zlib,binascii
     folder=options.get('artifactDir')
     if not folder:return None
-    desc=observation[0][0]
-    resource=next(t.resourceId for t in ctrl.GetTextures() if bridge._resource_id_int(t.resourceId)==desc['resourceId'])
+    desc,raw=observation[0]
+    transfer=_display_transfer(desc,options.get('displayTransfer','auto'))
+    w,h,rgb=_snapshot_rgb(desc,raw,options.get('blackPoint',0.),options.get('whitePoint',1.),transfer)
+    def chunk(kind,data):
+        return struct.pack('>I',len(data))+kind+data+struct.pack('>I',binascii.crc32(kind+data)&0xffffffff)
+    scanlines=b''.join(b'\x00'+rgb[y*w*3:(y+1)*w*3]for y in range(h))
+    png=(b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',w,h,8,2,0,0,0))
+         +chunk(b'sRGB',b'\x00')+chunk(b'IDAT',zlib.compress(scanlines))+chunk(b'IEND',b''))
     path=os.path.join(folder,leg+'.png')
-    if os.path.lexists(path):raise ValueError('Effect preview already exists')
-    rd=bridge.rd;save=rd.TextureSave();save.resourceId=resource;save.destType=rd.FileType.PNG
-    save.typeCast=rd.CompType.Typeless;save.mip=desc['mip'];save.slice.sliceIndex=desc['slice']
-    save.sample.mapToArray=False;save.sample.sampleIndex=0;save.channelExtract=-1
-    save.alpha=rd.AlphaMapping.Discard;save.comp.blackPoint=options.get('blackPoint',0.)
-    save.comp.whitePoint=options.get('whitePoint',1.)
-    result=ctrl.SaveTexture(save,path)
-    if result.code!=rd.ResultCode.Succeeded:raise RuntimeError('Effect image export failed: '+str(result))
-    with open(path,'rb')as stream:digest=hashlib.sha256(stream.read()).hexdigest()
-    return {'path':path,'sha256':digest,'resourceId':str(desc['resourceId']),
-            'width':desc['width'],'height':desc['height'],'eventId':options['eventId']}
+    with open(path,'xb')as stream:stream.write(png)
+    return dict(path=path,sha256=hashlib.sha256(png).hexdigest(),resourceId=str(desc['resourceId']),
+                width=w,height=h,eventId=options['eventId'],source=source,displayTransfer=transfer,
+                presentationTarget=desc.get('presentationTarget', False),
+                capturedPresent=desc.get('capturedPresent', False))
 
 
 def compare_candidates(bridge, params):
@@ -709,7 +846,8 @@ def compare_candidates(bridge, params):
             # RT/DS contents before each A/B/A leg. It is useful precisely where
             # replaying the entire frame independently produces a moving baseline.
             # Either side may be a captured original or an earlier compiled draft.
-            if (not effect and stage_name == "fragment" and not needs_storage
+            paired_effect = bool(effect and observation_event == event['eventId'] and not peers)
+            if ((not effect or paired_effect) and stage_name == "fragment" and not needs_storage
                     and callable(getattr(ctrl, "ComparePixelShaderPair", None))):
                 mutated = True
                 _switch_target(bridge, ctrl, api, original, current_target, None)
@@ -717,8 +855,22 @@ def compare_candidates(bridge, params):
                 ctrl.ClearReplayCache()
                 paired, paired_reason = _paired_observations(
                     bridge, ctrl, event["eventId"], original, targets[0], targets[1])
+                if paired is not None and paired_effect:
+                    index = int(effect.get('attachmentIndex',0))
+                    paired = [[(desc,raw)for desc,raw in leg if desc['kind']=='color' and desc['index']==index]
+                              for leg in paired]
+                    if any(len(leg)!=1 for leg in paired):
+                        raise ValueError('Requested color attachment is absent from the paired snapshots')
+                    swapchain_ids = {bridge._resource_id_int(texture.resourceId) for texture in ctrl.GetTextures()
+                                     if _swapchain_texture(bridge, texture)}
+                    for leg in paired:
+                        if leg[0][0]['resourceId'] in swapchain_ids:
+                            leg[0][0]['presentationTarget'] = True
             observations = paired[:2] if paired is not None else []
             effect_images=[]
+            if paired is not None and effect and effect.get('artifactDir'):
+                effect_images=[_snapshot_preview(effect,leg,name)
+                               for leg,name in zip(observations,('before','after'))]
             if paired is None:
                 for leg, target in enumerate(targets):
                     mutated = True
@@ -729,7 +881,7 @@ def compare_candidates(bridge, params):
                     if effect:
                         # Later passes require their own published pipeline/RT
                         # binding. Analysis-only replay retains the anchor cache.
-                        bridge._set_frame_event(ctrl,observation_event,True)
+                        _observe_effect_event(bridge,ctrl,observation_event)
                     else:
                         _observe_event(bridge, ctrl, observation_event)
                     observed=(_effect_outputs(bridge,ctrl,observation_event,effect) if effect else
@@ -774,11 +926,17 @@ def compare_candidates(bridge, params):
                 result['effectObservation']={'eventId':observation_event,'images':effect_images,
                     'roi':effect.get('roi',[0.,0.,1.,1.]),'metrics':[
                         dict(compare_bytes(a,b,desc),output=desc) for (desc,a),(_,b) in zip(region_left,region_right)],
-                    'replacementScope':'related-shader-resources' if peers else 'shared-shader-resource',
+                    'replacementScope':('single-draw-shader' if paired is not None else
+                                        'related-shader-resources' if peers else 'shared-shader-resource'),
                     'coordinatedShaderCount':1 + len(peers), 'sourceEventId':event['eventId']}
             stability = None
+            effect_stability = None
             if paired is not None:
                 stability = _baseline_stability(observations[0], paired[2], metrics)
+                if effect:
+                    effect_stability=_baseline_stability(region_left,
+                        _effect_roi(paired[2],effect.get('roi',[0.,0.,1.,1.]),effect.get('flipY',False)),
+                        result['effectObservation']['metrics'])
                 result["baselineStability"] = stability
                 # A matching candidate cannot hide a nonrepeatable baseline.
                 result["accepted"] = result["accepted"] and stability["withinTolerance"]
@@ -798,9 +956,12 @@ def compare_candidates(bridge, params):
                         if effect:
                             _switch_target(bridge,ctrl,api,original,current_target,targets[0]);current_target=targets[0]
                             switch_peers(0)
-                            ctrl.ClearReplayCache();bridge._set_frame_event(ctrl,observation_event,True)
+                            ctrl.ClearReplayCache();_observe_effect_event(bridge,ctrl,observation_event)
                             repeated=_effect_outputs(bridge,ctrl,observation_event,effect)
                             stability=_baseline_stability(observations[0],repeated,metrics)
+                            effect_stability=_baseline_stability(region_left,
+                                _effect_roi(repeated,effect.get('roi',[0.,0.,1.,1.]),effect.get('flipY',False)),
+                                result['effectObservation']['metrics'])
                         else:
                             stability = _repeat_baseline(bridge, ctrl, api, original, targets[0],
                                 event["eventId"], observations[0], metrics, current_target,
@@ -887,6 +1048,10 @@ def compare_candidates(bridge, params):
             result['geometryScope'] = geometry_scope
         if effect and result.get('effectObservation'):
             stability=result.get('baselineStability')or{}
+            if effect.get('roi',[0.,0.,1.,1.])!=[0.,0.,1.,1.] and effect_stability is not None:
+                stability=effect_stability
+                result['effectObservation']['stabilityScope']='requested-region'
+                result['effectObservation']['baselineStability']=stability
             result['effectObservation']['conclusive']=bool(stability.get('checked') and stability.get('withinTolerance'))
         result["durationMilliseconds"] = round((time.monotonic() - started) * 1000)
         return result

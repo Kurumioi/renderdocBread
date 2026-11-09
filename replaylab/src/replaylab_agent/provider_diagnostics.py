@@ -16,6 +16,9 @@ _RETRYABLE = frozenset({"provider-capacity", "provider-rate-limit", "provider-ti
 _CODES = _RETRYABLE | frozenset({"provider-quota", "provider-authentication",
     "provider-permission", "provider-model-unavailable", "provider-configuration",
     "provider-context", "provider-policy", "provider-turn-failed", "provider-failed"})
+_QUOTA_CODES = frozenset({"insufficient_quota", "billing_hard_limit_reached",
+    "credit_balance_exhausted", "usage_limit_exceeded", "organization_spend_limit_exceeded",
+    "project_spend_limit_exceeded", "organization_usage_limit_exceeded"})
 
 
 def provider_failure_metadata(error: BaseException) -> dict:
@@ -46,6 +49,8 @@ def provider_failure_metadata(error: BaseException) -> dict:
                 body = body["error"]
             raw_code = str((body.get("code") if isinstance(body, Mapping) else None)
                            or getattr(item, "code", "") or "").lower()
+            raw_type = str((body.get("type") if isinstance(body, Mapping) else None)
+                           or getattr(item, "type", "") or "").lower()
             status = getattr(item, "status_code", None)
             if not isinstance(status, int) or isinstance(status, bool):
                 status = getattr(response, "status_code", getattr(item, "code", None))
@@ -57,7 +62,8 @@ def provider_failure_metadata(error: BaseException) -> dict:
                 "all available accounts exhausted", "no available accounts",
                 "no available channels", "no available channel",
                 "account pool exhausted", "upstream accounts exhausted"))
-            if raw_code in {"insufficient_quota", "billing_hard_limit_reached", "credit_balance_exhausted", "usage_limit_exceeded"} or status == 402:
+            if ({raw_code, raw_type} & _QUOTA_CODES or status == 402
+                    or status in {None, 429} and "you have no credits remaining" in (message or text)):
                 code = "provider-quota"
             elif isinstance(item, AuthenticationError) or status == 401 or raw_code in {"invalid_api_key", "authentication_error", "unauthorized"}:
                 code = "provider-authentication"
@@ -76,13 +82,18 @@ def provider_failure_metadata(error: BaseException) -> dict:
                     status in {None, 503} and raw_code in {"", "other"}
                     and "selected model is at capacity" in text):
                 code = "provider-capacity"
-            elif status == 429 or raw_code == "rate_limit_exceeded":
+            elif status == 429 or raw_code in {"rate_limit_exceeded", "slow_down"} or raw_type == "rate_limit_error":
                 code = "provider-rate-limit"
-            elif isinstance(item, (TimeoutError, asyncio.TimeoutError)) or type(item).__name__ in {"APITimeoutError", "ReadTimeout", "ConnectTimeout", "WriteTimeout", "PoolTimeout"}:
+            elif status == 408 or isinstance(item, (TimeoutError, asyncio.TimeoutError)) or type(item).__name__ in {"APITimeoutError", "ReadTimeout", "ConnectTimeout", "WriteTimeout", "PoolTimeout"}:
                 code = "provider-timeout"
             elif isinstance(item, ConnectionError) or type(item).__name__ in {"APIConnectionError", "ConnectError", "RemoteProtocolError", "ReadError", "WriteError", "NetworkError"}:
                 code = "provider-transport"
-            elif isinstance(status, int) and 500 <= status <= 599:
+            elif status == 409 or isinstance(status, int) and 500 <= status <= 599 or (
+                    status is None and (
+                        {raw_code, raw_type} & {"server_error", "internal_error", "internal_server_error", "service_unavailable", "service_unavailable_error"}
+                        or type(item).__name__ == "APIError" and not raw_code and raw_type in {"", "error"}
+                        and (message or text).strip().rstrip(".") == "an error occurred while processing the request"
+                    )):
                 code = "provider-unavailable"
             elif isinstance(item, ConfigurationError) or status in {400, 404, 422}:
                 code = "provider-configuration"

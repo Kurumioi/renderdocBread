@@ -10,6 +10,7 @@ import hashlib,re
 class EffectLive(LiveAnnotation):
     def __init__(self):
         super(EffectLive,self).__init__()
+        self.visual_root=Path(os.environ['LOCALAPPDATA'])/'ReplayLab/ai-visuals'
         self.pointer=Path(self.spec['capture']+'.bread/frame-render-flow/current.json')
         self.pointer_before=hashlib.sha256(self.pointer.read_bytes()).hexdigest()
     def locate(self,identity):
@@ -38,7 +39,7 @@ class EffectLive(LiveAnnotation):
                 state=json.loads((Path(self.spec['eventsRoot'])/(task+'.report-state.json')).read_text(encoding='utf-8'))
                 self.cards=[]
                 for ref in state.get('replyVisuals',[]):
-                    manifest=json.loads((self.root/'local/ReplayLab/ai-visuals'/(ref['id']+'.json')).read_text(encoding='utf-8'))
+                    manifest=json.loads((self.visual_root/(ref['id']+'.json')).read_text(encoding='utf-8'))
                     self.cards.extend((ref['id'],i,c)for i,c in enumerate(manifest['cards']))
                 kinds={c['type']for _,_,c in self.cards}
                 if not {'code','compare','diagram'}<=kinds:raise RuntimeError('Missing code/comparison/local flow in real answer: '+str(kinds))
@@ -61,6 +62,15 @@ class EffectLive(LiveAnnotation):
                 reply.findChild(QtWidgets.QComboBox).setCurrentIndex(index);self.app.processEvents()
                 checks['flowHasRealRTs']=sum(bool(n.get('image'))for n in flow['nodes'])>=2
                 checks['flowHasCalculationOrChange']=bool(flow.get('edgeLabels'))or any(n.get('calculation')for n in flow['nodes'])
+                flow_page=reply.findChild(QtWidgets.QStackedWidget).currentWidget();self.keep.append(flow_page)
+                flow_canvas=flow_page.findChild(QtWidgets.QWidget,'aiVisualImageCanvas');self.keep.append(flow_canvas)
+                point=QtCore.QPoint(flow_canvas.width()//6,flow_canvas.height()//4)
+                self.app.sendEvent(flow_canvas,QtGui.QHelpEvent(QtCore.QEvent.ToolTip,point,flow_canvas.mapToGlobal(point)))
+                checks['flowTooltipHasCompleteDescription']=flow['nodes'][0]['description']in flow_canvas.toolTip()
+                self.result['flowTooltipDiagnostics']={'text':flow_canvas.toolTip(),
+                    'displayed':QtWidgets.QToolTip.text(),'point':[point.x(),point.y()],
+                    'size':[flow_canvas.width(),flow_canvas.height()],'visible':flow_canvas.isVisible()}
+                QtWidgets.QToolTip.hideText()
                 reply.grab().save(str(self.root/'effect-flow.png'))
                 # Expansion must be a separate dialog, with the same local card.
                 def inspect_expansion():
@@ -106,7 +116,7 @@ class EffectLive(LiveAnnotation):
                         block=block.next()
                 if not urls:raise RuntimeError('No CBuffer parameter hyperlink delivered')
                 self.cbuffer_queue=list(dict.fromkeys(urls));self.cbuffer_url=self.cbuffer_queue.pop(0)
-                self.target=json.loads((self.root/'local/ReplayLab/ai-visuals/targets'/(self.cbuffer_url.rsplit('/',1)[-1]+'.json')).read_text(encoding='utf-8'))['target']
+                self.target=json.loads((self.visual_root/'targets'/(self.cbuffer_url.rsplit('/',1)[-1]+'.json')).read_text(encoding='utf-8'))['target']
                 # Emit through the real transcript link handler, not direct buffer API.
                 transcript=next(b for b in browsers if 'rdoc://cbuffer/'in b.toHtml() or 'bread-visual-slot:'in b.toHtml())
                 transcript.anchorClicked.emit(QtCore.QUrl(self.cbuffer_url))
@@ -145,7 +155,7 @@ class EffectLive(LiveAnnotation):
                 found.grab().save(str(self.root/'effect-cbuffer.png'))
                 if self.cbuffer_queue:
                     self.cbuffer_url=self.cbuffer_queue.pop(0)
-                    self.target=json.loads((self.root/'local/ReplayLab/ai-visuals/targets'/(self.cbuffer_url.rsplit('/',1)[-1]+'.json')).read_text(encoding='utf-8'))['target']
+                    self.target=json.loads((self.visual_root/'targets'/(self.cbuffer_url.rsplit('/',1)[-1]+'.json')).read_text(encoding='utf-8'))['target']
                     browsers=self.window.findChildren(QtWidgets.QTextBrowser);self.keep.extend(browsers)
                     transcript=next(b for b in browsers if 'bread-visual-slot:'in b.toHtml())
                     transcript.anchorClicked.emit(QtCore.QUrl(self.cbuffer_url));self.deadline=time.monotonic()+30;return

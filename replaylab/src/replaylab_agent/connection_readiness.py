@@ -56,7 +56,8 @@ def _proved(receipt: Path, challenge: str) -> bool:
     return result == {"challengeSha256": hashlib.sha256(challenge.encode()).hexdigest(), "tool": "bread_connection_probe"}
 
 
-async def _model_probe(profile: Profile, server: dict, challenge: str, workspace: Path, timeout: float):
+async def _model_probe(profile: Profile, server: dict, challenge: str, workspace: Path, timeout: float,
+                       *, tools_config=None):
     prompt = ("This is an explicitly requested Bread connection check. Call the MCP tool bread_connection_probe "
               f"exactly once with challenge={challenge}. Then reply briefly with its result. "
               "Use the tool; do not simulate its output. No other work is requested.")
@@ -93,19 +94,22 @@ async def _model_probe(profile: Profile, server: dict, challenge: str, workspace
     from .process_env import external_agent_environment, resolved_agent_argv
     from . import native_vendor
     allowed = frozenset({"bread_connection_probe"})
-    env = external_agent_environment(profile)
-    native_vendor.prepare_workspace(profile, workspace)
+    inherit = getattr(tools_config, "inherit_desktop_capabilities", False) is True
+    env = external_agent_environment(profile, native_vendor.main_agent_env(profile, timeout), model=profile.model)
+    native_vendor.prepare_workspace(profile, workspace, allowed, inherit_desktop_capabilities=inherit)
     if profile.provider.protocol == "acp":
         if profile.options.get("allow_unsandboxed_agent") is not True:
             raise RuntimeError("trusted-acp-process-not-enabled")
         from .acp_session import ACPMainAgentSession
-        argv = native_vendor.runtime_argv(profile, resolved_agent_argv(profile), workspace, allowed)
+        argv = native_vendor.runtime_argv(profile, resolved_agent_argv(profile), workspace, allowed,
+                                          inherit_desktop_capabilities=inherit)
         async with ACPMainAgentSession(command=argv, cwd=workspace, env=env, allowed_tools=allowed,
                                        mcp_stdio_command=server["command"], mcp_stdio_args=server["args"],
                                        mcp_stdio_env=server["env"], timeout=timeout,
                                        authentication_method=profile.provider.acp_auth_method,
                                        provider_id=profile.preset, model=profile.model,
-                                       session_meta=native_vendor.session_meta(profile)) as session:
+                                       session_meta=native_vendor.session_meta(
+                                           profile, inherit_desktop_capabilities=inherit)) as session:
             result = await session.prompt(prompt)
             if not result.final_text:
                 raise RuntimeError("model-did-not-complete-after-tool")
@@ -115,9 +119,21 @@ async def _model_probe(profile: Profile, server: dict, challenge: str, workspace
         from .connectors.codex_app_server import CodexAppServerConnector
         from .native_mcp import NativeMCPRoute
         route = NativeMCPRoute(server["command"], tuple(server["args"]), server["env"], allowed, frozenset(), workspace)
-        command = harden_codex_argv(resolved_agent_argv(profile), config_overrides=[route.codex_config_override()])
+        overrides = []
+        options = {}
+        if inherit:
+            from .desktop_capabilities import discover_desktop_capabilities, codex_runtime_config, codex_runtime_overrides
+            capabilities = discover_desktop_capabilities()
+            home = Path(env['CODEX_HOME'])
+            overrides = codex_runtime_overrides(capabilities, home)
+            options = dict(inherit_desktop_capabilities=True, desktop_runtime_config=codex_runtime_config(
+                capabilities, home,
+                declared_mcp_ids=tuple(s.id for s in getattr(tools_config, 'mcp_servers', ())),
+                disabled_skill_paths=getattr(tools_config, 'runtime_disabled_skill_paths', ())))
+        command = harden_codex_argv(resolved_agent_argv(profile), inherit_desktop_capabilities=inherit,
+                                    config_overrides=[*overrides, route.codex_config_override()])
         async with CodexAppServerConnector(command, cwd=workspace, env=env, timeout=timeout,
-                                           expected_mcp_servers={"bread"}) as connector:
+                                           expected_mcp_servers={"bread"}, **options) as connector:
             result = await connector.run(prompt, model=profile.model or None)
             if not result.text:
                 raise RuntimeError("model-did-not-complete-after-tool")
@@ -125,7 +141,7 @@ async def _model_probe(profile: Profile, server: dict, challenge: str, workspace
     raise RuntimeError("connection-check-protocol-not-supported")
 
 
-async def run_execution_check(profile: Profile, *, timeout: float = 120.0) -> list[DoctorCheck]:
+async def run_execution_check(profile: Profile, *, timeout: float = 120.0, tools_config=None) -> list[DoctorCheck]:
     """Fresh temporary workspace, bounded model execution, one pure MCP tool."""
     async with _probe_workspace("bread-connection-") as temp:
         workspace = Path(temp).resolve()
@@ -134,7 +150,8 @@ async def run_execution_check(profile: Profile, *, timeout: float = 120.0) -> li
         challenge = secrets.token_hex(32)
         try:
             async with asyncio.timeout(max(1.0, min(timeout, 180.0))):
-                await _model_probe(profile, server, challenge, workspace, timeout)
+                options = {"tools_config": tools_config} if tools_config is not None else {}
+                await _model_probe(profile, server, challenge, workspace, timeout, **options)
             if not _proved(receipt, challenge):
                 raise RuntimeError("model-returned-without-mcp-execution-receipt")
         except Exception as error:

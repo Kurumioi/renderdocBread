@@ -43,6 +43,12 @@ class Widget:
             raise RuntimeError("native object deleted")
         return self.name
 
+    def property(self, name):
+        return getattr(self, 'properties', {}).get(name)
+
+    def repaint(self):
+        pass
+
     def parent(self):
         return self.owner
 
@@ -107,6 +113,7 @@ class LineEdit(Widget):
         super().__init__(name, parent)
         self.value, self.mode, self.read_only = "", 0, False
         self.editingFinished = Signal()
+        self.textEdited = Signal()
 
     def echoMode(self):
         return self.mode
@@ -477,6 +484,36 @@ def test_modal_dialog_blocks_background_controls_but_accepts_its_own(ui):
     inside = Button("cancel", ui.app.modal)
     assert run(ui, "activate", inside)["status"] == "completed"
     assert inside.clicked and not hasattr(button, "clicked")
+
+
+def test_annotation_strokes_reject_other_controls_and_validate_before_dispatch(ui):
+    assert run(ui, "draw", Widget("editor"), points=[[0, 0], [1, 1]])["status"] == "failed"
+    canvas = Widget("aiAnnotationCanvas")
+    canvas.properties = {'annotationImageRect': [10, 20, 100, 80], 'annotationStrokeCount': 0}
+    assert 'draw' in ui.control.inspect({'target_id': target(ui, canvas)})['objects'][0]['operations']
+    for points in ([], [[0, 0]], [[0, 0], [float('nan'), 1]], [[0, 0], [1.1, 1]], [[0, 0], [1, True]]):
+        result = run(ui, "draw", canvas, points=points)
+        assert result['status'] == 'failed' and 'ui-invalid' in result['error']
+    assert canvas.properties['annotationStrokeCount'] == 0
+
+
+def test_annotation_draw_maps_image_coordinates_through_actual_canvas_rect(ui):
+    canvas = Widget('aiAnnotationCanvas')
+    canvas.properties = {'annotationImageRect': [20, 50, 200, 100], 'annotationStrokeCount': 0}
+    ui.module.QtCore.Qt.LeftButton, ui.module.QtCore.Qt.NoButton, ui.module.QtCore.Qt.NoModifier = 1, 0, 0
+    ui.module.QtCore.QEvent = types.SimpleNamespace(MouseButtonPress=2, MouseMove=5, MouseButtonRelease=3)
+    ui.module.QtCore.QPointF = lambda x, y: (x, y)
+    ui.module.QtGui = types.SimpleNamespace(QMouseEvent=lambda *args: args)
+    events = []
+    def dispatch(obj, event):
+        assert obj is canvas
+        events.append(event)
+        if event[0] == 3:canvas.properties['annotationStrokeCount'] += 1
+    ui.app.sendEvent = dispatch
+    result = run(ui, 'draw', canvas, points=[[0, 0], [.5, .25], [1, 1]])
+    assert result['status'] == 'completed' and result['result']['strokeCount'] == 1
+    assert [event[1] for event in events] == [(20, 50), (120, 75), (220, 150), (220, 150)]
+    assert [event[0] for event in events] == [2, 5, 5, 3]
 
 
 def test_builtin_and_custom_windows_use_application_show_callbacks(ui):

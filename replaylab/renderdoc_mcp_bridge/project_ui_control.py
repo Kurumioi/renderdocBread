@@ -166,6 +166,10 @@ class ApplicationUIController(object):
                       label=_text(obj.accessibleName() or obj.windowTitle()),
                       tooltip=_text(obj.toolTip()), editable=self._editable(obj))
         operations = ["focus"]
+        if obj.objectName() == "aiAnnotationCanvas":
+            operations.append("draw")
+            result["imageRect"] = obj.property("annotationImageRect")
+            result["strokeCount"] = obj.property("annotationStrokeCount")
         if obj.isWindow():
             operations.append("close")
         if self._is(obj, "QAbstractButton"):
@@ -296,7 +300,7 @@ class ApplicationUIController(object):
     def perform(self, params):
         self._app()
         action = str(params.get("action", ""))
-        if action not in ("open_window", "focus", "close", "activate", "set_value", "select", "set_cell", "select_text"):
+        if action not in ("open_window", "focus", "close", "activate", "set_value", "select", "set_cell", "select_text", "draw"):
             raise ValueError("ui-unsupported-action: use a typed application UI operation")
         args = params.get("arguments") or {}
         if not isinstance(args, dict):
@@ -408,6 +412,29 @@ class ApplicationUIController(object):
             obj.ensureCursorVisible()
         elif action == "set_value":
             self._set_value(obj, args.get("value"))
+        elif action == "draw":
+            if obj.objectName() != "aiAnnotationCanvas":
+                raise ValueError("ui-not-annotation-canvas: draw requires the inspected RT annotation canvas")
+            points = args.get("points")
+            if not isinstance(points, list) or not 2 <= len(points) <= 256:
+                raise ValueError("ui-invalid-stroke: provide 2 to 256 normalized image points")
+            for point in points:
+                if (not isinstance(point, list) or len(point) != 2 or
+                        any(not 0 <= _number(value) <= 1 for value in point)):
+                    raise ValueError("ui-invalid-stroke: coordinates must be finite and inside [0,1]")
+            obj.repaint()
+            rect = obj.property("annotationImageRect")
+            if not isinstance(rect, list) or len(rect) != 4 or rect[2] <= 0 or rect[3] <= 0:
+                raise ValueError("ui-annotation-not-ready: inspect the visible canvas after its image is ready")
+            for index, point in enumerate(points):
+                position = QtCore.QPointF(rect[0] + point[0] * rect[2], rect[1] + point[1] * rect[3])
+                kind = QtCore.QEvent.MouseButtonPress if index == 0 else QtCore.QEvent.MouseMove
+                button = QtCore.Qt.LeftButton if index == 0 else QtCore.Qt.NoButton
+                app.sendEvent(obj, QtGui.QMouseEvent(kind, position, button, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier))
+            app.sendEvent(obj, QtGui.QMouseEvent(QtCore.QEvent.MouseButtonRelease, position,
+                          QtCore.Qt.LeftButton, QtCore.Qt.NoButton, QtCore.Qt.NoModifier))
+            obj.repaint()
+            return {"targetId": target_id, "strokeCount": obj.property("annotationStrokeCount")}
         return {"targetId": target_id}
 
     def _set_value(self, obj, value):
@@ -443,6 +470,7 @@ class ApplicationUIController(object):
                 if not obj.hasAcceptableInput():
                     obj.setText(previous)
                     raise ValueError("ui-invalid-input: value does not satisfy the control's validator")
+                obj.textEdited.emit(value)
                 obj.editingFinished.emit()
             else:
                 obj.setPlainText(value)

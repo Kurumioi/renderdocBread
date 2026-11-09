@@ -1,16 +1,74 @@
 """Bounded request-level negotiation for user-selected OpenAI-compatible hosts.
 
-Only rejected requests can negotiate. A streamed token, network ambiguity,
-authentication failure or model error never restarts a request/Agent/tool turn.
+Only rejected requests can negotiate. Transient failures can retry a model
+invocation, where a fresh callback run isolates any discarded stream chunks.
 """
 from __future__ import annotations
+import asyncio
 from typing import Any
 import logging
+import math
+import random
+import time
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit
+from copy import deepcopy
+
+from ..provider_diagnostics import provider_failure_metadata
 
 _OPTIONAL = frozenset({"temperature", "top_p", "seed", "store", "reasoning",
                       "reasoning_effort", "stream_options", "parallel_tool_calls", "user"})
 _TYPES: dict[type, type] = {}
+PROVIDER_RETRY_ATTEMPT = "bread_provider_retry_attempt"
+
+
+def _retry_delay(error: Exception, attempt: int) -> float | None:
+    if not provider_failure_metadata(error)["retryable"]:
+        return None
+    response = getattr(error, "response", None)
+    headers = response.headers if response is not None else {}
+    if headers.get("x-should-retry") == "false":
+        return None
+    try:
+        if headers.get("retry-after-ms") is not None:
+            delay = float(headers["retry-after-ms"]) / 1000
+        else:
+            value = headers.get("retry-after", "")
+            try:
+                delay = float(value)
+            except ValueError:
+                delay = parsedate_to_datetime(value).timestamp() - time.time()
+    except (ValueError, TypeError, OSError, OverflowError):
+        delay = 0
+    if math.isfinite(delay) and delay > 0:
+        return delay if delay <= 120 else None
+    return min(2 ** attempt, 8) * random.uniform(0.75, 1.0)
+
+
+def _retry_config(config, attempt: int):
+    from langchain_core.runnables.config import ensure_config
+
+    updated = ensure_config(config)
+    updated.pop("run_id", None)
+    updated["metadata"][PROVIDER_RETRY_ATTEMPT] = attempt
+    return updated
+
+
+def portable_function_schemas(tools):
+    """Adapt only model-facing regex metadata; the actual tool keeps its validator."""
+    result=deepcopy(tools)
+    def visit(value):
+        if isinstance(value,dict):
+            pattern=value.get('pattern')
+            if isinstance(pattern,str) and any(token in pattern for token in ('(?=','(?!','(?<=','(?<!')):
+                value.pop('pattern')
+                value['description']=(str(value.get('description')or'')+
+                    '\nThe tool validates this value against the pattern: '+pattern).strip()
+            for child in value.values():visit(child)
+        elif isinstance(value,list):
+            for child in value:visit(child)
+    visit(result)
+    return result
 
 
 def _repair(error, config, rejected, attempted):
@@ -73,6 +131,36 @@ def compatible_chat_model(model_type, config: dict[str, Any]):
             _bread_config: dict = PrivateAttr(default_factory=dict)
             _bread_rejected: set = PrivateAttr(default_factory=set)
             _bread_delegate: Any = PrivateAttr(default=None)
+            _bread_max_retries: int = PrivateAttr(default=0)
+
+            async def ainvoke(self, input, config=None, **kwargs):
+                # The graph receives only the successful model message. Existing tool
+                # results are inputs to this call and are never executed by this loop.
+                for attempt in range(self._bread_max_retries + 1):
+                    try:
+                        return await super().ainvoke(input, config=config, **kwargs)
+                    except Exception as error:
+                        delay = _retry_delay(error, attempt) if attempt < self._bread_max_retries else None
+                        if delay is None:
+                            raise
+                        await asyncio.sleep(delay)
+                        config = _retry_config(config, attempt + 1)
+
+            def invoke(self, input, config=None, **kwargs):
+                for attempt in range(self._bread_max_retries + 1):
+                    try:
+                        return super().invoke(input, config=config, **kwargs)
+                    except Exception as error:
+                        delay = _retry_delay(error, attempt) if attempt < self._bread_max_retries else None
+                        if delay is None:
+                            raise
+                        time.sleep(delay)
+                        config = _retry_config(config, attempt + 1)
+
+            def bind_tools(self, tools, **kwargs):
+                from langchain_core.utils.function_calling import convert_to_openai_tool
+                converted=[convert_to_openai_tool(tool,strict=kwargs.get('strict'))for tool in tools]
+                return super().bind_tools(portable_function_schemas(converted),**kwargs)
 
             def _selection_key(self):
                 c = self._bread_config
@@ -81,6 +169,9 @@ def compatible_chat_model(model_type, config: dict[str, Any]):
                         tuple(sorted(self._bread_rejected)))
 
             def _negotiate(self, error, attempted):
+                # Azure deployment routes retain their configured endpoint/version.
+                if not self._bread_config.get('base_url'):
+                    return False
                 repair = _repair(error, self._bread_config, self._bread_rejected, attempted)
                 if repair is None:
                     return False
@@ -157,6 +248,10 @@ def compatible_chat_model(model_type, config: dict[str, Any]):
                             raise
 
         adapter_type = _TYPES[model_type] = CompatibleOpenAI
-    model = adapter_type(**config)
-    model._bread_config = dict(config)
+    # The SDK retries all HTTP 429s before it reads their error codes. Own the
+    # budget here so quota errors stop immediately and SSE errors can be retried.
+    sdk_config = dict(config, max_retries=0)
+    model = adapter_type(**sdk_config)
+    model._bread_config = sdk_config
+    model._bread_max_retries = config.get("max_retries", 0)
     return model

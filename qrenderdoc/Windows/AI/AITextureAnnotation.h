@@ -31,6 +31,8 @@
 #include <functional>
 
 class AIAnnotationCanvas;
+class QGridLayout;
+class QLabel;
 
 // An immutable display snapshot plus a separate vector overlay. No drawing touches replay data.
 class AITextureAnnotation : public QWidget
@@ -40,7 +42,15 @@ public:
   using Accept = std::function<bool(const QImage &, const QImage &, const QJsonObject &)>;
   AITextureAnnotation(const QImage &image, const QString &title, const QJsonObject &context,
                       Accept accept, std::function<void()> close, QWidget *parent = NULL);
+  // Preserve the live texture's apparent size and position, in global logical pixels.
+  void SetImageViewRect(const QRectF &globalImageRect);
+
+protected:
+  void resizeEvent(QResizeEvent *event) override;
 
 private:
   AIAnnotationCanvas *m_Canvas = NULL;
+  QGridLayout *m_Header = NULL;
+  QWidget *m_Toolbar = NULL;
+  QLabel *m_Hint = NULL;
 };

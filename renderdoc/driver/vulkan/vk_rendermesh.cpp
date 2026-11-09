@@ -477,9 +477,20 @@ void VulkanReplay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &seco
 
   VkDevice dev = m_pDriver->GetDev();
   GPUBuffer &componentVB = m_MeshRender.ComponentHighlightVB;
-  if(!components.vertices.empty() && componentVB.UnwrappedBuffer() == VK_NULL_HANDLE)
-    componentVB.Create(m_pDriver, dev, sizeof(FloatVector) * MaxMeshComponentHighlightVertices, 4,
+  const VkDeviceSize componentBytes = components.vertices.byteSize();
+  if(componentBytes && (componentVB.UnwrappedBuffer() == VK_NULL_HANDLE ||
+                        componentBytes > componentVB.TotalSize() / componentVB.GetRingCount()))
+  {
+    if(componentVB.UnwrappedBuffer() != VK_NULL_HANDLE)
+    {
+      m_pDriver->SubmitCmds();
+      m_pDriver->FlushQ();
+      componentVB.Destroy();
+      componentVB = GPUBuffer();
+    }
+    componentVB.Create(m_pDriver, dev, AlignUp(componentBytes, VkDeviceSize(64 * 1024)), 4,
                        GPUBuffer::eGPUBufferVBuffer);
+  }
   VkCommandBuffer cmd = m_pDriver->GetNextCmd();
   const VkDevDispatchTable *vt = ObjDisp(dev);
 
@@ -515,11 +526,7 @@ void VulkanReplay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &seco
   VkViewport viewport = {0.0f, 0.0f, (float)m_DebugWidth, (float)m_DebugHeight, 0.0f, 1.0f};
   vt->CmdSetViewport(Unwrap(cmd), 0, 1, &viewport);
 
-  float nearPlane = cfg.cam ? ((Camera *)cfg.cam)->GetNear() : 0.1f;
-  float farPlane = cfg.cam ? ((Camera *)cfg.cam)->GetFar() : 100000.0f;
-
-  Matrix4f projMat =
-      Matrix4f::Perspective(90.0f, nearPlane, farPlane, float(m_DebugWidth) / float(m_DebugHeight));
+  Matrix4f projMat = Camera::MeshProjection(cfg.cam, float(m_DebugWidth) / float(m_DebugHeight));
   Matrix4f InvProj = projMat.Inverse();
 
   Matrix4f camMat = cfg.cam ? ((Camera *)cfg.cam)->GetMatrix() : Matrix4f::Identity();
@@ -1039,11 +1046,14 @@ void VulkanReplay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &seco
     helper.topology = points ? Topology::TriangleList : components.topology;
     cache = GetDebugManager()->CacheMeshDisplayPipelines(m_MeshRender.PipeLayout, helper, helper);
     meshUniforms.mvp = components.DepthBiasedTransform(
-        projMat.Mul(camMat.Mul(cfg.position.unproject ? guessProjInv : axisMapMat)));
+        projMat.Mul(camMat.Mul(cfg.position.unproject ? guessProjInv : axisMapMat)), cfg.cam);
     meshUniforms.homogenousInput = cfg.position.unproject;
     meshUniforms.color = Vec4f(1.0f, 0.36f, 0.035f, 1.0f);
     if(points)
-      meshUniforms.pointSpriteSize = Vec2f(-500.0f / m_DebugWidth, 500.0f / m_DebugHeight);
+    {
+      meshUniforms.pointSpriteSize = Vec2f(-800.0f / m_DebugWidth, 800.0f / m_DebugHeight);
+      meshUniforms.componentSelectedVertices = components.selectedVertices;
+    }
     MeshUBOData *data = (MeshUBOData *)m_MeshRender.UBO.Map(&dynOffs[0]);
     if(!data)
       return;

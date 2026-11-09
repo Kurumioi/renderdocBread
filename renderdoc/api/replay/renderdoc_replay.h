@@ -2381,9 +2381,26 @@ extern "C" RENDERDOC_API ICamera *RENDERDOC_CC RENDERDOC_InitCamera(CameraType t
 #if !defined(SWIG)
 // Independent of the table's single-row highlight. Point selections contain six copies
 // of each position, expanded into screen-space quads by the mesh vertex shader.
-constexpr uint32_t MaxMeshComponentHighlightVertices = 65532;
 extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_SetMeshComponentHighlight(
     IReplayOutput *output, const FloatVector *vertices, uint32_t count, Topology topology);
+
+// In point mode, unselected point sprites can follow the selected sprites in the same batch.
+extern "C" RENDERDOC_API void RENDERDOC_CC
+RENDERDOC_SetMeshComponentOverlay(IReplayOutput *output, const FloatVector *vertices,
+                                  uint32_t count, Topology topology, uint32_t selectedVertices);
+
+extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_SetMeshPreviewOrbit(ICamera *camera, float yaw,
+                                                                         float pitch);
+
+// Apply a pointer orbit step to the current mesh preview orientation. Angles are radians.
+// Use the same inverted flag throughout a drag, determined from the camera's initial up vector.
+extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_RotateMeshPreviewOrbit(ICamera *camera, float yaw,
+                                                                         float pitch, bool inverted);
+extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_SetMeshPreviewFov(ICamera *camera,
+                                                                       float degrees);
+// Column-major transform from the mesh position attribute to preview world space.
+extern "C" RENDERDOC_API void RENDERDOC_CC
+RENDERDOC_GetMeshPreviewModelTransform(const MeshDisplay &config, GraphicsAPI api, float *transform);
 
 // Column-major transform for the native mesh preview, with Y up and Z in [0, 1].
 extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_GetMeshPreviewTransform(

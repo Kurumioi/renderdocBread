@@ -11,6 +11,17 @@ from PySide2 import QtCore, QtGui, QtWidgets
 import renderdoc as rd
 
 
+class SurfaceEvents(QtCore.QObject):
+    def __init__(self):
+        super().__init__()
+        self.changes = []
+
+    def eventFilter(self, watched, event):
+        if event.type() in (QtCore.QEvent.Hide, QtCore.QEvent.Show):
+            self.changes.append((watched.objectName(), int(event.type())))
+        return False
+
+
 class Probe:
     def __init__(self):
         self.root = Path(os.environ['RD_ANNOTATION_RUN'])
@@ -112,12 +123,36 @@ c=IPCClient(timeout=110)
 
         checks = self.result['checks']
         native_mode = mode.currentIndex()
+        toolbar = view.findChild(QtWidgets.QWidget, 'meshComponentToolbar')
+        assert toolbar and toolbar.isVisible()
+        assert toolbar.mapToGlobal(QtCore.QPoint(0, 0)).y() < viewport.mapToGlobal(QtCore.QPoint(0, 0)).y()
+        checks['toolbarAboveMesh'] = True
         for name, vertices in (('Face', 3), ('Point', 6), ('Edge', 2)):
             button = view.findChild(QtWidgets.QToolButton, 'meshUV' + name)
             self.keep.append(button)
             assert not button.icon().isNull() and button.toolTip() and button.isVisible()
+            assert button.parentWidget() == toolbar
             button.click()
+            self.key(atlas, QtCore.Qt.Key_A, QtCore.Qt.AltModifier)
+            if name == 'Point':
+                assert native.property('uvPointMarkers') > 0
+                before_point = atlas.grab().toImage()
             atlas_hit = hit(atlas)
+            if name == 'Point':
+                after_point = atlas.grab().toImage()
+                pixels = []
+                for y in range(after_point.height()):
+                    for x in range(after_point.width()):
+                        p = after_point.pixelColor(x, y)
+                        if (p.red() > 220 and 130 < p.green() < 190 and p.blue() < 80 and
+                                after_point.pixel(x, y) != before_point.pixel(x, y)):
+                            pixels.append((x, y))
+                assert pixels
+                w = max(x for x, _ in pixels) - min(x for x, _ in pixels) + 1
+                h = max(y for _, y in pixels) - min(y for _, y in pixels) + 1
+                assert 0.7 < w / h < 1.4, (w, h)
+                checks['roundUvPoint'] = dict(width=w, height=h,
+                                               unselected3DMarkers=native.property('uvPointMarkers'))
             assert native.property('uvHighlightedVertices') == vertices
             assert mode.currentIndex() == native_mode and native.isVisible()
             self.key(atlas, QtCore.Qt.Key_A, QtCore.Qt.AltModifier)
@@ -128,6 +163,31 @@ c=IPCClient(timeout=110)
             checks[name] = dict(uvToMesh=True, meshToUV=True, nativeViewportPreserved=True,
                                 uvPixel=[atlas_hit.x(), atlas_hit.y()],
                                 meshPixel=[native_hit.x(), native_hit.y()])
+
+        view.findChild(QtWidgets.QToolButton, 'meshUVFace').click()
+        hit(viewport)
+        before_vertices = native.property('uvHighlightedVertices')
+        assert before_vertices == 3
+        view.findChild(QtWidgets.QToolButton, 'meshUVPoint').click()
+        assert atlas.property('uvSelectionCount') == 3
+        view.findChild(QtWidgets.QToolButton, 'meshUVEdge').click()
+        assert atlas.property('uvSelectionCount') == 3
+        view.findChild(QtWidgets.QToolButton, 'meshUVFace').click()
+        assert atlas.property('uvSelectionCount') == 1
+        primary = view.findChild(QtWidgets.QTableView, 'inTable')
+        output = view.findChild(QtWidgets.QTableView, 'out1Table')
+        self.keep.extend([primary, output])
+        selected_rows = lambda table: sorted(i.row() for i in table.selectionModel().selectedRows())
+        assert len(selected_rows(primary)) >= 3
+        assert selected_rows(primary) == selected_rows(output)
+        row = selected_rows(primary)[0]
+        primary.selectRow(row)
+        assert view.findChild(QtWidgets.QToolButton, 'meshUVPoint').isChecked()
+        assert atlas.property('uvSelectionCount') == 1
+        assert selected_rows(primary) == selected_rows(output)
+        primary.clearSelection()
+        assert atlas.property('uvSelectionCount') == 0 and not selected_rows(output)
+        checks['componentConversionAndTables'] = True
 
         zooms = []
         for dx, dy, px, py in ((0, 120, 0, 0), (120, 0, 0, 0), (0, 0, 0, 40)):
@@ -173,6 +233,43 @@ c=IPCClient(timeout=110)
         checks['meshBoxSelection'] = True
         self.key(viewport, QtCore.Qt.Key_A, QtCore.Qt.AltModifier)
         self.key(viewport, QtCore.Qt.Key_B)
+
+        cursor_probe = os.getenv('RD_MESH_CURSOR_TEST_DLL')
+        if cursor_probe:
+            import ctypes
+            cursor_library = ctypes.WinDLL(cursor_probe)
+            set_cursor = cursor_library.setMeshProbeCursor
+            set_cursor.argtypes = (ctypes.c_int, ctypes.c_int)
+            set_cursor.restype = ctypes.c_int
+
+            def focus_under_pointer(widget):
+                cursor = widget.mapToGlobal(widget.rect().center())
+                assert set_cursor(cursor.x(), cursor.y())
+                assert QtGui.QCursor.pos() == cursor
+                key = QtGui.QKeyEvent(QtCore.QEvent.KeyPress, QtCore.Qt.Key_F, QtCore.Qt.NoModifier)
+                key.ignore()
+                self.app.sendEvent(self.window, key)
+                assert key.isAccepted()
+
+            hit(atlas)
+            previous_zoom = atlas.property('uvZoom')
+            focus_under_pointer(atlas)
+            uv_zoom = atlas.property('uvZoom')
+            assert uv_zoom != previous_zoom
+            focus_under_pointer(viewport)
+            assert atlas.property('uvZoom') == uv_zoom
+            checks['followsPointerWithFocusElsewhere'] = True
+
+        fov = view.findChild(QtWidgets.QSlider, 'cameraFov')
+        fov_value = view.findChild(QtWidgets.QLabel, 'cameraFovValue')
+        self.keep.extend([fov, fov_value, toolbar])
+        previous_fov = fov.value()
+        assert (fov.minimum(), fov.maximum()) == (1, 130)
+        for value in (1, 60, 130):
+            fov.setValue(value)
+            assert str(value) in fov_value.text() and mode.currentIndex() == native_mode
+        fov.setValue(previous_fov)
+        checks['fovSlider'] = True
 
     def tick(self):
         try:
@@ -271,6 +368,7 @@ link=save_navigation_target(observed['target'],ctx['capture'])
                 wireframe.setChecked(False)
                 self.native_state = (view, atlas, native, mode, wireframe)
                 self.textured_view = mesh
+                self.texture_picker = texture
                 self.phase = 'texture-wire-off'
             elif self.phase == 'texture-wire-off':
                 if self.textured_view.property('uvWireframeRendered'):
@@ -283,7 +381,26 @@ link=save_navigation_target(observed['target'],ctx['capture'])
                 view, atlas, native, mode, wireframe = self.native_state
                 assert self.textured_view.isVisible() and not native.isVisible()
                 self.result['checks'] = dict(gpuTexture=True, texturedWireframe=True)
-                wireframe.setChecked(False)
+                self.surface_events = SurfaceEvents()
+                native.installEventFilter(self.surface_events)
+                self.textured_view.installEventFilter(self.surface_events)
+                self.texture_key = self.textured_view.property('uvTextureKey')
+                self.assert_texture_surface(native)
+                index = self.texture_picker.currentIndex()
+                other = index % (self.texture_picker.count() - 1) + 1
+                for target in (other, index, other):
+                    self.texture_picker.setCurrentIndex(target)
+                    self.assert_texture_surface(native)
+                self.phase = 'texture-switch'
+            elif self.phase == 'texture-switch':
+                view, atlas, native, mode, wireframe = self.native_state
+                self.assert_texture_surface(native)
+                if self.textured_view.property('uvTextureKey') == self.texture_key:
+                    return
+                self.result['checks']['textureSwitchWithoutSurfaceChanges'] = True
+                native.removeEventFilter(self.surface_events)
+                self.textured_view.removeEventFilter(self.surface_events)
+                wireframe.setChecked(True)
                 mode.setCurrentIndex(int(rd.Visualisation.Solid))
                 self.phase = 'native-view'
             elif self.phase == 'native-view':
@@ -303,9 +420,121 @@ data=c.call('inspect_vertex_effect_scope',dict(event_id=1310,observation_event_i
                 if self.worker.returncode:
                     raise RuntimeError((self.root/'vertex-scope-worker.log').read_text(encoding='utf-8'))
                 self.result['vertexScope'] = json.loads((self.root/'vertex-scope.json').read_text(encoding='utf-8'))
+                table = self.native_state[0].findChild(QtWidgets.QTableView, 'inTable')
+                self.evidence_indices = sorted({int(table.model().index(row, 1).data()) for row in range(3)})
+                self.result['evidenceIndices'] = self.evidence_indices
+                pyrenderdoc.SetEventID([], 1326, 1326, True)
+                self.start_worker('expected='+repr(self.evidence_indices)+"\n"+"""
+from src import server
+server.ipc=c
+before=c.call('get_current_renderdoc_context',{})['events']
+omitted=json.loads(server.capture_mesh_uv_evidence(event_id=1291,inline=False)[0])
+assert omitted['textureSelectionRequired']and 66250 in omitted['textureResourceIds'],omitted
+assert c.call('get_current_renderdoc_context',{})['events']==before
+blocks=server.capture_mesh_uv_evidence(event_id=1291,stage='vs-in',channel='_input1',
+    texture_resource_id=4047,selection_mode='point',selected_vertices=expected,inline=False)
+result=json.loads(blocks[0])
+assert result.get('ready'),result
+assert result['channel']=='_input1' and result['navigation']['target']['channel']=='_input1',result
+assert set(result['selectedVertices'])==set(expected),result
+assert len(result['images'])==2 and result['images'][0]['sha256']!=result['images'][1]['sha256']
+assert set(result['navigation']['target']['selectedVertices'])==set(result['selectedVertices'])
+from PIL import Image
+for image in result['images']:
+    with Image.open(image['path']) as im:assert im.width>60 and im.height>60
+cases=[result.copy()]
+for mode in ('face','edge'):
+    answer=json.loads(server.capture_mesh_uv_evidence(event_id=1291,stage='vs-in',channel='_input1',
+        texture_resource_id=4047,selection_mode=mode,selected_vertices=expected,inline=False)[0])
+    assert answer.get('ready') and answer['selectedCount']>0,answer
+    assert answer['navigation']['target']['selectedElements']==sorted(answer['selectedElements'],key=int)
+    cases.append(answer)
+result['selectionCases']=cases
+feature=json.loads(server.capture_mesh_uv_evidence(event_id=1291,stage='vs-in',channel='_input1',
+    texture_resource_id=66250,selection_mode='face',selected_elements=['18'],
+    selection_expansion='connected',inline=False)[0])
+assert feature.get('ready')and feature['selectedCount']>1,feature
+assert feature['meshTextureRendered']and feature['uvTextureRendered']and feature['textureName'],feature
+assert feature['visualCard']['caption']==feature['textureName']
+assert feature['selectionComplete']and len(feature['detailImages'])==2,feature
+assert feature['visualCard']['type']=='mesh-uv'
+assert feature['visualCard']['annotations']and feature['visualCard']['secondAnnotations']
+assert len(feature['navigation']['target']['selectedElements'])==feature['selectedCount']
+result['feature']=feature
+region=json.loads(server.capture_mesh_uv_evidence(event_id=1291,stage='vs-in',channel='_input1',
+    texture_resource_id=66250,selection_mode='face',uv_bounds=[.5,0.,1.,.1],
+    include_details=False,inline=False)[0])
+assert region.get('ready')and region['selectedCount']>=feature['selectedCount'],region
+assert set(feature['selectedVertices'])<=set(region['selectedVertices']),region
+result['uvRegionCount']=region['selectedCount']
+untextured=json.loads(server.capture_mesh_uv_evidence(event_id=1291,stage='vs-in',channel='_input1',
+    texture_resource_id=0,selection_mode='face',selected_elements=[str(i)for i in range(34)],
+    view_angles=[-90.,-90.,-90.],inline=False)[0])
+assert untextured.get('ready')and untextured['selectedCount']==34,untextured
+with Image.open(untextured['images'][0]['path'])as image:assert min(image.size)>=300,image.size
+untextured['fullFeature']=True
+result['selectionCases'].append(untextured)
+result['untexturedFeature']=untextured
+large=json.loads(server.capture_mesh_uv_evidence(event_id=1291,stage='vs-in',channel='_input1',
+    texture_resource_id=66250,selection_mode='edge',uv_bounds=[-10.,-10.,10.,10.],
+    framing='preserve',include_details=False,inline=False)[0])
+assert large.get('ready')and large['selectedCount']>4096,large
+assert large['selectionComplete']and not large['selectionListComplete'],large
+assert len(large['selectedElements'])<=64 and 'selectionKeyData'not in large['navigation']['target'],large
+from src.visual_replies import root_path
+target_file=root_path()/'targets'/(large['navigation']['id']+'.json')
+saved=json.loads(target_file.read_text(encoding='utf-8'))['target']
+assert saved['selectionKeyData'].startswith('v1:')and saved['selectedCount']==large['selectedCount']
+large['expectedPackedSelection']=saved['selectionKeyData']
+result['selectionCases'].append(large)
+result['largeSelectionCount']=large['selectedCount']
+(root/'native-evidence.json').write_text(json.dumps(result,indent=2),encoding='utf-8')
+""", 'native-evidence-worker')
+                self.phase = 'native-evidence'
+            elif self.phase == 'native-evidence':
+                if self.worker.poll() is None:
+                    return
+                self.worker_log.close()
+                if self.worker.returncode:
+                    raise RuntimeError((self.root/'native-evidence-worker.log').read_text(encoding='utf-8'))
+                self.result['nativeEvidence'] = json.loads((self.root/'native-evidence.json').read_text(encoding='utf-8'))
+                self.evidence_cases = list(self.result['nativeEvidence']['selectionCases'])
+                # Reopen the returned link after clearing; it must restore real component IDs.
+                view, atlas, native, mode, wireframe = self.native_state
+                self.key(atlas, QtCore.Qt.Key_A, QtCore.Qt.AltModifier)
+                assert atlas.property('uvSelectionCount') == 0
+                pyrenderdoc.SetEventID([], 1326, 1326, True)
+                self.evidence_case = self.evidence_cases.pop(0)
+                self.link(self.evidence_case['navigation']['url'])
+                self.phase = 'evidence-navigation'
+            elif self.phase == 'evidence-navigation':
+                view = pyrenderdoc.GetMeshPreview().Widget()
+                value = view.property('meshEvidence')
+                if not value or not value.get('ready'):
+                    return
+                assert value['selectionMode'] == self.evidence_case['selectionMode']
+                if 'expectedPackedSelection' in self.evidence_case:
+                    assert value['selectedCount']==self.evidence_case['selectedCount']
+                    assert value['selectionKeyData']==self.evidence_case['expectedPackedSelection']
+                    self.result['checks']['completeLargeSelectionNavigation']=True
+                else:
+                    assert set(value['selectedVertices']) == set(self.evidence_case['selectedVertices'] if self.evidence_case.get('fullFeature') else self.evidence_indices)
+                    assert set(value['selectedElements']) == set(self.evidence_case['selectedElements'])
+                if self.evidence_cases:
+                    self.evidence_case = self.evidence_cases.pop(0)
+                    pyrenderdoc.SetEventID([], 1326, 1326, True)
+                    self.link(self.evidence_case['navigation']['url'])
+                    return
+                self.result['checks']['nativeMeshUVImagesAndSelectionLink'] = True
+                self.result['checks']['fullConnectedFeatureAndPairedContext']=self.result['nativeEvidence']['feature']['selectedCount']>1
                 self.finish()
         except Exception:
             self.finish(traceback.format_exc())
+
+    def assert_texture_surface(self, native):
+        assert self.textured_view.isVisible() and not native.isVisible()
+        assert self.textured_view.property('uvTextureRendered')
+        assert not self.surface_events.changes, self.surface_events.changes
 
     def open_uv_link(self):
         link = json.loads((self.root/'uv-link.json').read_text(encoding='utf-8'))

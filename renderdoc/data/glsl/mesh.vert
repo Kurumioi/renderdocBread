@@ -191,9 +191,12 @@ void main(void)
 
   gl_Position = Mesh.mvp * pos;
   const int corners[6] = int[](0, 1, 2, 2, 1, 3);
-  int spriteCorner = Mesh.pointSpriteSize.x < 0.0f ? corners[VERTEX_ID % 6] : VERTEX_ID % 4;
-  gl_Position.xy += abs(Mesh.pointSpriteSize.xy) * 0.01f * psprite[spriteCorner] * gl_Position.w;
-  vsout_secondary = vec4(secondary);
+  bool componentPoint = Mesh.pointSpriteSize.x < 0.0f;
+  bool marker = componentPoint && uint(VERTEX_ID) >= Mesh.componentSelectedVertices;
+  vec2 sprite = psprite[componentPoint ? corners[VERTEX_ID % 6] : VERTEX_ID % 4];
+  gl_Position.xy +=
+      abs(Mesh.pointSpriteSize.xy) * (marker ? 0.0045f : 0.01f) * sprite * gl_Position.w;
+  vsout_secondary = componentPoint ? vec4(sprite, marker ? 1.0f : 0.0f, 0.0f) : secondary;
   vsout_norm = vec4(0, 0, 1, 1);
 
 #ifdef VULKAN

@@ -21,6 +21,100 @@ from replaylab_agent.profiles import Profile
 from replaylab_agent.skill_gateway import SkillGateway
 
 
+@pytest.mark.asyncio
+async def test_real_sdk_internal_model_metadata_survives_event_stream():
+    from langchain.agents.middleware.internal_call_transformer import internal_call_metadata
+    from langchain_core.runnables import RunnableLambda
+    from replaylab_agent.deep_engine import _internal_model_event
+
+    model = FakeMessagesListChatModel(responses=[AIMessage(content="Internal compaction note"),
+                                                AIMessage(content="Public answer")])
+    async def calls(_):
+        await model.ainvoke("compact", config={"metadata": {
+            "lc_source": "summarization", **internal_call_metadata()}})
+        return await model.ainvoke("answer")
+    events = [event async for event in RunnableLambda(calls).astream_events("test", version="v2")]
+    endings = [event for event in events if event['event'] == 'on_chat_model_end']
+    assert len(endings) == 2
+    assert _internal_model_event(endings[0])
+    assert not _internal_model_event(endings[1])
+    assert _internal_model_event({'metadata': internal_call_metadata()})
+    assert not _internal_model_event({'metadata': {'lc_internal_call': 'untrusted-marker'}})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exhausted", [False, True])
+async def test_api_responses_stream_failure_after_tool_preserves_completed_work(tmp_path, monkeypatch, exhausted):
+    import httpx
+    from langchain_openai import ChatOpenAI
+    from replaylab_agent.connectors.openai_compatibility import compatible_chat_model
+
+    requests, effects = [], []
+    function = dict(type="function_call", id="fc-evidence", call_id="call-evidence",
+                    name="inspect_event", arguments='{"event_id":5832}', status="completed")
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        index = len(requests)
+        assert request.url.path == "/v1/responses" and requests[-1]["stream"] is True
+        if index == 1:
+            events = [dict(type="response.output_item.added", output_index=0, item=function)]
+            output = [function]
+        elif index == 2:
+            events = [dict(type="response.output_text.delta", output_index=0, content_index=0,
+                           item_id="msg-abandoned", delta="Abandoned draft"),
+                      dict(type="error", error={"message": "You have no credits remaining." if exhausted
+                                                else "An error occurred while processing the request."})]
+            output = None
+        else:
+            events = [dict(type="response.output_text.delta", output_index=0, content_index=0,
+                           item_id="msg-final", delta="Verified result")]
+            output = [dict(type="message", id="msg-final", role="assistant", status="completed",
+                           content=[dict(type="output_text", text="Verified result", annotations=[])])]
+        if output is not None:
+            events.append(dict(type="response.completed", response=dict(id=f"resp-{index}", object="response",
+                               model="offline", created_at=1, status="completed", output=output)))
+        stream = "".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events)
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=stream)
+
+    async def inspect_event(event_id: int) -> str:
+        effects.append(event_id)
+        return "Saved evidence from event 5832"
+
+    tool = _langchain_tool("inspect_event", inspect_event, description="Save verified event evidence.",
+        args_schema={"type": "object", "properties": {"event_id": {"type": "integer"}}, "required": ["event_id"]})
+
+    @asynccontextmanager
+    async def session(*args):
+        yield {"inspect_event": tool}
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        model = compatible_chat_model(ChatOpenAI, dict(model="offline", api_key="fixture-key",
+            base_url="https://api.invalid/v1", use_responses_api=True, max_retries=2, http_async_client=client))
+        engine = DeepAgentsEngine(catalog=_catalog(tmp_path),
+            config=OrchestratorConfig(event_root=tmp_path / "events", workspace_base=tmp_path / "turns", log_root=tmp_path / "logs"),
+            deepagents_module=deepagents, tool_session_factory=session, model_factory=lambda *args: model)
+        result = await engine.run(RunRequest(prompt="Inspect event 5832", task_id="api-sse-recovery", instance_id="offline",
+            profile=Profile(id="offline", preset="openai", model="offline")))
+        model.root_client.close()
+    assert effects == [5832], result.error
+    assert len(requests) == (2 if exhausted else 3)
+    evidence = [item for item in requests[-1]["input"] if item.get("type") == "function_call_output"]
+    assert len(evidence) == 1 and evidence[0]["call_id"] == "call-evidence"
+    events = [json.loads(line) for line in (tmp_path / "events/api-sse-recovery.jsonl").read_text(encoding="utf-8").splitlines()]
+    if exhausted:
+        assert result.terminal_status == "failed"
+        assert events[-1]["data"]["errorCode"] == "provider-quota"
+    else:
+        assert requests[1] == requests[2]
+        assert result.terminal_status == "completed" and result.text == "Verified result", result.error
+        provider_text = ""
+        for event in events:
+            if event["kind"] == "message-delta" and event["data"].get("stream") == "provider":
+                provider_text = ("" if event["data"].get("reset") else provider_text) + event["text"]
+        assert provider_text == "Verified result"
+
+
 @pytest.fixture(autouse=True)
 def completed_general_review_for_framework_regressions(monkeypatch):
     """Keep these Skill/Shader/framework tests independent of generic review policy."""
@@ -575,5 +669,5 @@ async def test_capture_free_api_file_tools_confine_reads_and_writes_to_owned_roo
     assert backend.virtual_mode is True
     assert backend.cwd.parent.parent == (tmp_path / "turns").resolve()
     assert (backend.cwd / "notes" / "owned.txt").read_text(encoding="utf-8") == "OWNED PHYSICAL FILE"
-    assert "Local task outputs are retained" in result.text
+    assert "Local task outputs are retained" not in result.text
     assert all("execute" not in names for names in model.bound_tool_names)

@@ -446,19 +446,19 @@
 <context>
     <name>AIAssistant</name>
     <message>
-        <location filename="../Windows/AI/AIAssistant.cpp" line="+11328"/>
+        <location filename="../Windows/AI/AIAssistant.cpp" line="+11433"/>
         <source>Loading Skills...</source>
         <translation>正在加载技能……</translation>
     </message>
     <message>
-        <location line="-7085"/>
-        <location line="+7139"/>
+        <location line="-7189"/>
+        <location line="+7243"/>
         <source>Skills</source>
         <translation>技能</translation>
     </message>
     <message>
-        <location line="-7134"/>
-        <location line="+7163"/>
+        <location line="-7238"/>
+        <location line="+7267"/>
         <source>MCP servers</source>
         <translation>MCP 服务器</translation>
     </message>
@@ -517,12 +517,12 @@
         <translation>参数（每行一个）</translation>
     </message>
     <message>
-        <location line="-8178"/>
+        <location line="-8282"/>
         <source>Type @ to load a Skill or MCP server for this message (@skill:&lt;id&gt;, @mcp:&lt;id&gt;).</source>
         <translation>输入 @ 可为本条消息加载技能或 MCP 服务器（@skill:&lt;id&gt;、@mcp:&lt;id&gt;）。</translation>
     </message>
     <message>
-        <location line="-3240"/>
+        <location line="-3242"/>
         <source>SKIPPED</source>
         <translation>已跳过</translation>
     </message>
@@ -568,24 +568,24 @@
     </message>
     <message>
         <location line="+32"/>
-        <location line="+7687"/>
+        <location line="+7791"/>
         <source>Status</source>
         <translation>状态</translation>
     </message>
     <message>
-        <location line="-7686"/>
-        <location line="+7686"/>
+        <location line="-7790"/>
+        <location line="+7790"/>
         <source>Check</source>
         <translation>检查</translation>
     </message>
     <message>
-        <location line="-7685"/>
-        <location line="+7685"/>
+        <location line="-7789"/>
+        <location line="+7789"/>
         <source>Detail</source>
         <translation>详细信息</translation>
     </message>
     <message>
-        <location line="-7676"/>
+        <location line="-7780"/>
         <source>Selected detail (plain text; select or copy as needed):</source>
         <translation>所选详细信息（纯文本；可按需选择或复制）：</translation>
     </message>
@@ -631,12 +631,12 @@
     </message>
     <message>
         <location line="+1"/>
-        <location line="+7648"/>
+        <location line="+7752"/>
         <source>The diagnostic command did not complete successfully.</source>
         <translation>诊断命令未成功完成。</translation>
     </message>
     <message>
-        <location line="-7644"/>
+        <location line="-7748"/>
         <source>Connection check</source>
         <translation>连接检查</translation>
     </message>
@@ -647,35 +647,35 @@
     </message>
     <message>
         <location line="+4"/>
-        <location line="+7644"/>
+        <location line="+7748"/>
         <source>One or more checks failed. Review the details.</source>
         <translation>一项或多项检查失败。请查看详细信息。</translation>
     </message>
     <message>
-        <location line="-7641"/>
-        <location line="+7643"/>
+        <location line="-7745"/>
+        <location line="+7747"/>
         <source>Checks completed with warnings or skipped items.</source>
         <translation>检查已完成，但存在警告或跳过的项目。</translation>
     </message>
     <message>
-        <location line="-7640"/>
-        <location line="+7641"/>
+        <location line="-7744"/>
+        <location line="+7745"/>
         <source>All reported checks passed.</source>
         <translation>报告的所有检查均已通过。</translation>
     </message>
     <message>
-        <location line="-7639"/>
+        <location line="-7743"/>
         <source>Diagnostic information was returned.</source>
         <translation>已返回诊断信息。</translation>
     </message>
     <message>
         <location line="+15"/>
-        <location line="+7569"/>
+        <location line="+7673"/>
         <source>Copy All Details</source>
         <translation>复制全部详细信息</translation>
     </message>
     <message>
-        <location line="-5727"/>
+        <location line="-5836"/>
         <source>OpenAI API</source>
         <comment>provider.openai.title</comment>
         <translation>OpenAI API</translation>
@@ -989,7 +989,7 @@
         <translation>请在浏览器中完成提供商授权。</translation>
     </message>
     <message>
-        <location line="+126"/>
+        <location line="+130"/>
         <source>Child Agent started: %1</source>
         <comment>task.child.started</comment>
         <translation>子 Agent 已启动：%1</translation>
@@ -1019,29 +1019,29 @@
     <message>
         <location filename="../Windows/AI/AIAssistant.cpp" line="+38"/>
         <location line="+1"/>
-        <location line="+1905"/>
-        <location line="+224"/>
+        <location line="+1940"/>
+        <location line="+226"/>
         <location line="+47"/>
-        <location line="+1715"/>
-        <location line="+5939"/>
+        <location line="+1777"/>
+        <location line="+5955"/>
         <location line="+678"/>
         <location line="+41"/>
         <source>New conversation</source>
         <translation>新建对话</translation>
     </message>
     <message>
-        <location line="-10543"/>
+        <location line="-10658"/>
         <source>Starting...</source>
         <translation>正在启动…</translation>
     </message>
     <message>
-        <location line="+120"/>
-        <location line="+2737"/>
+        <location line="+123"/>
+        <location line="+2771"/>
         <source>Continue</source>
         <translation>继续</translation>
     </message>
     <message>
-        <location line="-2677"/>
+        <location line="-2711"/>
         <source>Ask Bread AI... (Enter sends; Shift+Enter inserts a new line)</source>
         <translation>询问 Bread AI…（Enter 发送；Shift+Enter 插入新行）</translation>
     </message>
@@ -1057,12 +1057,12 @@
     </message>
     <message>
         <location line="+22"/>
-        <location line="+3023"/>
+        <location line="+3057"/>
         <source>Stop the active chat request.</source>
         <translation>停止当前聊天请求。</translation>
     </message>
     <message>
-        <location line="-3022"/>
+        <location line="-3056"/>
         <source>Stop</source>
         <translation>停止</translation>
     </message>
@@ -1073,7 +1073,7 @@
         <translation>发送</translation>
     </message>
     <message>
-        <location line="+223"/>
+        <location line="+229"/>
         <source>AI host not found. Set REPLAYLAB_AI_CLI or install the bundled AI host.</source>
         <translation>找不到 AI 主机。请设置 REPLAYLAB_AI_CLI，或安装捆绑的 AI 主机。</translation>
     </message>
@@ -1083,7 +1083,7 @@
         <translation>Bread AI 已嵌入此处。提供商进程仍与回放进程隔离。</translation>
     </message>
     <message>
-        <location line="+1673"/>
+        <location line="+1701"/>
         <source>This capture already has %1 conversations. Delete one before creating another.</source>
         <translation>此捕获已有 %1 个对话。请先删除一个再新建。</translation>
     </message>
@@ -1098,8 +1098,8 @@
         <translation>删除此对话及其任务日志和临时文件？正在执行的请求将停止，已保存的抓帧和项目文件会保留。</translation>
     </message>
     <message>
-        <location line="-1713"/>
-        <location line="+1807"/>
+        <location line="-1741"/>
+        <location line="+1835"/>
         <source>The conversation was deleted, but some task files could not be cleaned up. Saved work was kept. %1</source>
         <translation>对话已删除，但部分任务文件未能清理。已保存的工作内容会保留。%1</translation>
     </message>
@@ -1149,12 +1149,12 @@
     </message>
     <message>
         <location line="+311"/>
-        <location line="+8178"/>
+        <location line="+8256"/>
         <source>Running</source>
         <translation>正在运行</translation>
     </message>
     <message>
-        <location line="-8164"/>
+        <location line="-8242"/>
         <source>%1 capture action(s) running</source>
         <translation>正在运行 %1 个捕获操作</translation>
     </message>
@@ -1165,11 +1165,12 @@
     </message>
     <message>
         <location line="+74"/>
+        <location line="+212"/>
         <source>The link is not an allowed RenderDoc navigation target.</source>
         <translation>该链接不是允许的 RenderDoc 导航目标。</translation>
     </message>
     <message>
-        <location line="+186"/>
+        <location line="+38"/>
         <source>Unknown RenderDoc panel link: %1</source>
         <translation>未知的 RenderDoc 面板链接：%1</translation>
     </message>
@@ -1179,12 +1180,12 @@
         <translation>RenderDoc 链接目标无效。</translation>
     </message>
     <message>
-        <location line="+158"/>
+        <location line="+159"/>
         <source>Conversation</source>
         <translation>对话</translation>
     </message>
     <message>
-        <location line="+112"/>
+        <location line="+113"/>
         <source>Interrupted when the capture closed</source>
         <translation>捕获关闭时已中断</translation>
     </message>
@@ -1199,12 +1200,7 @@
         <translation>存储的对话载荷使用了不受支持的架构。</translation>
     </message>
     <message>
-        <location line="+27"/>
-        <source>The stored conversation payload exceeds the 4 MiB limit.</source>
-        <translation>存储的对话载荷超过 4 MiB 限制。</translation>
-    </message>
-    <message>
-        <location line="+59"/>
+        <location line="+82"/>
         <source>Queued message was not run before the previous session ended</source>
         <translation>上一会话结束前，排队的消息尚未运行</translation>
     </message>
@@ -1214,7 +1210,7 @@
         <translation>为符合本地历史记录限制，恢复副本已被截断。</translation>
     </message>
     <message>
-        <location line="+168"/>
+        <location line="+170"/>
         <source>Capture: %1 | current EID %2 | selected EID %3</source>
         <translation>捕获：%1 | 当前 EID %2 | 已选 EID %3</translation>
     </message>
@@ -1224,16 +1220,16 @@
         <translation>未加载捕获 | 可使用常规聊天</translation>
     </message>
     <message>
-        <location line="-3813"/>
-        <location line="+446"/>
-        <location line="+3375"/>
-        <location line="+5612"/>
+        <location line="-3911"/>
+        <location line="+454"/>
+        <location line="+3465"/>
+        <location line="+5626"/>
         <location line="+267"/>
         <source>This action requires an open capture.</source>
         <translation>此操作需要打开一个捕获。</translation>
     </message>
     <message>
-        <location line="-10862"/>
+        <location line="-10981"/>
         <source>Tencent CodeBuddy / Hunyuan Subscription (ACP)</source>
         <comment>provider.codebuddy-acp.title</comment>
         <translation>腾讯 CodeBuddy / 混元订阅（ACP）</translation>
@@ -1257,7 +1253,7 @@
         <translation>请在 CodeBuddy 终端中选择“通过中国站登录”，使用拥有订阅套餐的账号完成浏览器登录流程，然后在身份验证成功后退出终端。</translation>
     </message>
     <message>
-        <location line="+222"/>
+        <location line="+226"/>
         <source>Queued</source>
         <comment>task.queued</comment>
         <translation>已排队</translation>
@@ -1275,7 +1271,7 @@
         <translation>智能体监视器</translation>
     </message>
     <message>
-        <location line="+222"/>
+        <location line="+225"/>
         <source>Add images or files</source>
         <translation>添加图片或文件</translation>
     </message>
@@ -1285,7 +1281,7 @@
         <translation>请添加一条消息，说明希望 AI 如何处理这些附件。</translation>
     </message>
     <message>
-        <location line="+272"/>
+        <location line="+280"/>
         <source>The attachment content or byte count is invalid.</source>
         <translation>附件内容或字节数无效。</translation>
     </message>
@@ -1330,7 +1326,7 @@
         <translation>所有文件 (*)</translation>
     </message>
     <message>
-        <location line="+336"/>
+        <location line="+359"/>
         <source>The attachment is empty: %1</source>
         <translation>附件为空：%1</translation>
     </message>
@@ -1369,12 +1365,12 @@
         <translation>剪贴板</translation>
     </message>
     <message>
-        <location line="+2721"/>
+        <location line="+2788"/>
         <source>No stage-scoped shader AI actions are available for this capture.</source>
         <translation>此捕获没有可用的面向特定着色器阶段的 AI 操作。</translation>
     </message>
     <message>
-        <location line="+293"/>
+        <location line="+297"/>
         <source>The AI host did not expose a running process for containment.</source>
         <translation>AI 主机未提供可纳入隔离管控的运行中进程。</translation>
     </message>
@@ -1409,18 +1405,18 @@
     <message>
         <location line="+35"/>
         <location line="+153"/>
-        <location line="+2562"/>
+        <location line="+2564"/>
         <source>AI host was not found</source>
         <translation>找不到 AI 主机</translation>
     </message>
     <message>
-        <location line="-2489"/>
-        <location line="+1916"/>
+        <location line="-2491"/>
+        <location line="+1918"/>
         <source>Command timed out</source>
         <translation>命令超时</translation>
     </message>
     <message>
-        <location line="-2024"/>
+        <location line="-2026"/>
         <source>Command failed with exit code %1</source>
         <translation>命令失败，退出代码为 %1</translation>
     </message>
@@ -1441,7 +1437,7 @@
         <translation>无法发送受保护的命令输入</translation>
     </message>
     <message>
-        <location line="+244"/>
+        <location line="+246"/>
         <source>%1 | API</source>
         <translation>%1 | API</translation>
     </message>
@@ -1451,12 +1447,12 @@
         <translation>%1 | 订阅</translation>
     </message>
     <message>
-        <location line="+25"/>
+        <location line="+26"/>
         <source>No connection configured</source>
         <translation>未配置连接</translation>
     </message>
     <message>
-        <location line="+35"/>
+        <location line="+34"/>
         <location line="+271"/>
         <location line="+2"/>
         <source>Provider default</source>
@@ -1518,18 +1514,18 @@
         <translation>检查连接</translation>
     </message>
     <message>
-        <location line="-5145"/>
+        <location line="-5249"/>
         <source>Conversation selection</source>
         <translation>对话中选中的内容</translation>
     </message>
     <message>
         <location line="+70"/>
-        <location line="+3069"/>
+        <location line="+3103"/>
         <source>Task progress</source>
         <translation>任务进度</translation>
     </message>
     <message>
-        <location line="-3067"/>
+        <location line="-3101"/>
         <source>Show the steps and status of the active AI task.</source>
         <translation>显示当前 AI 任务的步骤和状态。</translation>
     </message>
@@ -1539,7 +1535,7 @@
         <translation>添加附件</translation>
     </message>
     <message>
-        <location line="+322"/>
+        <location line="+330"/>
         <source>Selected text</source>
         <translation>选中的文本</translation>
     </message>
@@ -1565,12 +1561,12 @@
     </message>
     <message>
         <location line="+36"/>
-        <location line="+374"/>
+        <location line="+397"/>
         <source>A request can contain at most %1 attachments.</source>
         <translation>每个请求最多可包含 %1 个附件。</translation>
     </message>
     <message>
-        <location line="-362"/>
+        <location line="-385"/>
         <source>This attachment is already in the composer.</source>
         <translation>此附件已添加到输入框中。</translation>
     </message>
@@ -1580,7 +1576,7 @@
         <translation>附件总大小超过单个请求 2 MiB 的文本上限。</translation>
     </message>
     <message>
-        <location line="+351"/>
+        <location line="+374"/>
         <source>The attachment is not a readable file: %1</source>
         <translation>附件不是可读取的文件：%1</translation>
     </message>
@@ -1655,7 +1651,7 @@ Size: %2 bytes</source>
         <translation>将引用路径复制到剪贴板</translation>
     </message>
     <message>
-        <location line="+135"/>
+        <location line="+136"/>
         <source>File</source>
         <translation>文件</translation>
     </message>
@@ -1683,18 +1679,18 @@ Size: %2 bytes</source>
         <translation>预览附件：%1</translation>
     </message>
     <message>
-        <location line="-2540"/>
+        <location line="-2579"/>
         <source>Claude Code (ACP subscription)</source>
         <comment>provider.claude-code-acp.title</comment>
         <translation>Claude Code（ACP 订阅）</translation>
     </message>
     <message>
-        <location line="+1039"/>
+        <location line="+1046"/>
         <source>A referenced file changed after it was added. Remove it and add it again.</source>
         <translation>引用的文件在添加后已发生更改。请将其移除后重新添加。</translation>
     </message>
     <message>
-        <location line="+1006"/>
+        <location line="+1037"/>
         <source>Pasted image.%1</source>
         <translation>粘贴的图片.%1</translation>
     </message>
@@ -1718,13 +1714,13 @@ Size: %2 bytes</source>
         <translation>正在加载图片预览…</translation>
     </message>
     <message>
-        <location line="+267"/>
+        <location line="+268"/>
         <location line="+1"/>
         <source>Remove attachment: %1</source>
         <translation>移除附件：%1</translation>
     </message>
     <message>
-        <location line="+1260"/>
+        <location line="+1262"/>
         <source>Step %1 of %2</source>
         <translation>第 %1/%2 步</translation>
     </message>
@@ -1749,12 +1745,12 @@ Size: %2 bytes</source>
         <translation>等待中</translation>
     </message>
     <message>
-        <location line="-4233"/>
+        <location line="-4274"/>
         <source>Could not persist Bread AI conversations:</source>
         <translation>无法保存 Bread AI 对话：</translation>
     </message>
     <message>
-        <location line="-1740"/>
+        <location line="-1735"/>
         <location line="+105"/>
         <source>Bundled tool dependencies</source>
         <translation>内置工具依赖</translation>
@@ -1783,7 +1779,7 @@ Size: %2 bytes</source>
         <translation>正在检查…</translation>
     </message>
     <message>
-        <location line="+1850"/>
+        <location line="+1845"/>
         <source>Uses an Anthropic API key. To use a Claude Code subscription instead, select the separate Claude Code ACP preset; it wraps the official Claude Code CLI with the Agent Client Protocol reference adapter and remains subject to Anthropic&apos;s third-party authentication and usage terms.</source>
         <comment>provider.anthropic.note</comment>
         <translation>此连接使用 Anthropic API key。若要改用 Claude Code 订阅，请选择单独的 Claude Code ACP 预设；它通过 Agent Client Protocol 参考适配器连接官方 Claude Code CLI，并仍须遵守 Anthropic 的第三方身份验证与使用条款。</translation>
@@ -1877,6 +1873,18 @@ Size: %2 bytes</source>
         <source>Model capacity is temporarily unavailable. Continuing this session in %1 seconds (retry %2 of %3).</source>
         <comment>task.provider.retry-capacity</comment>
         <translation>模型服务暂时满负荷。将在 %1 秒后继续当前会话（第 %2 次重试，共 %3 次）。</translation>
+    </message>
+    <message>
+        <location line="+2"/>
+        <source>The provider&apos;s account lookup timed out. Retrying in %1 seconds (%2 of %3).</source>
+        <comment>task.provider.retry-session</comment>
+        <translation>提供方账号查询超时，将在 %1 秒后重试（第 %2/%3 次）。</translation>
+    </message>
+    <message>
+        <location line="+2"/>
+        <source>Provider connection restored. Continuing the request.</source>
+        <comment>task.provider.session-ready</comment>
+        <translation>提供方连接已恢复，继续处理请求。</translation>
     </message>
     <message>
         <location line="+2"/>
@@ -1981,7 +1989,7 @@ Size: %2 bytes</source>
         <translation>正在自检任务完成情况</translation>
     </message>
     <message>
-        <location line="+3619"/>
+        <location line="+3656"/>
         <source>step ended</source>
         <translation>本步骤已结束</translation>
     </message>
@@ -2016,29 +2024,34 @@ Size: %2 bytes</source>
         <translation>另有 %1 个对话正在运行</translation>
     </message>
     <message>
-        <location line="+120"/>
+        <location line="+142"/>
         <source>This UV link no longer matches the source capture.</source>
         <translation>此 UV 链接已不再匹配来源捕获。</translation>
     </message>
     <message>
-        <location line="+95"/>
+        <location line="+117"/>
         <source>The Shader source link is unavailable in the current workspace.</source>
         <translation>当前着色器工作区中无法打开此源码链接。</translation>
     </message>
     <message>
-        <location line="+312"/>
+        <location line="+46"/>
+        <source>This texture is not bound to an input or output at the linked event.</source>
+        <translation>链接对应的事件未将此纹理绑定为输入或输出。</translation>
+    </message>
+    <message>
+        <location line="+288"/>
         <source>Attachment content unavailable</source>
         <translation>附件内容不可用</translation>
     </message>
     <message>
         <location line="+2"/>
-        <location line="+160"/>
+        <location line="+156"/>
         <source>Stored attachment data was invalid and was not loaded.</source>
         <translation>保存的附件数据无效，未予加载。</translation>
     </message>
     <message>
-        <location line="-159"/>
-        <location line="+162"/>
+        <location line="-155"/>
+        <location line="+158"/>
         <source>%1 attachment(s) were not persisted because the bounded local conversation store was full.</source>
         <translation>由于受限容量的本地对话存储空间已满，未保存 %1 个附件。</translation>
     </message>
@@ -2048,12 +2061,12 @@ Size: %2 bytes</source>
         <translation>无法加载此捕获的对话历史：%1 本次会话不会写入该历史，以免丢失已保存的内容；请重新打开捕获后重试。</translation>
     </message>
     <message>
-        <location line="+826"/>
+        <location line="+832"/>
         <source>Checking the connection. Close this window to cancel.</source>
         <translation>正在检查连接，关闭此窗口可取消检查。</translation>
     </message>
     <message>
-        <location line="+406"/>
+        <location line="+408"/>
         <source>Add model APIs or Agent subscriptions here. API connections use the same RenderDoc deepagents framework maintained on GitHub. Managed subscriptions run the vendor&apos;s native Agent. Both can use Bread Skills and task-scoped Host tools. API keys can be stored securely in Windows Credential Manager or kept only for the current qrenderdoc session.</source>
         <translation>在此添加模型接口或 Agent 订阅。API 连接使用 GitHub 上维护的 RenderDoc deepagents 框架；托管订阅运行提供商的原生 Agent。两者都可使用 Bread Skills 和任务作用域内的 Host 工具。API 密钥可安全地保存在 Windows 凭据管理器中，或仅在当前 qrenderdoc 会话中保留。</translation>
     </message>
@@ -2827,7 +2840,7 @@ Device code: %1</source>
         <translation>默认连接</translation>
     </message>
     <message>
-        <location line="-2432"/>
+        <location line="-2434"/>
         <source>AI Connection Check</source>
         <translation>AI 连接检查</translation>
     </message>
@@ -2838,34 +2851,34 @@ Device code: %1</source>
         <translation>命令输出超出安全限制</translation>
     </message>
     <message>
-        <location line="+4250"/>
-        <location line="+737"/>
+        <location line="+4252"/>
+        <location line="+745"/>
         <source>Add or select an AI connection first.</source>
         <translation>请先添加或选择 AI 连接。</translation>
     </message>
     <message>
-        <location line="-724"/>
+        <location line="-730"/>
         <source>Host missing</source>
         <translation>找不到主机</translation>
     </message>
     <message>
-        <location line="+6"/>
+        <location line="+12"/>
         <location line="+2767"/>
         <source>Chat ready</source>
         <translation>聊天就绪</translation>
     </message>
     <message>
-        <location line="-2769"/>
+        <location line="-2774"/>
         <source>Waiting for bridge</source>
         <translation>正在等待桥接</translation>
     </message>
     <message>
-        <location line="-2"/>
+        <location line="-3"/>
         <source>Add connection</source>
         <translation>添加连接</translation>
     </message>
     <message>
-        <location line="+2717"/>
+        <location line="+2723"/>
         <source>Turn ended with unfinished work</source>
         <translation>本轮已结束，仍有未完成内容</translation>
     </message>
@@ -2937,7 +2950,7 @@ Device code: %1</source>
         <translation>捕获桥接尚未就绪。</translation>
     </message>
     <message>
-        <location line="-11091"/>
+        <location line="-11210"/>
         <source>%1 CLI detected; sign-in state is checked only after approval.</source>
         <comment>subscription.cli-detected</comment>
         <translation>已检测到 %1 CLI；仅在批准后检查登录状态。</translation>
@@ -3039,7 +3052,7 @@ Device code: %1</source>
         <translation>Codex 登录和模型目录测试成功。</translation>
     </message>
     <message>
-        <location line="+53"/>
+        <location line="+57"/>
         <source>Main Agent is analysing the request</source>
         <comment>task.main.started</comment>
         <translation>主智能体正在分析请求</translation>
@@ -3067,17 +3080,17 @@ Device code: %1</source>
         <translation>整理当前着色器</translation>
     </message>
     <message>
-        <location line="+274"/>
+        <location line="+277"/>
         <source>Use @renderdoc-explain-event to reorganize this entire frame&apos;s rendering flow. Follow the skill workflow, inspect the capture evidence again, and update the Frame Rendering Flow window, including any existing diagram.</source>
         <translation>使用 @renderdoc-explain-event 重新整理这一整帧的渲染流程。遵循技能流程，重新检查捕获证据，并更新帧渲染流程图窗口中已有的流程图。</translation>
     </message>
     <message>
-        <location line="+3838"/>
+        <location line="+3936"/>
         <source>Use @renderdoc-shader-workbench to reorganize the selected Shader. Follow the skill workflow and update its Shader Workspace source and explanation, including any existing organization.</source>
         <translation>使用 @renderdoc-shader-workbench 重新整理所选着色器。遵循技能流程，更新着色器工作区中的源码和说明，包括已有的整理结果。</translation>
     </message>
     <message>
-        <location line="+1112"/>
+        <location line="+1118"/>
         <source>The connection name is for display. qrenderdoc creates an internal stable identifier automatically. Models enabled here appear beside Send in the Bread AI panel. The first connection becomes the default automatically. Use Fetch Models for an API check, or Edit then Connect/Test for a subscription check.</source>
         <translation>连接名称仅用于显示。qrenderdoc 会自动创建内部稳定标识符。在此启用的模型会显示在 Bread AI 面板的“发送”按钮旁。第一个连接会自动成为默认连接。使用“获取模型”检查 API，或先点“编辑”，再通过“连接/测试”检查订阅。</translation>
     </message>
@@ -3187,7 +3200,7 @@ Device code: %1</source>
         <translation>用 discover_tool_interface 探测它，用 run_asset_tool_operation 尝试各种调用。帮助输出只是线索，不是证据：只有当一次调用在上述真实文件上产出了正确结果，该操作才算数。用 record_asset_tool_operation 把每一条记录下来，给出名称、一句话描述和带类型的 inputSchema，失败的情况记为 knownFailures。做完后告诉我它能做什么、不能做什么。</translation>
     </message>
     <message>
-        <location line="+1262"/>
+        <location line="+1270"/>
         <source>Could not begin asynchronous Bread AI context freeze:</source>
         <translation>无法开始异步 Bread AI 上下文冻结：</translation>
     </message>
@@ -3475,12 +3488,12 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>[后续推理内容见智能体监视器]</translation>
     </message>
     <message>
-        <location line="-8110"/>
+        <location line="-8188"/>
         <source>The artifact no longer exists: %1</source>
         <translation>产物已不存在：%1</translation>
     </message>
     <message>
-        <location line="+8133"/>
+        <location line="+8211"/>
         <location line="+19"/>
         <source>Tool: %1</source>
         <translation>工具：%1</translation>
@@ -3558,7 +3571,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>已取消</translation>
     </message>
     <message>
-        <location line="-4425"/>
+        <location line="-4433"/>
         <source>New...</source>
         <translation>新建...</translation>
     </message>
@@ -4129,13 +4142,13 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>读取脚本随 Bread AI 一起提供；你选择的解释器只需要安装 UnityPy 包（pip install UnityPy）。</translation>
     </message>
     <message>
-        <location line="-11438"/>
+        <location line="-11544"/>
         <location line="+110"/>
         <source>Claude sign-in</source>
         <translation>Claude 登录状态</translation>
     </message>
     <message>
-        <location line="+2060"/>
+        <location line="+2055"/>
         <source>This Claude connection is not signed in. Use Save and Connect to sign in to its isolated profile.</source>
         <comment>subscription.claude-account-unauthenticated</comment>
         <translation>此 Claude 连接尚未登录。请使用“保存并连接”，在该连接的独立配置中完成登录。</translation>
@@ -4165,7 +4178,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>配置或已信任的 CLI 不可用，因此未检查 Claude 登录状态。</translation>
     </message>
     <message>
-        <location line="+700"/>
+        <location line="+707"/>
         <source>Open the source capture to use this visual answer&apos;s navigation links.</source>
         <translation>请打开来源捕获，以使用此视觉回复的跳转链接。</translation>
     </message>
@@ -4180,23 +4193,23 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>标记渲染目标</translation>
     </message>
     <message>
-        <location line="+511"/>
+        <location line="+519"/>
         <source>The capture connection is not ready. Try drawing again after it connects.</source>
         <translation>捕获连接尚未就绪，请连接成功后再绘制标记。</translation>
     </message>
     <message>
-        <location line="+34"/>
-        <location line="+131"/>
+        <location line="+36"/>
+        <location line="+151"/>
         <source>Return to the conversation where you started drawing before adding the marks.</source>
         <translation>请先返回开始绘制时的对话，再添加标记。</translation>
     </message>
     <message>
-        <location line="-107"/>
+        <location line="-127"/>
         <source>An annotation needs two attachment slots for the original and marked images. Remove some attachments first.</source>
         <translation>标记需要两个附件位置，分别存放原图和标注图。请先移除部分附件。</translation>
     </message>
     <message>
-        <location line="+35"/>
+        <location line="+44"/>
         <source>EID %1: original render target</source>
         <translation>EID %1：渲染目标原图</translation>
     </message>
@@ -4206,22 +4219,22 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>EID %1：渲染目标标注图</translation>
     </message>
     <message>
-        <location line="+51"/>
+        <location line="+57"/>
         <source>The original annotation image is unavailable. The saved marks were kept.</source>
         <translation>原始标记图像不可用。已保存的笔画仍然保留。</translation>
     </message>
     <message>
-        <location line="+867"/>
+        <location line="+874"/>
         <source>Edit marks</source>
         <translation>编辑标记</translation>
     </message>
     <message>
-        <location line="+1664"/>
+        <location line="+1700"/>
         <source>This CBuffer link no longer matches the source capture or reflected parameter.</source>
         <translation>此 CBuffer 链接已不再匹配来源捕获或反射参数。</translation>
     </message>
     <message>
-        <location line="+13"/>
+        <location line="+17"/>
         <source>The saved Shader source changed. Refresh this code excerpt before navigating.</source>
         <translation>保存的着色器源码已更改。请刷新此代码片段后再跳转。</translation>
     </message>
@@ -4354,7 +4367,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
 <context>
     <name>AIConversationView</name>
     <message>
-        <location filename="../Windows/AI/AIConversationView.cpp" line="+1485"/>
+        <location filename="../Windows/AI/AIConversationView.cpp" line="+1547"/>
         <source>Edited %1 files</source>
         <translation>已编辑 %1 个文件</translation>
     </message>
@@ -4369,12 +4382,12 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>……该文件夹内还有更多文件</translation>
     </message>
     <message>
-        <location line="-990"/>
+        <location line="-1039"/>
         <source>Code</source>
         <translation>代码</translation>
     </message>
     <message>
-        <location line="+188"/>
+        <location line="+237"/>
         <location line="+38"/>
         <source>queued</source>
         <translation>排队中</translation>
@@ -4520,7 +4533,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>部分</translation>
     </message>
     <message>
-        <location line="+844"/>
+        <location line="+895"/>
         <source>Open file</source>
         <translation>打开文件</translation>
     </message>
@@ -4535,7 +4548,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>在资源管理器中显示</translation>
     </message>
     <message>
-        <location line="-1499"/>
+        <location line="-1550"/>
         <source>Command</source>
         <translation>命令</translation>
     </message>
@@ -4645,7 +4658,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>文本：%1</translation>
     </message>
     <message>
-        <location line="+646"/>
+        <location line="+697"/>
         <source>Conversation turns</source>
         <translation>对话轮次</translation>
     </message>
@@ -4667,12 +4680,12 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>跳转到最新消息</translation>
     </message>
     <message>
-        <location line="+1058"/>
+        <location line="+1091"/>
         <source>Empty user turn</source>
         <translation>空白用户消息</translation>
     </message>
     <message>
-        <location line="+310"/>
+        <location line="+321"/>
         <source>AI (live)</source>
         <translation>AI（实时）</translation>
     </message>
@@ -4687,7 +4700,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>失败详情</translation>
     </message>
     <message>
-        <location line="-2231"/>
+        <location line="-2326"/>
         <source>Show fewer</source>
         <translation>收起</translation>
     </message>
@@ -4697,7 +4710,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>再显示 %1 个文件</translation>
     </message>
     <message>
-        <location line="+776"/>
+        <location line="+827"/>
         <source>Edit marks in a new draft</source>
         <translation>在新草稿中编辑标记</translation>
     </message>
@@ -4755,7 +4768,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
 <context>
     <name>AITextureAnnotation</name>
     <message>
-        <location filename="../Windows/AI/AITextureAnnotation.cpp" line="+445"/>
+        <location filename="../Windows/AI/AITextureAnnotation.cpp" line="+475"/>
         <source>Render target annotation canvas</source>
         <translation>渲染目标标记画布</translation>
     </message>
@@ -4780,7 +4793,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>橡皮擦</translation>
     </message>
     <message>
-        <location line="+14"/>
+        <location line="+15"/>
         <source>Erase only the marks inside the brush. The render target stays intact.</source>
         <translation>仅擦除笔刷范围内的标记，不改变渲染目标。</translation>
     </message>
@@ -4805,27 +4818,27 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>线宽</translation>
     </message>
     <message>
-        <location line="+4"/>
+        <location line="+8"/>
         <source>Eraser width</source>
         <translation>橡皮擦宽度</translation>
     </message>
     <message>
-        <location line="+7"/>
+        <location line="+6"/>
         <source> px</source>
         <translation> 像素</translation>
     </message>
     <message>
-        <location line="+1"/>
+        <location line="+2"/>
         <source>Eraser diameter in view pixels; the circle previews the erased area.</source>
         <translation>以视图像素设置橡皮擦直径；圆圈预览擦除范围。</translation>
     </message>
     <message>
-        <location line="+6"/>
+        <location line="+11"/>
         <source>Fit</source>
         <translation>适应窗口</translation>
     </message>
     <message>
-        <location line="+7"/>
+        <location line="+4"/>
         <source>Mark the object or color region, then add it to the conversation and describe your question. Refer to marks by color. Only the marked image is shown in chat; the clean original is also sent to AI. Wheel to zoom; middle-drag to pan. Up to 64 marks.</source>
         <translation>标记物体或颜色区域，添加到对话并描述问题。可用颜色指代不同标记。聊天仅显示标记图；干净原图也会发送给 AI。滚轮缩放，中键拖动平移。最多 64 条笔画。</translation>
     </message>
@@ -4850,12 +4863,12 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>取消</translation>
     </message>
     <message>
-        <location line="+2"/>
+        <location line="+3"/>
         <source>Update conversation marks</source>
         <translation>更新对话标记</translation>
     </message>
     <message>
-        <location line="+1"/>
+        <location line="+0"/>
         <source>Add to conversation</source>
         <translation>添加到对话</translation>
     </message>
@@ -4863,72 +4876,112 @@ Additional direction from the user (re-plan and continue from the preserved cont
 <context>
     <name>AIVisualReply</name>
     <message>
-        <location filename="../Windows/AI/AIVisualReply.cpp" line="+361"/>
+        <location filename="../Windows/AI/AIVisualReply.cpp" line="+1051"/>
         <source>Image data is unavailable or changed.</source>
         <translation>图片数据不可用或已发生变化。</translation>
     </message>
     <message>
-        <location line="+263"/>
+        <location line="+458"/>
         <source>Geometry data is unavailable or changed.</source>
         <translation>几何数据不可用或已发生变化。</translation>
     </message>
     <message>
-        <location line="+65"/>
+        <location line="+196"/>
         <source>Visual explanation unavailable. Its saved data is missing or changed.</source>
         <translation>视觉说明不可用。保存的数据已丢失或发生变化。</translation>
     </message>
     <message>
-        <location line="+8"/>
+        <location line="+58"/>
         <source>Expand</source>
         <translation>放大查看</translation>
     </message>
     <message>
-        <location line="+4"/>
+        <location line="+6"/>
         <source>Visual explanation</source>
         <translation>视觉说明</translation>
     </message>
     <message>
-        <location line="+13"/>
+        <location line="+24"/>
         <source>This visual card is invalid.</source>
         <translation>此视觉卡片无效。</translation>
     </message>
     <message>
-        <location line="+8"/>
-        <source>Example code. Click to locate the corresponding Shader calculation.</source>
-        <translation>示例代码。点击可定位对应的着色器计算。</translation>
+        <location line="-1676"/>
+        <source>Restored</source>
+        <translation>已恢复</translation>
     </message>
     <message>
         <location line="+1"/>
-        <source>Saved %1 source; click a line to open Shader Workspace</source>
-        <translation>已保存的 %1 源码；点击代码行可在着色器工作区中打开</translation>
+        <source>Reused existing reconstructed source</source>
+        <translation>复用现有重建源码</translation>
     </message>
     <message>
-        <location line="+30"/>
-        <source>Material illustration; replay unchanged</source>
-        <translation>材质示意；不改变回放</translation>
-    </message>
-    <message>
-        <location line="+0"/>
-        <source>Algorithm demonstration; replay unchanged</source>
-        <translation>算法演示；未改变回放</translation>
+        <location line="+398"/>
+        <source>No visible difference</source>
+        <translation>未见可见差异</translation>
     </message>
     <message>
         <location line="+6"/>
+        <source>Original</source>
+        <translation>原效果</translation>
+    </message>
+    <message>
+        <location line="+2"/>
+        <source>Modified</source>
+        <translation>修改后</translation>
+    </message>
+    <message>
+        <location line="+358"/>
+        <source>Choose display channels. A single channel is shown in grayscale.</source>
+        <translation>选择显示通道。单个通道以灰度显示。</translation>
+    </message>
+    <message>
+        <location line="+850"/>
+        <source>Code: %1</source>
+        <translation>代码：%1</translation>
+    </message>
+    <message>
+        <location line="+25"/>
+        <source>Explanation page</source>
+        <translation>说明页</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Drag to switch explanations</source>
+        <translation>拖动切换说明内容</translation>
+    </message>
+    <message>
+        <location line="+50"/>
+        <source>Click code to open the Shader calculation.</source>
+        <translation>点击代码可跳转到对应的着色器计算。</translation>
+    </message>
+    <message>
+        <location line="+30"/>
+        <source>Algorithm illustration</source>
+        <translation>算法示意</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Material preview</source>
+        <translation>材质预览</translation>
+    </message>
+    <message>
+        <location line="+9"/>
         <source>Captured geometry; approximate projection</source>
         <translation>捕获中的几何；近似投影</translation>
     </message>
     <message>
-        <location line="+0"/>
+        <location line="+1"/>
         <source>Exported geometry</source>
         <translation>导出的几何</translation>
     </message>
     <message>
-        <location line="+1"/>
+        <location line="+3"/>
         <source>Partial captured geometry</source>
         <translation>部分捕获几何</translation>
     </message>
     <message>
-        <location line="+11"/>
+        <location line="+13"/>
         <source>Material</source>
         <translation>材质</translation>
     </message>
@@ -4943,177 +4996,176 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>线框</translation>
     </message>
     <message>
-        <location line="+2"/>
+        <location line="+7"/>
         <source>Roughness</source>
         <translation>粗糙度</translation>
     </message>
     <message>
-        <location line="+7"/>
+        <location line="+15"/>
         <source>Metalness</source>
         <translation>金属度</translation>
     </message>
     <message>
-        <location line="+3"/>
+        <location line="+9"/>
         <source>Base color</source>
         <translation>基础颜色</translation>
     </message>
     <message>
-        <location line="+3"/>
+        <location line="+5"/>
         <source>Illustrative base color</source>
         <translation>示意材质的基础颜色</translation>
     </message>
     <message>
-        <location line="+3"/>
+        <location line="+8"/>
         <source>Reset view</source>
         <translation>重置视角</translation>
     </message>
     <message>
-        <location line="+4"/>
+        <location line="+5"/>
         <source>Environment strength</source>
         <translation>环境色强度</translation>
     </message>
     <message>
-        <location line="+9"/>
+        <location line="+16"/>
         <source>Inverted hull</source>
         <translation>外扩描边</translation>
     </message>
     <message>
-        <location line="+0"/>
+        <location line="+1"/>
         <source>Vertex displacement</source>
         <translation>顶点位移</translation>
     </message>
     <message>
-        <location line="+4"/>
+        <location line="+12"/>
         <source>Extrusion width</source>
         <translation>外扩宽度</translation>
     </message>
     <message>
-        <location line="+0"/>
+        <location line="+1"/>
         <source>Displacement amount</source>
         <translation>位移幅度</translation>
     </message>
     <message>
-        <location line="+2"/>
+        <location line="+8"/>
         <source>Preview units; this control does not edit the capture.</source>
         <translation>使用预览单位；此控件不会修改捕获。</translation>
     </message>
     <message>
-        <location line="+5"/>
+        <location line="+16"/>
         <source>Preview settings</source>
         <translation>预览设置</translation>
     </message>
     <message>
         <location line="+7"/>
-        <location line="+3"/>
+        <location line="+4"/>
         <source>Outline color</source>
         <translation>描边颜色</translation>
     </message>
     <message>
-        <location line="+6"/>
+        <location line="+12"/>
         <source>Frequency</source>
         <translation>频率</translation>
     </message>
     <message>
-        <location line="+3"/>
+        <location line="+11"/>
         <source>Phase</source>
         <translation>相位</translation>
     </message>
     <message>
-        <location line="+5"/>
+        <location line="+13"/>
         <source>Preview normals and units are illustrative; use the linked Shader/CBuffer for capture controls.</source>
         <translation>预览法线和单位仅用于演示；请通过关联的着色器或 CBuffer 调节捕获中的效果。</translation>
     </message>
     <message>
-        <location line="+11"/>
+        <location line="+21"/>
         <source>Drag to rotate; wheel to zoom. Material controls affect this illustration only.</source>
         <translation>拖动旋转，滚轮缩放。材质控件仅影响此示意。</translation>
     </message>
     <message>
-        <location line="+7"/>
+        <location line="+23"/>
         <source>Wheel to zoom; drag to move the image or comparison divider.</source>
         <translation>滚轮缩放；拖动移动图片或对比分割线。</translation>
     </message>
     <message>
-        <location line="+4"/>
+        <location line="+5"/>
         <source>Flip Y</source>
         <translation>翻转 Y 轴</translation>
     </message>
     <message>
-        <location line="+52"/>
-        <source>The two saved previews have identical pixels.</source>
-        <translation>两张保存的预览像素完全相同。</translation>
+        <location line="+15"/>
+        <source>Before / After</source>
+        <translation>之前 / 之后</translation>
     </message>
     <message>
-        <location line="+17"/>
-        <source>Click a node to navigate; right-click for Shader and parameter links.</source>
-        <translation>点击节点可跳转；右键可查看着色器和参数链接。</translation>
+        <location line="+1"/>
+        <source>Difference</source>
+        <translation>差异图</translation>
     </message>
     <message>
-        <location line="-296"/>
-        <location line="+239"/>
+        <location line="+11"/>
+        <source>Click to switch between the two images</source>
+        <translation>点击切换两张图片</translation>
+    </message>
+    <message>
+        <location line="+5"/>
+        <source>Compare matching pixels. Black means no change; brighter pixels changed more.</source>
+        <translation>比较同一位置的像素。黑色表示无变化，越亮表示变化越大。</translation>
+    </message>
+    <message>
+        <location line="+64"/>
+        <source>Select a stage or connection for its calculation; double-click a stage to navigate.</source>
+        <translation>单击阶段或连线查看计算说明；双击阶段跳转。</translation>
+    </message>
+    <message>
+        <location line="+6"/>
+        <source>Select a stage or connection to see how it is calculated.</source>
+        <translation>选择阶段或连线，查看它的计算方式。</translation>
+    </message>
+    <message>
+        <location line="+4"/>
+        <source>View stage code</source>
+        <translation>查看阶段代码</translation>
+    </message>
+    <message>
+        <location line="-648"/>
         <source>Before</source>
         <translation>之前</translation>
     </message>
     <message>
-        <location line="-238"/>
-        <location line="+238"/>
+        <location line="-997"/>
+        <source>A: %1</source>
+        <translation>A: %1</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>B: %1</source>
+        <translation>B: %1</translation>
+    </message>
+    <message>
+        <location line="+998"/>
         <source>After</source>
         <translation>之后</translation>
     </message>
     <message>
-        <location line="+0"/>
+        <location line="+555"/>
         <source>Wipe</source>
         <translation>滑动对比</translation>
     </message>
     <message>
-        <location line="-61"/>
-        <location line="+61"/>
+        <location line="-120"/>
+        <location line="+120"/>
         <source>Side by side</source>
         <translation>并排对比</translation>
     </message>
     <message>
-        <location line="+25"/>
+        <location line="+57"/>
         <source>Focus region</source>
         <translation>聚焦区域</translation>
     </message>
     <message>
-        <location line="+10"/>
-        <source>Controlled A/B/A experiment; replay restored</source>
-        <translation>受控 A/B/A 对照实验；已恢复回放</translation>
-    </message>
-    <message>
-        <location line="+1"/>
-        <source>Stage/reference comparison; an isolated effect toggle requires separate evidence.</source>
-        <translation>阶段或参考图对比；单独效果的开关对比需要另外的验证证据。</translation>
-    </message>
-    <message>
-        <location line="+8"/>
-        <source>Baseline calculation</source>
-        <translation>基线计算</translation>
-    </message>
-    <message>
-        <location line="+1"/>
-        <source>Experimental calculation</source>
-        <translation>实验计算</translation>
-    </message>
-    <message>
-        <location line="+3"/>
-        <source>A: %1    B: %2</source>
-        <translation>A：%1    B：%2</translation>
-    </message>
-    <message>
-        <location line="+4"/>
-        <source>Captured RT</source>
-        <translation>捕获中的 RT</translation>
-    </message>
-    <message>
-        <location line="+0"/>
-        <source>Reference image</source>
-        <translation>参考图片</translation>
-    </message>
-    <message>
-        <location line="-657"/>
-        <location line="+692"/>
+        <location line="-1219"/>
+        <location line="+1282"/>
+        <location line="+73"/>
         <source>EID %1</source>
         <translation>EID %1</translation>
     </message>
@@ -6121,7 +6173,7 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
     </message>
     <message>
         <location/>
-        <location filename="../Windows/BufferViewer.cpp" line="+9289"/>
+        <location filename="../Windows/BufferViewer.cpp" line="+10389"/>
         <location line="+30"/>
         <source>VS In</source>
         <translation>VS 输入</translation>
@@ -6304,7 +6356,7 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
     </message>
     <message>
         <location/>
-        <location filename="../Windows/BufferViewer.cpp" line="+1952"/>
+        <location filename="../Windows/BufferViewer.cpp" line="+1983"/>
         <source>Current Range filter: None</source>
         <translation>当前范围筛选：无</translation>
     </message>
@@ -6324,7 +6376,7 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>长度</translation>
     </message>
     <message>
-        <location filename="../Windows/BufferViewer.cpp" line="-7810"/>
+        <location filename="../Windows/BufferViewer.cpp" line="-8826"/>
         <source>&amp;Debug this Vertex</source>
         <translation>调试该顶点(&amp;D)</translation>
     </message>
@@ -6345,12 +6397,12 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
     </message>
     <message>
         <location line="+3"/>
-        <location line="+2017"/>
+        <location line="+2932"/>
         <source>&amp;Remove Filter</source>
         <translation>移除筛选(&amp;R)</translation>
     </message>
     <message>
-        <location line="-2014"/>
+        <location line="-2929"/>
         <source>&amp;Go to task</source>
         <translation>转到任务(&amp;G)</translation>
     </message>
@@ -6366,11 +6418,12 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
     </message>
     <message>
         <location line="+7"/>
+        <location line="+1449"/>
         <source>None</source>
         <translation>无</translation>
     </message>
     <message>
-        <location line="+0"/>
+        <location line="-1449"/>
         <source>Solid Colour</source>
         <translation>纯色</translation>
     </message>
@@ -6421,37 +6474,37 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
     </message>
     <message>
         <location line="+8"/>
-        <location line="+1586"/>
-        <location line="+2632"/>
+        <location line="+2503"/>
+        <location line="+2642"/>
         <location line="+7"/>
         <source>Name</source>
         <translation>名称</translation>
     </message>
     <message>
-        <location line="-4225"/>
-        <location line="+1586"/>
-        <location line="+2632"/>
+        <location line="-5152"/>
+        <location line="+2503"/>
+        <location line="+2642"/>
         <location line="+7"/>
         <source>Value</source>
         <translation>值</translation>
     </message>
     <message>
-        <location line="-4225"/>
-        <location line="+4218"/>
+        <location line="-5152"/>
+        <location line="+5145"/>
         <location line="+7"/>
         <source>Byte Offset</source>
         <translation>字节偏移</translation>
     </message>
     <message>
-        <location line="-4225"/>
-        <location line="+1586"/>
-        <location line="+2632"/>
+        <location line="-5152"/>
+        <location line="+2503"/>
+        <location line="+2642"/>
         <location line="+7"/>
         <source>Type</source>
         <translation>类型</translation>
     </message>
     <message>
-        <location line="-4182"/>
+        <location line="-5109"/>
         <source>Fixed SoA data</source>
         <translation>固定 SoA 数据</translation>
     </message>
@@ -6482,7 +6535,12 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>清除此参数的修改，恢复捕获时的原始值</translation>
     </message>
     <message>
-        <location line="+857"/>
+        <location line="+844"/>
+        <source>Choose display channels. A single channel is shown in grayscale. For combinations, disabled RGB becomes 0 and disabled alpha becomes 1.</source>
+        <translation>选择显示通道。单通道以灰度显示；组合显示时，未选的 RGB 通道补 0，未选的 A 通道补 1。</translation>
+    </message>
+    <message>
+        <location line="+52"/>
         <source>Select points (1)</source>
         <translation>选择顶点 (1)</translation>
     </message>
@@ -6497,7 +6555,7 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>选择面 (3)</translation>
     </message>
     <message>
-        <location line="+557"/>
+        <location line="+1435"/>
         <source>Preview</source>
         <translation>预览</translation>
     </message>
@@ -6522,7 +6580,7 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>将 Alpha 设为辅助属性</translation>
     </message>
     <message>
-        <location line="+130"/>
+        <location line="+128"/>
         <source>&amp;Expand All</source>
         <translation>全部展开(&amp;E)</translation>
     </message>
@@ -6602,13 +6660,13 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>清除自定义格式，以选择捕获中经反射得到的 CBuffer 叶节点</translation>
     </message>
     <message>
-        <location line="-1634"/>
-        <location line="+1638"/>
+        <location line="-2549"/>
+        <location line="+2553"/>
         <source>Only reflected 32-bit float/int/uint scalar and vector leaves are editable</source>
         <translation>仅可编辑经反射得到的 32 位 float/int/uint 标量和向量叶节点</translation>
     </message>
     <message>
-        <location line="-5449"/>
+        <location line="-6473"/>
         <source>Saturation and brightness</source>
         <translation>饱和度与明度</translation>
     </message>
@@ -6659,7 +6717,7 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>数值未应用：OpenGL 无法重放缓冲区更新。悬停可查看详情。</translation>
     </message>
     <message>
-        <location line="+3092"/>
+        <location line="+3201"/>
         <source>Search CBuffer parameters (Ctrl+F5)</source>
         <translation>搜索 CBuffer 参数（Ctrl+F5）</translation>
     </message>
@@ -6720,12 +6778,12 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <location line="+215"/>
         <location line="+8"/>
         <location line="+24"/>
-        <location line="+1990"/>
+        <location line="+2915"/>
         <source>The CBuffer binding changed; select the value again.</source>
         <translation>CBuffer 绑定已变化，请重新选择参数。</translation>
     </message>
     <message>
-        <location line="-2006"/>
+        <location line="-2931"/>
         <source>Another editor changed this buffer. Values were refreshed; select the parameter again before editing.</source>
         <translation>其他编辑器已修改此缓冲区。数值已刷新，请重新选择参数后再修改。</translation>
     </message>
@@ -6740,7 +6798,7 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>无法读取恢复后的 CBuffer 值，请刷新视图。</translation>
     </message>
     <message>
-        <location line="+229"/>
+        <location line="+230"/>
         <source>UV channel of the selected mesh stage</source>
         <translation>所选网格阶段的 UV 通道</translation>
     </message>
@@ -6750,7 +6808,7 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>此 EID 绑定的输入纹理</translation>
     </message>
     <message>
-        <location line="+43"/>
+        <location line="+76"/>
         <source>Box select (B)</source>
         <translation>框选（B）</translation>
     </message>
@@ -6780,7 +6838,7 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>翻转 UV 背景和网格纹理采样</translation>
     </message>
     <message>
-        <location line="+12"/>
+        <location line="+16"/>
         <source>UV</source>
         <translation>UV</translation>
     </message>
@@ -6815,32 +6873,39 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>UV 纹理</translation>
     </message>
     <message>
-        <location line="+114"/>
+        <location line="+54"/>
+        <source>%1°</source>
+        <translation>%1°</translation>
+    </message>
+    <message>
+        <location line="+567"/>
         <source>%1 (UV candidate)</source>
         <translation>%1（候选 UV）</translation>
     </message>
     <message>
-        <location line="+33"/>
+        <location line="-596"/>
+        <location line="+629"/>
+        <location line="+186"/>
         <source>No texture</source>
         <translation>无纹理</translation>
     </message>
     <message>
-        <location line="+141"/>
-        <source>Partial mesh: preview triangle limit reached.</source>
-        <translation>已达到预览三角形上限，仅显示部分网格。</translation>
+        <location line="-918"/>
+        <source>Space: toggle texture tiling. Wheel: zoom. Middle-drag: pan.</source>
+        <translation>空格：切换纹理平铺。滚轮：缩放。中键拖动：平移。</translation>
     </message>
     <message>
-        <location line="+90"/>
+        <location line="+928"/>
+        <source>Explanation texture</source>
+        <translation>说明纹理</translation>
+    </message>
+    <message>
+        <location line="+341"/>
         <source>The GPU texture preview is unavailable.</source>
         <translation>GPU 纹理预览不可用。</translation>
     </message>
     <message>
-        <location line="+59"/>
-        <source>Partial highlight for a large selection.</source>
-        <translation>选区较大，3D 视口仅高亮其中一部分。</translation>
-    </message>
-    <message>
-        <location line="+357"/>
+        <location line="+480"/>
         <source>CBuffer: %1 (EID %2)</source>
         <translation>CBuffer：%1（EID %2）</translation>
     </message>
@@ -6908,7 +6973,7 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>未绑定顶点着色器</translation>
     </message>
     <message>
-        <location line="+327"/>
+        <location line="+337"/>
         <source>Specify a custom format for this constant buffer</source>
         <translation>为此常量缓冲区指定自定义格式</translation>
     </message>
@@ -6918,12 +6983,12 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>没有底层内存，无法指定自定义格式</translation>
     </message>
     <message>
-        <location line="+586"/>
+        <location line="+587"/>
         <source>Starting at: %1 bytes</source>
         <translation>起始位置：%1 字节</translation>
     </message>
     <message>
-        <location line="+250"/>
+        <location line="+251"/>
         <location line="+18"/>
         <location line="+153"/>
         <location line="+132"/>
@@ -6976,29 +7041,29 @@ Source SHA-256: %7</source>
     </message>
     <message>
         <location line="+134"/>
-        <location line="+3810"/>
+        <location line="+3840"/>
         <source>Unused · %1</source>
         <translation>未使用 · %1</translation>
     </message>
     <message>
-        <location line="-3809"/>
-        <location line="+3810"/>
+        <location line="-3839"/>
+        <location line="+3840"/>
         <source>Parameter · %1</source>
         <translation>参数 · %1</translation>
     </message>
     <message>
-        <location line="-3808"/>
+        <location line="-3838"/>
         <source>Unused by this shader</source>
         <translation>当前着色器未使用</translation>
     </message>
     <message>
         <location line="+1"/>
-        <location line="+3808"/>
+        <location line="+3838"/>
         <source>Meaning not identified</source>
         <translation>用途尚未识别</translation>
     </message>
     <message>
-        <location line="-3805"/>
+        <location line="-3835"/>
         <source>Original name: %1
 This shader does not read these components. Other shaders may use them; their bytes and editing controls are preserved.</source>
         <translation>原始名称：%1
@@ -7027,7 +7092,7 @@ The role of this parameter has not been identified. This does not mean it is unu
         <translation>常量块别名</translation>
     </message>
     <message>
-        <location line="+157"/>
+        <location line="+161"/>
         <source>Min %1: %2</source>
         <translation>最小值 %1：%2</translation>
     </message>
@@ -7037,7 +7102,7 @@ The role of this parameter has not been identified. This does not mean it is unu
         <translation>最大值 %1：%2</translation>
     </message>
     <message>
-        <location line="+335"/>
+        <location line="+341"/>
         <source>This instance</source>
         <translation>当前实例</translation>
     </message>
@@ -7073,7 +7138,7 @@ The role of this parameter has not been identified. This does not mean it is unu
         <translation>所有实例（不适用）</translation>
     </message>
     <message>
-        <location line="+485"/>
+        <location line="+533"/>
         <source>%1 bytes of padding. Packing rules in effect:
 
 </source>
@@ -7294,7 +7359,7 @@ Matrix stored </source>
         <translation>%1（已固定：EID %2）</translation>
     </message>
     <message>
-        <location line="+106"/>
+        <location line="+88"/>
         <source>Prev Page</source>
         <translation>上一页</translation>
     </message>
@@ -7304,7 +7369,7 @@ Matrix stored </source>
         <translation>下一页</translation>
     </message>
     <message>
-        <location line="+637"/>
+        <location line="+678"/>
         <source>Constant Buffer Custom Format</source>
         <translation>常量缓冲区自定义格式</translation>
     </message>
@@ -7419,7 +7484,7 @@ Matrix stored </source>
         <translation>调试线程失败——请确保已选择有效的线程组和线程</translation>
     </message>
     <message>
-        <location line="+87"/>
+        <location line="+99"/>
         <source>Auto</source>
         <translation>自动</translation>
     </message>
@@ -7464,7 +7529,7 @@ Matrix stored </source>
         <translation>宽高比 %1，近平面和远平面均自动推断</translation>
     </message>
     <message>
-        <location line="+322"/>
+        <location line="+318"/>
         <source>Current Range filter: Single Amplification Threadgroup</source>
         <translation>当前范围筛选：单个放大着色器线程组</translation>
     </message>
@@ -7479,7 +7544,7 @@ Matrix stored </source>
         <translation>当前范围筛选：单个网格簇</translation>
     </message>
     <message>
-        <location line="-5615"/>
+        <location line="-5716"/>
         <source>&amp;Rename (Create Alias)...</source>
         <translation>重命名（创建别名）(&amp;R)...</translation>
     </message>
@@ -7509,7 +7574,7 @@ Matrix stored </source>
         <translation>所选常量缓冲区绑定或数组元素无效</translation>
     </message>
     <message>
-        <location line="+1461"/>
+        <location line="+1473"/>
         <source>Original name: %1 (alias set by you)</source>
         <translation>原始名称：%1（别名由您设置）</translation>
     </message>
@@ -7527,6 +7592,11 @@ Matrix stored </source>
         <location line="+668"/>
         <source>Constant Alias</source>
         <translation>常量别名</translation>
+    </message>
+    <message>
+        <location filename="../Windows/BufferViewer.ui"/>
+        <source>Camera FOV</source>
+        <translation>相机 FOV</translation>
     </message>
 </context>
 <context>
@@ -17956,7 +18026,7 @@ Would you like to try to reinstall the version %2?</source>
         <translation>解析符号——捕获中没有符号</translation>
     </message>
     <message>
-        <location line="+496"/>
+        <location line="+501"/>
         <source>Not Available</source>
         <translation>不可用</translation>
     </message>
@@ -18138,7 +18208,7 @@ Please check your installation is not corrupted. Or if this is a custom build ch
 <context>
     <name>MeshUVView</name>
     <message>
-        <location filename="../Windows/MeshUVView.cpp" line="+193"/>
+        <location filename="../Windows/MeshUVView.cpp" line="+533"/>
         <source>No UV triangles for this stage and channel.</source>
         <translation>此阶段和通道没有可显示的 UV 三角形。</translation>
     </message>
@@ -23363,7 +23433,7 @@ The project folder and every local file will remain on disk.</source>
     </message>
     <message>
         <location line="+3"/>
-        <location filename="../Windows/MainWindow.cpp" line="-3564"/>
+        <location filename="../Windows/MainWindow.cpp" line="-3569"/>
         <source>Frame Rendering Flow</source>
         <translation>帧渲染流程图</translation>
     </message>
@@ -28535,7 +28605,7 @@ Do you want to replace it?</source>
     </message>
     <message>
         <location/>
-        <location filename="../Windows/TextureViewer.cpp" line="+2047"/>
+        <location filename="../Windows/TextureViewer.cpp" line="+2068"/>
         <source>Mip</source>
         <translation>MIP</translation>
     </message>
@@ -28689,7 +28759,7 @@ See FAQ on &quot;Gamma display of linear data&quot;</source>
         <translation>选择可见列</translation>
     </message>
     <message>
-        <location filename="../Windows/TextureViewer.cpp" line="-1436"/>
+        <location filename="../Windows/TextureViewer.cpp" line="-1457"/>
         <source>No draw call selected</source>
         <translation>未选择绘制调用</translation>
     </message>
@@ -28721,13 +28791,13 @@ See FAQ on &quot;Gamma display of linear data&quot;</source>
     </message>
     <message>
         <location line="+132"/>
-        <location line="+997"/>
+        <location line="+1018"/>
         <location line="+16"/>
         <source>Unbound</source>
         <translation>未绑定</translation>
     </message>
     <message>
-        <location line="-1012"/>
+        <location line="-1033"/>
         <source>Pixel Context</source>
         <translation>像素上下文</translation>
     </message>
@@ -28808,18 +28878,18 @@ See FAQ on &quot;Gamma display of linear data&quot;</source>
     </message>
     <message>
         <location line="+1"/>
-        <location line="+3424"/>
+        <location line="+3480"/>
         <source>Quad Overdraw (Pass)</source>
         <translation>四像素块过度绘制（渲染通道）</translation>
     </message>
     <message>
-        <location line="-3424"/>
-        <location line="+3423"/>
+        <location line="-3480"/>
+        <location line="+3479"/>
         <source>Quad Overdraw (Draw)</source>
         <translation>四像素块过度绘制（绘制）</translation>
     </message>
     <message>
-        <location line="-3422"/>
+        <location line="-3478"/>
         <source>Triangle Size (Pass)</source>
         <translation>三角形大小（渲染通道）</translation>
     </message>
@@ -28874,7 +28944,7 @@ See FAQ on &quot;Gamma display of linear data&quot;</source>
         <translation>转到</translation>
     </message>
     <message>
-        <location line="+765"/>
+        <location line="+786"/>
         <source>Hover - [%1] - </source>
         <translation>悬停 - [%1] - </translation>
     </message>
@@ -28991,12 +29061,12 @@ See FAQ on &quot;Gamma display of linear data&quot;</source>
     </message>
     <message>
         <location line="+50"/>
-        <location line="+2980"/>
+        <location line="+3015"/>
         <source>Slice %1</source>
         <translation>切片 %1</translation>
     </message>
     <message>
-        <location line="-2407"/>
+        <location line="-2442"/>
         <source>Close tab</source>
         <translation>关闭选项卡</translation>
     </message>
@@ -29011,7 +29081,7 @@ See FAQ on &quot;Gamma display of linear data&quot;</source>
         <translation>关闭右侧的选项卡</translation>
     </message>
     <message>
-        <location line="+697"/>
+        <location line="+732"/>
         <source>Open new Locked Tab</source>
         <translation>在新锁定标签页中打开</translation>
     </message>
@@ -29255,12 +29325,12 @@ Select a custom shader from the drop-down</source>
         <translation>从磁盘删除着色器 %1 时出错</translation>
     </message>
     <message>
-        <location line="-4632"/>
+        <location line="-4665"/>
         <source>Select a render target in the Texture Viewer before drawing.</source>
         <translation>绘制前，请先在纹理查看器中选择一个渲染目标。</translation>
     </message>
     <message>
-        <location line="+42"/>
+        <location line="+48"/>
         <source>Annotate EID %1 | %2 | MIP %3, slice %4</source>
         <translation>标记 EID %1 | %2 | MIP %3，切片 %4</translation>
     </message>
@@ -29271,7 +29341,8 @@ Select a custom shader from the drop-down</source>
         <translation>准备标记时纹理已发生变化，请重新点击画笔。</translation>
     </message>
     <message>
-        <location line="-8"/>
+        <location line="-77"/>
+        <location line="+69"/>
         <source>The render target image could not be read for annotation.</source>
         <translation>无法读取渲染目标图像以绘制标记。</translation>
     </message>

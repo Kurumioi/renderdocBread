@@ -448,7 +448,7 @@ class TaskReportStore:
             from .unity_restoration_requirements import annotate_transferred_shader_reviews
             return annotate_transferred_shader_reviews(review_state(self._shader_review_targets), self._task_completion or {})
 
-    def begin_task_review(self, request_fingerprint: str) -> dict[str, Any]:
+    def begin_task_review(self, request_fingerprint: str, *, marked_render_target: bool = False) -> dict[str, Any]:
         """Start a fresh execution scope internally, never as an Agent tool."""
         if not self.enabled:
             raise ValueError("Task self-review requires an active task ledger")
@@ -461,6 +461,8 @@ class TaskReportStore:
             self._task_completion = {"taskId": self.task_id, "scopeId": self._task_review_scope_pin,
                 "requestFingerprint": request_fingerprint, "workRevision": 0,
                 "identities": [], "occurrences": [], "review": None}
+            if marked_render_target:
+                self._task_completion["markedRenderTarget"] = True
             # Only a new begin in this execution opts into the full-source read
             # gate. Historical restoration/registration remains unaffected.
             for target in self._shader_review_targets.values():
@@ -477,7 +479,9 @@ class TaskReportStore:
         return state
 
     def record_task_review(self, verdict: str, criteria: list[dict[str, str]], findings: list[str],
-                           next_actions: list[str], blocker: str = "", decision_request: dict | None = None) -> dict[str, Any]:
+                           next_actions: list[str], blocker: str = "", decision_request: dict | None = None,
+                           visual_review: str = '', visual_checks: dict[str, str] | None = None,
+                           reviewed_answer: dict | None = None) -> dict[str, Any]:
         """Record the main Agent's assessment; do not judge its semantic quality."""
         from .task_completion_review import make_review
         if not self.enabled:
@@ -517,7 +521,8 @@ class TaskReportStore:
                                and (row.get("cbufferSemanticDelivery") or {}).get("status") != "complete"]
                     if pending:
                         raise ValueError("Shader resource naming is incomplete: use the pending cbufferSemanticDelivery.nextActions to finish asset/texture review and all active CBuffer publications without recompiling")
-                review = make_review(state, verdict, criteria, findings, next_actions, blocker, decision_request)
+                review = make_review(state, verdict, criteria, findings, next_actions, blocker,
+                                     decision_request, visual_review, visual_checks, reviewed_answer)
             except (ValueError, TypeError) as error:
                 # A failed reassessment replaces the prior verdict as well.
                 # Keeping an older complete receipt would hide this failure.
@@ -562,6 +567,11 @@ class TaskReportStore:
                 for row in state.get(name, {}).values():
                     row.update(diagnosticsOnly=True, workflowPolicy="agent-directed")
             return state_view(state)
+
+    def inspected_effect_draws(self) -> set[int]:
+        self.sync()
+        with self._lock:
+            return set(self._task_completion.get('inspectedEffectDraws', []))
 
     def _record_task_activity(self, tool: str, identity: str, occurrence_id: str) -> None:
         from .task_completion_review import MAX_IDENTITIES, REVIEW_TOOLS
@@ -670,7 +680,7 @@ class TaskReportStore:
             "taskCompletionReview": self._task_completion,
         })
 
-    def register_reply_visual(self, identifier: str) -> bool:
+    def register_reply_visual(self, identifier: str, presentation: dict | None = None) -> bool:
         if not re.fullmatch(r"[0-9a-f]{64}", identifier):
             raise ValueError("Invalid visual manifest identity")
         if not self.enabled:
@@ -681,6 +691,8 @@ class TaskReportStore:
                 if len(self._reply_visuals) >= 8:
                     raise ValueError("This answer already contains eight visual bundles")
                 self._reply_visuals.append({"id": identifier})
+            if presentation is not None and self._task_completion:
+                self._task_completion['visualPublication']={**presentation,'id':identifier}
             self._write_state()
         return True
 
@@ -789,6 +801,13 @@ class TaskReportStore:
             if len(self._tool_stats) > 128:
                 self._tool_stats.pop(next(iter(self._tool_stats)))
             self._occupancy_from_result(tool, result, arguments or {}, failed)
+            if tool == 'inspect_event' and fact['outcome'] != 'error' and self._task_completion:
+                inspection = _parsed_result(result)
+                if isinstance(inspection, Mapping) and isinstance(inspection.get('drawCall'), Mapping):
+                    event_id = inspection.get('eventId')
+                    if type(event_id) is int and event_id > 0:
+                        seen = self._task_completion.get('inspectedEffectDraws', [])
+                        self._task_completion['inspectedEffectDraws'] = list(dict.fromkeys([*seen, event_id]))[-256:]
             from .shader_organization_review import track_result
             track_result(self._shader_review_targets, tool, _parsed_result(result),
                          arguments or {}, fact["outcome"] == "error",

@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 from replaylab_agent.connectors import langchain_models
+from replaylab_agent.connectors import openai_compatibility
 from replaylab_agent.errors import ConfigurationError
 from replaylab_agent.profiles import Profile
 from replaylab_agent.provider_diagnostics import provider_failure_metadata
@@ -30,7 +31,11 @@ def test_every_api_constructor_has_bounded_request_defaults(preset, url, options
         langchain_models.build_chat_model(profile, environ={profile.key_env: "synthetic-key"})
     kwargs = getattr(load.return_value, constructor).call_args.kwargs
     assert kwargs["max_retries"] == 2
-    assert kwargs["timeout"] == 120.0
+    if constructor in {"ChatOpenAI", "AzureChatOpenAI"}:
+        assert kwargs["timeout"] == httpx.Timeout(120, read=600)
+        assert kwargs["stream_chunk_timeout"] == 600
+    else:
+        assert kwargs["timeout"] == 120.0
     assert profile.options == options
 
 
@@ -40,6 +45,7 @@ def test_explicit_timeout_and_retry_override_remain_exact():
         langchain_models.build_chat_model(profile, max_retries=0)
     kwargs = load.return_value.ChatOpenAI.call_args.kwargs
     assert kwargs["max_retries"] == 0 and kwargs["timeout"] == 42.5
+    assert kwargs["stream_chunk_timeout"] == 42.5
 
 
 def test_azure_v1_constructs_real_sdk_without_legacy_version_or_deployment_prefix(monkeypatch):
@@ -50,12 +56,14 @@ def test_azure_v1_constructs_real_sdk_without_legacy_version_or_deployment_prefi
                       options={"max_output_tokens": 2048})
     model = langchain_models.build_chat_model(profile, environ={profile.key_env: "synthetic-key"})
     try:
-        assert type(model) is ChatOpenAI
+        assert isinstance(model,ChatOpenAI)
         assert str(model.root_client.base_url) == profile.base_url + "/"
         assert model.model_name == "deployment-name"
         assert model.max_tokens == 2048
-        assert model.root_client.max_retries == 2
-        assert model.root_client.timeout == 120.0
+        assert model.root_client.max_retries == 0
+        assert model._bread_max_retries == 2
+        assert model.root_client.timeout == httpx.Timeout(120, read=600)
+        assert model.stream_chunk_timeout == 600
     finally:
         model.root_client.close()
         asyncio.run(model.root_async_client.close())
@@ -97,13 +105,19 @@ def _chat_response():
 
 
 def _transport_model(monkeypatch, handler):
-    import openai._base_client
     from langchain_openai import ChatOpenAI
     sync = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(500)))
     async_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    monkeypatch.setattr(openai._base_client.BaseClient, "_calculate_retry_timeout", lambda *args, **kwargs: 0)
+    retry_delay = openai_compatibility._retry_delay
+    monkeypatch.setattr(openai_compatibility, "_retry_delay",
+                        lambda *args: None if retry_delay(*args) is None else 0)
+
+    class TestChatOpenAI(ChatOpenAI):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs, http_client=sync, http_async_client=async_client)
+
     monkeypatch.setattr(langchain_models, "_load", lambda *args: SimpleNamespace(
-        ChatOpenAI=lambda **kwargs: ChatOpenAI(**kwargs, http_client=sync, http_async_client=async_client)))
+        ChatOpenAI=TestChatOpenAI))
     profile = Profile(id="test", preset="custom-openai", model="fixture-model",
                       base_url="https://api.invalid/v1", options={"api": "chat"})
     model = langchain_models.build_chat_model(profile, environ={profile.key_env: "synthetic-key"})
@@ -113,7 +127,9 @@ def _transport_model(monkeypatch, handler):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status,code,attempts", [
     (401, "invalid_api_key", 1), (403, "permission_denied", 1),
-    (400, "invalid_request_error", 1), (429, "insufficient_quota", 3),
+    (400, "invalid_request_error", 1), (429, "insufficient_quota", 1),
+    (429, "credit_balance_exhausted", 1), (429, "project_spend_limit_exceeded", 1),
+    (429, "rate_limit_exceeded", 3),
     (503, "server_overloaded", 3),
 ])
 async def test_actual_sdk_failure_retry_is_bounded_per_request(monkeypatch, status, code, attempts):
@@ -182,6 +198,35 @@ async def test_cancelled_request_exits_without_retry(monkeypatch):
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=1)
         assert count == 1
+    finally:
+        model.root_client.close()
+        await model.root_async_client.close()
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_survives_gap_longer_than_sdk_default(monkeypatch):
+    monkeypatch.setenv("LANGCHAIN_OPENAI_STREAM_CHUNK_TIMEOUT_S", "0.02")
+    monkeypatch.setattr(langchain_models, "DEFAULT_OPENAI_STREAM_IDLE_SECONDS", .5)
+
+    class PausedStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for index, word in enumerate(("first", " second")):
+                if index:
+                    yield b": keepalive\n\n"
+                    await asyncio.sleep(.06)
+                chunk = {"id": "fixture", "object": "chat.completion.chunk", "created": 0,
+                         "model": "fixture-model", "choices": [{"index": 0,
+                         "delta": {"role": "assistant", "content": word},
+                         "finish_reason": "stop" if index else None}]}
+                yield ("data: " + json.dumps(chunk) + "\n\n").encode()
+            yield b"data: [DONE]\n\n"
+
+    async def handler(request):
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=PausedStream())
+
+    model = _transport_model(monkeypatch, handler)
+    try:
+        assert "".join([chunk.content async for chunk in model.astream("fixture request")]) == "first second"
     finally:
         model.root_client.close()
         await model.root_async_client.close()

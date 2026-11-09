@@ -64,6 +64,30 @@ def test_plain_answer_can_review_existing_reasoning_without_any_probe(tmp_path):
     assert TaskReportStore("task-1", tmp_path).task_review_state()["fresh"] is True
 
 
+def test_new_visual_publication_needs_its_presentation_assessment(tmp_path):
+    store=_store(tmp_path)
+    inventory=dict(cards=[dict(type='image',title='Requested image',nodes=[])])
+    store.register_reply_visual('a'*64,presentation=inventory)
+    with pytest.raises(ValueError,match='visual_review'):
+        store.record_task_review('complete',_criteria(),[],[])
+    evidence='The user asked for one image. It answers that question; a graph and code are not useful here.'
+    review=store.record_task_review('complete',_criteria(),[],[],visual_review=evidence)
+    assert review['visualReview']==dict(visualId='a'*64,evidence=evidence)
+    assert store.task_review_state()['fresh']
+    store.register_reply_visual('b'*64,presentation=inventory)
+    state=store.task_review_state()
+    assert not state['fresh'] and state['visualPublication']['id']=='b'*64
+    store.record_task_review('complete',_criteria(),[],[],visual_review='Checked the corrected image and its caption.')
+    assert store.task_review_state()['fresh']
+
+
+def test_legacy_visual_registration_does_not_rewrite_old_review_contract(tmp_path):
+    store=_store(tmp_path)
+    store.register_reply_visual('a'*64)
+    store.record_task_review('complete',_criteria(),[],[])
+    assert store.task_review_state()['fresh']
+
+
 def test_frame_diagram_quality_cannot_be_overruled_by_self_review(tmp_path):
     store = _store(tmp_path)
     receipt = {"schema": "bread-frame-render-flow-publication/v1", "flowId": "flow-test",

@@ -1347,7 +1347,7 @@ class ReplayLabRestoreHostClient(object):
                  startup_timeout_seconds=60, poll_seconds=0.1,
                  request_timeout_seconds=3.0, transport=None,
                  health_transport=None, sleep=None, monotonic=None,
-                 internal_executable=None):
+                 internal_executable=None, confirm_replay_rollback=False):
         self.runtime_directory = os.path.abspath(
             runtime_directory or runtime_root())
         self.timeout_seconds = max(1.0, float(timeout_seconds))
@@ -1366,9 +1366,16 @@ class ReplayLabRestoreHostClient(object):
             internal_executable)
         self._cancelled = threading.Event()
         self._restore_generation = None
+        self._confirm_replay_rollback = confirm_replay_rollback
+        self._inspection_requested = threading.Event()
+        self.replay_inspection_safe = True
 
     def cancel(self):
         self._cancelled.set()
+
+    def cancel_for_inspection(self):
+        self._inspection_requested.set()
+        self.cancel()
 
     def _cancel_requested(self):
         with _RESTORE_LIFECYCLE:
@@ -1599,6 +1606,30 @@ class ReplayLabRestoreHostClient(object):
             # The Host also owns a deadline, so a failed cleanup request cannot
             # justify replacing or delaying that original diagnostic.
             pass
+
+    def _confirm_restore_rollback(self, port, token, job_id):
+        """Wait for this job's Host rollback, rather than its DELETE acknowledgment."""
+        path = "%s/%s" % (RESTORE_JOB_PATH, job_id)
+        deadline = self.monotonic() + 20
+        try:
+            result = self._request(port, token, "DELETE", path, cancellation_cleanup=True)
+            while True:
+                _, status, _, _ = self._snapshot(result, job_id)
+                if status in ("completed", "failed"):
+                    # A completed job won the race before analysis started.
+                    # Failed rollback must not be mistaken for clean cancellation.
+                    self.replay_inspection_safe = (
+                        status == "completed" or
+                        result.get("error") == "Bread project restore was cancelled")
+                    return
+                if self.monotonic() >= deadline:
+                    return
+                (self.sleep or time.sleep)(self.poll_seconds)
+                result = self._request(port, token, "GET", path + "?after=0",
+                                       cancellation_cleanup=True)
+        except ReplayLabRestoreClientError:
+            # Keep the admission barrier closed if the Host cannot prove cleanup.
+            return
 
     @staticmethod
     def _snapshot(value, expected_job_id=None, after_sequence=0):
@@ -2030,11 +2061,13 @@ class ReplayLabRestoreHostClient(object):
         _publish_progress(progress_callback, "host-health")
         self._verify_health(port, pid, version, host_instance_id)
         _publish_progress(progress_callback, "restore-submit")
+        self._check_cancelled()
+        self.replay_inspection_safe = not self._confirm_replay_rollback
         started = self._request(port, token, "POST", RESTORE_JOB_PATH, {
             "projectRoot": project,
             "capturePath": capture,
             "captureSessionId": session,
-        })
+        }, cancellation_cleanup=self._confirm_replay_rollback)
         job_id, status, events, latest_sequence = self._snapshot(
             started, after_sequence=0)
         sequence = 0
@@ -2052,9 +2085,13 @@ class ReplayLabRestoreHostClient(object):
         if status in ("completed", "failed") and sequence >= latest_sequence:
             if status == "completed":
                 _publish_progress(progress_callback, "result-validate")
-                return self._result(
+                value = self._result(
                     started.get("result"), project, capture, session)
+                self.replay_inspection_safe = True
+                return value
             error = str(started.get("error", "") or "").strip()
+            if error == "Bread project restore was cancelled":
+                self.replay_inspection_safe = True
             raise ReplayLabRestoreClientError(
                 error[:4096] or "Bread project restore failed")
 
@@ -2105,18 +2142,27 @@ class ReplayLabRestoreHostClient(object):
                     continue
                 if status == "completed":
                     _publish_progress(progress_callback, "result-validate")
-                    return self._result(
+                    value = self._result(
                         snapshot.get("result"), project, capture, session)
+                    self.replay_inspection_safe = True
+                    return value
                 if status == "failed":
                     error = str(snapshot.get("error", "") or "").strip()
+                    if error == "Bread project restore was cancelled":
+                        self.replay_inspection_safe = True
                     raise ReplayLabRestoreClientError(
                         error[:4096] or "Bread project restore failed")
                 self._wait(self.poll_seconds)
         except ReplayLabRestoreClientError:
-            if self._cancel_requested():
+            if self._inspection_requested.is_set() and not self.replay_inspection_safe:
+                self._confirm_restore_rollback(port, token, job_id)
+            elif self._cancel_requested():
                 self._cancel_restore_job_best_effort(port, token, job_id)
             raise
-        self._cancel_restore_job_best_effort(port, token, job_id)
+        if self._inspection_requested.is_set():
+            self._confirm_restore_rollback(port, token, job_id)
+        else:
+            self._cancel_restore_job_best_effort(port, token, job_id)
         raise ReplayLabRestoreClientError(
             "Bread project restore timed out")
 

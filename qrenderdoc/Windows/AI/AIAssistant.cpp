@@ -210,9 +210,8 @@ const int MaxClarificationOtherChars = 16 * 1024;
 const int MaxClarificationOriginChars = 256 * 1024;
 const int MaxDiscoveredModels = 200;
 const int MaxModelIdBytes = 512;
-const int MaxConversationStoreChars = 4 * 1024 * 1024;
 const int MaxConversationMessageChars = 256 * 1024;
-const int MaxConversationMessages = 200;
+const int MaxConversationMessages = 1000;
 const int MaxConversationThreads = 32;
 const int MaxPendingChats = 64;
 const int MaxStoredConversationActivities = 256;
@@ -2932,14 +2931,9 @@ void drainConversationSaveQueue(const std::shared_ptr<AIConversationSaveQueueSta
 
     const QByteArray payload = work.document.toJson(QJsonDocument::Compact);
     QString error;
-    bool saved = payload.size() <= MaxConversationStoreChars;
-    if(saved)
-      // Use the normalized path captured on the GUI thread. A later capture rename, deletion or
-      // symlink change must not move this generation to a different storage key.
-      saved = AIConversationStore::Save(work.normalizedPath, payload, &error);
-    else
-      // i18n-ignore: developer diagnostic written only to the debug log.
-      error = QStringLiteral("encoded payload exceeds 4 MiB");
+    // Use the normalized path captured on the GUI thread. A later capture rename, deletion or
+    // symlink change must not move this generation to a different storage key.
+    const bool saved = AIConversationStore::Save(work.normalizedPath, payload, &error);
     {
       QMutexLocker locker(&state->mutex);
       const auto latest = state->latestDocuments.constFind(work.normalizedPath);
@@ -3514,6 +3508,10 @@ static const ProviderRuntimeTranslation taskRuntimeTranslations[] = {
                         "task.capabilities.inherited")},
     {"task.provider.retry-capacity",
      QT_TRANSLATE_NOOP3("AIAssistant", "Model capacity is temporarily unavailable. Continuing this session in %1 seconds (retry %2 of %3).", "task.provider.retry-capacity")},
+    {"task.provider.retry-session",
+     QT_TRANSLATE_NOOP3("AIAssistant", "The provider's account lookup timed out. Retrying in %1 seconds (%2 of %3).", "task.provider.retry-session")},
+    {"task.provider.session-ready",
+     QT_TRANSLATE_NOOP3("AIAssistant", "Provider connection restored. Continuing the request.", "task.provider.session-ready")},
     {"task.error.provider-capacity",
      QT_TRANSLATE_NOOP3("AIAssistant", "The selected model is temporarily at capacity. Retry later or choose another model; the task is unfinished.", "task.error.provider-capacity")},
     {"doctor.context-window-unknown",
@@ -4408,6 +4406,12 @@ AIAssistant::AIAssistant(CaptureContext &ctx, QWidget *parent) : QFrame(parent),
   m_EventTimer->setInterval(TaskEventPollIntervalMs);
   connect(m_EventTimer, &QTimer::timeout, this, [this]() { pollTaskEvents(); });
 
+  m_ConnectionStatusTimer = new QTimer(this);
+  m_ConnectionStatusTimer->setSingleShot(true);
+  m_ConnectionStatusTimer->setInterval(1000);
+  connect(m_ConnectionStatusTimer, &QTimer::timeout, this,
+          [this]() { refreshConnectionStatus(); });
+
   m_ConversationSaveTimer = new QTimer(this);
   m_ConversationSaveTimer->setSingleShot(true);
   connect(m_ConversationSaveTimer, &QTimer::timeout, this, [this]() { saveConversations(); });
@@ -4544,6 +4548,8 @@ void AIAssistant::Shutdown()
   discardAllChatContextFreezes();
   if(m_EventTimer)
     m_EventTimer->stop();
+  if(m_ConnectionStatusTimer)
+    m_ConnectionStatusTimer->stop();
   if(m_ConversationRenderTimer)
     m_ConversationRenderTimer->stop();
   if(m_ChatContextFreezeTimer)
@@ -4856,10 +4862,20 @@ bool AIAssistant::addRenderTargetAnnotation(const QImage &original, const QImage
     return false;
   }
   QByteArray encoded[2];
-  const QImage images[] = {original, annotated};
+  QImage images[] = {original, annotated};
+  // The editor uses native RT pixels. The attachment protocol caps each encoded image at 1600.
+  const QSize limit(1600, 1600);
+  for(QImage &image : images)
+  {
+    if(image.width() <= limit.width() && image.height() <= limit.height())
+      continue;
+    const QSize scaled = image.size().scaled(limit, Qt::KeepAspectRatio).expandedTo(QSize(1, 1));
+    image = image.scaled(scaled, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+  }
   bool jpeg = false;
   for(int attempt = 0; attempt < 2; ++attempt)
   {
+    jpeg = attempt > 0;
     for(int i = 0; i < 2; ++i)
     {
       encoded[i].clear();
@@ -4870,7 +4886,6 @@ bool AIAssistant::addRenderTargetAnnotation(const QImage &original, const QImage
     }
     if(encoded[0].size() + encoded[1].size() <= MaxBinaryAttachmentTotalBytes)
       break;
-    jpeg = true;
   }
   const uint32_t eid = uint32_t(
       context.value(QLatin1String("capture")).toObject().value(QLatin1String("eventId")).toDouble());
@@ -4891,6 +4906,8 @@ bool AIAssistant::addRenderTargetAnnotation(const QImage &original, const QImage
     attachment.originalBytes = encoded[i].size();
     attachment.context = context;
     QJsonObject annotation = context.value(QLatin1String("annotation")).toObject();
+    annotation[QLatin1String("imageWidth")] = images[i].width();
+    annotation[QLatin1String("imageHeight")] = images[i].height();
     annotation[QLatin1String("imageRole")] =
         i == 0 ? QLatin1String("original") : QLatin1String("annotated");
     attachment.context[QLatin1String("annotation")] = annotation;
@@ -7423,12 +7440,23 @@ void AIAssistant::handleTranscriptLink(const QUrl &url)
             leaf.value(QLatin1String("textureResourceId")).toString().toULongLong();
         ResourceId texture;
         memcpy(&texture, &raw, sizeof(texture));
-        m_Ctx.SetEventID({}, eid, eid, true);
+        if(m_Ctx.CurEvent() != eid || m_Ctx.CurSelectedEvent() != eid)
+          m_Ctx.SetEventID({}, eid, eid, true);
         if(BufferViewer *viewer = qobject_cast<BufferViewer *>(m_Ctx.GetMeshPreview()->Widget()))
         {
           m_Ctx.AddDockWindow(viewer, DockReference::MainToolArea, this);
+          if(leaf.contains(QLatin1String("framing")) || leaf.contains(QLatin1String("selectionKeyData")))
+            viewer->setMeshEvidence(leaf.toVariantMap());
+          else
+          {
           viewer->NavigateMeshUV(stageIndex, leaf.value(QLatin1String("channel")).toString(),
                                  leaf.value(QLatin1String("pair")).toInt() == 1 ? 2 : 0, texture);
+          if(leaf.contains(QLatin1String("selectedVertices")))
+            viewer->NavigateMeshSelection(
+                leaf.value(QLatin1String("selectionMode")).toString(),
+                leaf.value(QLatin1String("selectedVertices")).toArray().toVariantList(),
+                leaf.value(QLatin1String("selectedElements")).toArray().toVariantList());
+          }
           m_Ctx.RaiseDockWindow(viewer);
           viewer->show();
         }
@@ -7541,6 +7569,9 @@ void AIAssistant::handleTranscriptLink(const QUrl &url)
     {
       request[QStringLiteral("line")] = line;
       request[QStringLiteral("column")] = column;
+      request[QStringLiteral("symbol")] = query.queryItemValue(QStringLiteral("symbol"));
+      request[QStringLiteral("selectLine")] = query.queryItemValue(QStringLiteral("selectLine")) == QStringLiteral("1");
+      request[QStringLiteral("sourceSha256")] = query.queryItemValue(QStringLiteral("sourceSha256"));
       QString error;
       const QString result = m_Ctx.ReplayLab().NavigateShaderSourceJSON(
           QString::fromUtf8(QJsonDocument(request).toJson(QJsonDocument::Compact)), &error);
@@ -7574,10 +7605,28 @@ void AIAssistant::handleTranscriptLink(const QUrl &url)
       ResourceId id;
       static_assert(sizeof(id) == sizeof(raw), "ResourceId wire size changed");
       memcpy(&id, &raw, sizeof(id));
-      if(target == lit("texture"))
+      const QUrlQuery query(url);
+      const bool eventScoped = query.hasQueryItem(QLatin1String("eid"));
+      if(target == QLatin1String("texture") ||
+         (target == QLatin1String("resource") && eventScoped && m_Ctx.GetTexture(id)))
       {
-        m_Ctx.GetTextureViewer()->ViewTexture(id, CompType::Typeless, true);
+        bool validEvent = true;
+        const uint32_t eid = eventScoped
+                                 ? query.queryItemValue(QLatin1String("eid")).toUInt(&validEvent)
+                                 : 0;
+        if(!m_Ctx.GetTexture(id) || (eventScoped && (!validEvent || !eid || !m_Ctx.GetAction(eid))))
+        {
+          appendSystem(tr("The link is not an allowed RenderDoc navigation target."), true);
+          return;
+        }
+        if(eid && (m_Ctx.CurEvent() != eid || m_Ctx.CurSelectedEvent() != eid))
+          m_Ctx.SetEventID({}, eid, eid, true);
         m_Ctx.ShowTextureViewer();
+        TextureViewer *viewer = qobject_cast<TextureViewer *>(m_Ctx.GetTextureViewer()->Widget());
+        if(!viewer || (eid && m_Ctx.CurEvent() != eid) ||
+           !viewer->FollowBoundTexture(id, query.queryItemValue(QLatin1String("kind"))))
+          appendSystem(tr("This texture is not bound to an input or output at the linked event."),
+                       true);
         return;
       }
       if(target == lit("buffer"))
@@ -7916,7 +7965,7 @@ void AIAssistant::loadConversations()
     const bool loaded = latestConversationPayload(m_CaptureConversationPath, &encoded) ||
                         AIConversationStore::Load(m_CaptureConversationPath, &encoded,
                                                   &storeError);
-    if(loaded && encoded.size() <= MaxConversationStoreChars)
+    if(loaded)
     {
       if(!encoded.isEmpty())
       {
@@ -7959,10 +8008,6 @@ void AIAssistant::loadConversations()
           }
         }
       }
-    }
-    else if(encoded.size() > MaxConversationStoreChars && storeError.isEmpty())
-    {
-      storeError = tr("The stored conversation payload exceeds the 4 MiB limit.");
     }
   }
   if(m_Conversations.isEmpty())
@@ -8074,7 +8119,7 @@ void AIAssistant::saveConversations()
   if(m_ConversationSaveTimer && m_ConversationSaveTimer->isActive())
     m_ConversationSaveTimer->stop();
   // Keep a conservative byte margin for UTF-8 conversion, JSON structure and escaping.
-  int remainingChars = MaxConversationStoreChars / 4 - 8192;
+  int remainingChars = AIConversationStore::MaximumPayloadBytes / 4 - 8192;
   QJsonObject root;
   root[lit("schema")] = lit("replaylab-ai-conversations/v5");    // i18n-ignore: conversation store field/schema ID
   root[lit("activeConversationId")] = m_ActiveConversationId;
@@ -8165,7 +8210,9 @@ void AIAssistant::saveConversations()
         return a->createdMs > b->createdMs;
       });
   const int threadCount = qMin(MaxConversationThreads, orderedThreads.size());
-  for(int i = 0; i < threadCount && remainingChars > 0; ++i)
+  // Preserve thread identities even when only the newest messages fit. The store merges older
+  // messages by identity; an omitted thread would instead be treated as an explicit deletion.
+  for(int i = 0; i < threadCount; ++i)
     threads.push_back(conversationToJSON(*orderedThreads[i], &remainingChars));
   root[lit("conversations")] = threads;
   // The QObject-owned model is read and bounded only on the GUI thread. The implicitly shared,
@@ -8245,22 +8292,25 @@ QString AIAssistant::findAgentCLI() const
 {
   // A portable distribution must never pick a source venv, PATH executable or another install.
   const QDir application(QCoreApplication::applicationDirPath());
+  const QString bundled = application.filePath(lit("replaylab/replaylab-ai.exe"));    // i18n-ignore: fixed first-party executable path
   if(application.exists(lit("RenderDocBread.portable")))    // i18n-ignore: portable package marker
   {
-    const QString bundled = application.filePath(lit("replaylab/replaylab-ai.exe"));    // i18n-ignore: fixed first-party executable path
     return QFileInfo(bundled).isFile() ? bundled : QString();
   }
   const QString configured = environmentValue("REPLAYLAB_AI_CLI").trimmed();
   if(!configured.isEmpty() && QFileInfo(configured).isFile())
     return QFileInfo(configured).absoluteFilePath();
 
+  // A deployed runtime belongs to this application. Keep an explicit override for source tests.
+  // i18n-ignore: fixed manifest path for the runtime deployed beside the GUI.
+  if(application.exists(lit("replaylab/replaylab-runtime-manifest.json")) && QFileInfo(bundled).isFile())
+    return bundled;
+
   const QString appDir = QCoreApplication::applicationDirPath();
   QStringList candidates;
 #if defined(Q_OS_WIN)
 #if !defined(RELEASE)
-  // Development builds must prefer the live repository environment. Otherwise
-  // a previously deployed one-file AgentHost silently masks newer orchestration,
-  // bridge, Skill, and cancellation code while source-level tests still pass.
+  // An undeployed development checkout can still run the source environment.
   candidates << QDir(appDir).filePath(lit("../../replaylab/.venv/Scripts/replaylab-ai.exe"));
 #endif
   candidates << QDir(appDir).filePath(lit("replaylab-ai.exe"));
@@ -8318,7 +8368,8 @@ bool AIAssistant::findBridgeBinding(QString *instanceId, QString *captureSession
   const qint64 now = QDateTime::currentMSecsSinceEpoch();
   const qint64 currentPid = QCoreApplication::applicationPid();
   const QFileInfoList directories =
-      instances.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Time);
+      instances.entryInfoList(QStringList{QString::number(currentPid) + QLatin1String("-*")},
+                              QDir::Dirs | QDir::NoDotAndDotDot, QDir::Time);
   for(const QFileInfo &directory : directories)
   {
     QFile manifest(QDir(directory.absoluteFilePath()).filePath(lit("instance.json")));
@@ -13087,6 +13138,8 @@ void AIAssistant::runDoctor()
 
 void AIAssistant::refreshConnectionStatus()
 {
+  if(m_ConnectionStatusTimer)
+    m_ConnectionStatusTimer->stop();
   if(m_ShuttingDown || m_ConnectionDialogOpen)
     return;
   if(m_CLIPath.isEmpty())
@@ -13096,7 +13149,13 @@ void AIAssistant::refreshConnectionStatus()
   else if(m_ActiveProfile.isEmpty())
     setDiagnosticStatus(m_Status, DiagnosticLevel::Warning, tr("Add connection"));
   else if(m_Ctx.IsCaptureLoaded() && findBridgeInstance().isEmpty())
+  {
     setDiagnosticStatus(m_Status, DiagnosticLevel::Warning, tr("Waiting for bridge"));
+    // Capture loading can precede the first bridge manifest. Retry this pending
+    // state so the badge becomes ready without a model change or another send.
+    if(m_ConnectionStatusTimer)
+      m_ConnectionStatusTimer->start();
+  }
   else
     setDiagnosticStatus(m_Status, DiagnosticLevel::Success, tr("Chat ready"));
 }

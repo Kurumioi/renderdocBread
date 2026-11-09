@@ -33,6 +33,7 @@ struct MeshUVGeometry
     QVector4D position;
     QPointF uv;
     uint32_t index = 0;
+    bool uvValid = true;
   };
   QVector<Vertex> vertices;
   QVector<std::array<int, 3>> triangles;
@@ -50,11 +51,23 @@ struct MeshUVData
   };
   std::shared_ptr<const MeshUVGeometry> geometry;
   QImage texture;
+  uint32_t textureChannels = 0x7;
+  QImage displayTexture() const;
   Selection mode = Selection::Face;
   QSet<quint64> selected;
   bool flipTexture = false;
 
+private:
+  mutable QImage m_DisplayTexture;
+  mutable qint64 m_DisplaySourceKey = 0;
+  mutable uint32_t m_DisplayChannels = 0;
+
+public:
+
   quint64 key(int triangle, int corner) const;
+  QSet<uint32_t> selectedVertices() const;
+  void changeMode(Selection next);
+  void selectVertices(const QSet<uint32_t> &vertices);
   int elementCount() const { return mode == Selection::Face ? 1 : 3; }
 };
 
@@ -67,13 +80,27 @@ public:
   void geometryChanged();
   void textureChanged();
   void focusSelection();
+  void frameOverview();
+  QImage snapshot();
+  QRectF overviewImageBounds() const;
+  QRectF selectionImageBounds() const;
+  void selectUVRegion(const QRectF &bounds, bool restrictToSelection);
   void selectAll();
   void selectLinked();
+  void selectLinkedAt(const QPointF &point);
+  void selectMeshLinked(const QPointF &point, const QSize &size, const QMatrix4x4 &transform,
+                         bool homogenous);
   void clearSelection();
+  void setSelectionMode(MeshUVData::Selection mode);
+  void selectVertices(const QSet<uint32_t> &vertices);
+  void selectElements(const QSet<quint64> &elements);
   void setBoxSelect(bool enabled);
   bool handleSelectionShortcut(QKeyEvent *event);
-  void selectMesh(const QPointF &point, const QSize &size, const QMatrix4x4 &transform, bool extend);
-  void selectMeshBox(const QRectF &rect, const QSize &size, const QMatrix4x4 &transform, bool extend);
+  void selectMesh(const QPointF &point, const QSize &size, const QMatrix4x4 &transform,
+                  bool homogenous, bool extend);
+  void selectMeshBox(const QRectF &rect, const QSize &size, const QMatrix4x4 &transform,
+                     bool homogenous, bool extend);
+  std::function<QVector4D(const MeshUVGeometry::Vertex &)> meshPosition;
   std::function<void()> selectionChanged;
   std::function<void()> boxShortcut;
   std::function<void(int)> modeShortcut;
@@ -93,6 +120,7 @@ private:
   void selectBox(const QRectF &box, bool extend, const QVector<QPointF> &points);
   void notifySelection();
   void updateWireCache(double density);
+  void selectLinkedFrom(const std::function<void()> &pick);
 
   std::shared_ptr<MeshUVData> m_Mesh;
   QPixmap m_Texture, m_Wire;
@@ -103,9 +131,11 @@ private:
   bool m_BoxSelect = false;
   bool m_DraggingBox = false;
   bool m_Panning = false;
+  bool m_Tiled = false;
   QPointF m_Press, m_Last, m_Pan;
   double m_Zoom = 1.0;
   double m_WireDensity = 0.0;
+  double m_SnapshotScale = 1.0;
 };
 
 // The explicit UV texture mode shares the native camera and mesh data. Static vertex and
@@ -115,10 +145,11 @@ class MeshUVTextureView : public QOpenGLWindow, protected QOpenGLFunctions
 public:
   explicit MeshUVTextureView(std::shared_ptr<MeshUVData> mesh);
   ~MeshUVTextureView() override;
-  void setTransform(const QMatrix4x4 &transform, bool homogenous, bool wireframe);
+  void setTransform(const QMatrix4x4 &transform, bool homogenous, bool wireframe, float nearPlane);
   void setSelection(QVector<QVector4D> vertices, unsigned int primitive);
+  QImage snapshot();
   std::function<void()> unavailable;
-  std::function<void(bool, bool)> rendered;
+  std::function<void(qint64, bool)> rendered;
 
 protected:
   void initializeGL() override;
@@ -129,12 +160,14 @@ private:
   std::shared_ptr<MeshUVData> m_Mesh;
   std::shared_ptr<const MeshUVGeometry> m_UploadedGeometry;
   QMatrix4x4 m_Transform;
+  QSize m_SnapshotSize;
   std::unique_ptr<QOpenGLShaderProgram> m_Shader;
   std::unique_ptr<QOpenGLTexture> m_Texture;
-  QOpenGLBuffer m_Triangles, m_Lines, m_Selected;
+  QOpenGLBuffer m_Background, m_Triangles, m_Lines, m_Points, m_Selected;
   QVector<QVector4D> m_Selection;
   qint64 m_TextureKey = 0;
   int m_TriangleVertices = 0;
+  float m_HighlightDepthBias = 0.0f;
   unsigned int m_SelectionPrimitive = GL_TRIANGLES;
   bool m_Homogenous = false, m_Wireframe = false, m_SelectionDirty = true;
 };

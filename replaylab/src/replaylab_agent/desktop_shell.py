@@ -22,6 +22,7 @@ from typing import Any
 
 from deepagents.backends.local_shell import LocalShellBackend
 from deepagents.backends.protocol import ExecuteResponse
+from .filesystem_backend import Utf8GrepMixin
 
 
 def _resume_windows_process(process: subprocess.Popen[bytes]) -> None:
@@ -38,7 +39,7 @@ process through Popen's retained process handle instead of racing its startup.
         raise OSError(f"Cannot resume contained shell process (NTSTATUS {status:#x})")
 
 
-class DesktopShellBackend(LocalShellBackend):
+class DesktopShellBackend(Utf8GrepMixin,LocalShellBackend):
     """SDK local file tools plus an output-bounded, cancellable native shell."""
 
     def __init__(

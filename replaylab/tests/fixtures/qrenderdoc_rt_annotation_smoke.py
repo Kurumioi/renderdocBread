@@ -37,16 +37,12 @@ class AnnotationSmoke(object):
         return next(item for item in buttons if item.text() == text)
 
     def drag(self, start, end):
-        size = self.canvas.size()
-        texture = pyrenderdoc.GetTexture(self.viewer.GetCurrentResource())
-        mip = int(self.viewer.GetSelectedSubresource().mip)
-        fitted = QtCore.QSize(max(1, int(texture.width) >> mip), max(1, int(texture.height) >> mip))
-        fitted.scale(size, QtCore.Qt.KeepAspectRatio)
-        left, top = (size.width() - fitted.width()) / 2.0, (size.height() - fitted.height()) / 2.0
+        self.canvas.grab()
+        left, top, width, height = self.canvas.property('annotationImageRect')
         for kind, uv in ((QtCore.QEvent.MouseButtonPress, start),
                          (QtCore.QEvent.MouseMove, end),
                          (QtCore.QEvent.MouseButtonRelease, end)):
-            point = QtCore.QPointF(left + uv[0] * fitted.width(), top + uv[1] * fitted.height())
+            point = QtCore.QPointF(left + uv[0] * width, top + uv[1] * height)
             event = QtGui.QMouseEvent(kind, point, QtCore.Qt.LeftButton, QtCore.Qt.LeftButton,
                                      QtCore.Qt.NoModifier)
             self.app.sendEvent(self.canvas, event)
@@ -76,16 +72,25 @@ class AnnotationSmoke(object):
                         visit(action.children)
                 visit(pyrenderdoc.CurRootActions())
                 self.check("fixture has two draw events", len(draws) >= 2)
-                self.anchor, self.other = draws[-1], draws[0]
+                self.anchor, self.other = int(os.getenv("RD_ANNOTATION_EVENT", draws[-1])), draws[0]
+                self.check("annotation observation is a draw", self.anchor in draws)
                 pyrenderdoc.SetEventID([], self.anchor, self.anchor, True)
                 pyrenderdoc.ShowTextureViewer()
                 self.viewer = pyrenderdoc.GetTextureViewer()
+                resource = os.getenv("RD_ANNOTATION_RESOURCE")
+                if resource:
+                    texture = next(t for t in pyrenderdoc.GetTextures()
+                                   if str(t.resourceId).split("::")[-1] == resource)
+                    self.viewer.ViewTexture(texture.resourceId, rd.CompType.Typeless, True)
                 self.window = pyrenderdoc.GetMainWindow().Widget()
                 self.keep.extend([self.viewer, self.window])
                 self.window.findChild(QtWidgets.QAction, "action_AI_Assistant").trigger()
                 self.phase = "binding"
+                self.ready_after = time.monotonic() + 1.0
                 return
             if self.phase == "binding":
+                if time.monotonic() < self.ready_after:
+                    return
                 instances = Path(os.environ["LOCALAPPDATA"]) / "ReplayLab/ipc-v2/instances"
                 ready = False
                 for path in instances.glob("*/instance.json"):
@@ -108,11 +113,44 @@ class AnnotationSmoke(object):
                 self.check("canvas appears in texture viewer", self.panel.isVisible() and self.canvas.width() > 100)
                 self.result["canvasSize"] = [self.canvas.width(), self.canvas.height()]
                 self.panel.grab().save(os.environ["BREAD_DIAG_UI_IMAGE"])
+                self.panel.grab().save(os.environ["BREAD_DIAG_UI_IMAGE"])
+                controls = {name: self.button(name) for name in
+                            ("Fit", "Undo", "Redo", "Clear", "Cancel", "Add to conversation")}
+                canvas_top = self.canvas.mapToGlobal(QtCore.QPoint()).y()
+                self.check("actions above the drawing canvas", all(
+                    widget.mapToGlobal(QtCore.QPoint()).y() + widget.height() <= canvas_top
+                    for widget in controls.values()))
+                def position(name):
+                    point = controls[name].mapToGlobal(QtCore.QPoint())
+                    return point.y(), point.x()
+
+                fit_y, fit_x = position("Fit")
+                undo_y, undo_x = position("Undo")
+                self.check("history follows Fit across toolbar rows",
+                           (undo_y > fit_y + 5 or (abs(undo_y - fit_y) <= 5 and undo_x > fit_x)) and
+                           position("Undo")[1] < position("Redo")[1] < position("Clear")[1])
+                self.check("actions are grouped on the upper right",
+                           position("Cancel")[0] == position("Add to conversation")[0] and
+                           position("Cancel")[0] < position("Fit")[0] and
+                           position("Cancel")[1] < position("Add to conversation")[1])
+                self.check("toolbar controls fit within the canvas width", all(
+                    widget.mapTo(self.panel, QtCore.QPoint()).x() + widget.width() <= self.panel.width()
+                    for widget in controls.values()))
+                self.check("add waits for marks", not controls["Add to conversation"].isEnabled())
+
+                def background(button):
+                    image = button.grab().toImage()
+                    return image.pixelColor(8, image.height() // 2)
+
+                cancel_color = background(controls["Cancel"])
+                self.check("Cancel has a red background", cancel_color.red() > cancel_color.green() + 25)
                 self.button("Circle").click()
                 self.drag((.3, .35), (.6, .65))
                 self.button("Arrow").click()
                 self.drag((.75, .7), (.45, .5))
                 self.check("marks enable attachment", self.button("Add to conversation").isEnabled())
+                add_color = background(controls["Add to conversation"])
+                self.check("Add to conversation has a green background", add_color.green() > add_color.red() + 25)
                 self.panel.grab().save(os.environ["BREAD_DIAG_UI_IMAGE"])
                 pyrenderdoc.SetEventID([], self.other, self.other, True)
                 self.phase = "attach"

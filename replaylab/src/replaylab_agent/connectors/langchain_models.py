@@ -17,6 +17,7 @@ from ..profiles import Profile, azure_endpoint_uses_v1
 _INSTALL_HINT = 'pip install "replaylab-agenthost"'
 _LOCAL_API_KEY_PLACEHOLDER = "replaylab-local-no-key"
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 120.0
+DEFAULT_OPENAI_STREAM_IDLE_SECONDS = 600.0
 DEFAULT_REQUEST_MAX_RETRIES = 2
 
 
@@ -48,13 +49,24 @@ def _load(module: str, profile: Profile) -> Any:
         ) from exc
 
 
-def _common_kwargs(profile: Profile, max_retries: int | None = None) -> dict[str, Any]:
+def _common_kwargs(profile: Profile, max_retries: int | None = None, *, openai_stream=False) -> dict[str, Any]:
     # Bound one provider request, not the graph/Agent invocation. In particular
     # never replay an Agent after it has already executed a Host tool.
     kwargs: dict[str, Any] = {
         "max_retries": DEFAULT_REQUEST_MAX_RETRIES if max_retries is None else max_retries,
         "timeout": float(profile.options.get("timeout_seconds", DEFAULT_REQUEST_TIMEOUT_SECONDS)),
     }
+    if openai_stream:
+        if "timeout_seconds" in profile.options:
+            kwargs["stream_chunk_timeout"] = kwargs["timeout"]
+        else:
+            from httpx import Timeout
+
+            # SSE keepalives can keep the socket active during long reasoning.
+            # Bound both parsed-content silence and a fully silent transport.
+            kwargs["stream_chunk_timeout"] = DEFAULT_OPENAI_STREAM_IDLE_SECONDS
+            kwargs["timeout"] = Timeout(DEFAULT_REQUEST_TIMEOUT_SECONDS,
+                                        read=DEFAULT_OPENAI_STREAM_IDLE_SECONDS)
     if "temperature" in profile.options:
         kwargs["temperature"] = float(profile.options["temperature"])
     return kwargs
@@ -120,7 +132,7 @@ def build_chat_model(
         surface = _string_option(profile, "api", default_surface).lower()
         if surface not in {"chat", "responses"}:
             raise ConfigurationError(f"profile '{profile.id}' options.api must be 'chat' or 'responses'")
-        kwargs = _common_kwargs(profile, max_retries)
+        kwargs = _common_kwargs(profile, max_retries, openai_stream=True)
         kwargs.update({"model": model_name, "api_key": api_key, "base_url": endpoint})
         if _max_output_tokens(profile):
             kwargs["max_tokens"] = _max_output_tokens(profile)
@@ -218,7 +230,7 @@ def build_chat_model(
         endpoint = _require_endpoint(profile)
         api_key = profile.resolve_api_key(environment)
         module = _load("langchain_openai", profile)
-        kwargs = _common_kwargs(profile, max_retries)
+        kwargs = _common_kwargs(profile, max_retries, openai_stream=True)
         if azure_endpoint_uses_v1(endpoint):
             # The v1 endpoint already contains its API route and uses the
             # ordinary OpenAI contract. AzureChatOpenAI would require the
@@ -229,7 +241,8 @@ def build_chat_model(
             effort = profile.options.get("reasoning_effort")
             if effort is not None:
                 kwargs["reasoning_effort"] = str(effort)
-            return module.ChatOpenAI(**kwargs)
+            from .openai_compatibility import compatible_chat_model
+            return compatible_chat_model(module.ChatOpenAI,kwargs)
         kwargs.update(
             {
                 "azure_deployment": model_name,
@@ -243,7 +256,8 @@ def build_chat_model(
         effort = profile.options.get("reasoning_effort")
         if effort is not None:
             kwargs["reasoning_effort"] = str(effort)
-        return module.AzureChatOpenAI(**kwargs)
+        from .openai_compatibility import compatible_chat_model
+        return compatible_chat_model(module.AzureChatOpenAI,kwargs)
 
     raise ConfigurationError(
         f"profile '{profile.id}' uses model protocol '{protocol}', which the deepagents engine does not support yet"

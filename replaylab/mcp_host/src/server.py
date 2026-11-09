@@ -8,7 +8,7 @@ Architecture:
 
 from __future__ import annotations
 import asyncio, atexit, contextvars, copy, fnmatch, hashlib, hmac, json, logging, os, re, secrets, subprocess, tempfile, threading, time, shutil, uuid
-import base64, codecs, mimetypes
+import base64, codecs, math, mimetypes
 import sys
 from collections import Counter, OrderedDict
 from datetime import datetime, timezone
@@ -260,11 +260,20 @@ def _accept_string_resource_ids(function: Any) -> Any:
 
     import functools
     import inspect
+    import typing
 
     try:
         signature = inspect.signature(function)
     except (TypeError, ValueError):
         return function
+    # Instrumentation wrappers live in other modules. Resolve postponed types
+    # against the original declaration before detaching __wrapped__, otherwise a
+    # mixed ResourceId/Literal signature is evaluated in the wrapper's namespace.
+    resolved = typing.get_type_hints(inspect.unwrap(function))
+    signature = signature.replace(
+        parameters=[p.replace(annotation=resolved.get(name, p.annotation))
+                    for name, p in signature.parameters.items()],
+        return_annotation=resolved.get('return', signature.return_annotation))
     targets: dict[str, bool] = {}
     parameters = []
     for name, parameter in signature.parameters.items():
@@ -276,7 +285,7 @@ def _accept_string_resource_ids(function: Any) -> Any:
         if _RESOURCE_ID_PARAMETER.search(name) and (is_int or is_optional_int):
             optional = is_optional_int or parameter.default is None
             targets[name] = optional
-            parameters.append(parameter.replace(annotation="int | str | None" if optional else "int | str"))
+            parameters.append(parameter.replace(annotation=int | str | None if optional else int | str))
         else:
             parameters.append(parameter)
     if not targets:
@@ -291,9 +300,9 @@ def _accept_string_resource_ids(function: Any) -> Any:
 
     def _finish_wrapper(wrapper: Any) -> Any:
         wrapper.__signature__ = signature.replace(parameters=parameters)  # type: ignore[attr-defined]
-        annotations = dict(getattr(function, "__annotations__", {}))
+        annotations = dict(resolved)
         for name, optional in targets.items():
-            annotations[name] = "int | str | None" if optional else "int | str"
+            annotations[name] = int | str | None if optional else int | str
         wrapper.__annotations__ = annotations
         # FastMCP must see the widened signature, not follow __wrapped__ to the original.
         del wrapper.__wrapped__
@@ -3497,7 +3506,9 @@ def control_application_ui(
     Inspect first for target IDs and supported actions. open_window takes
     arguments={window: a returned window ID}; other actions are focus, close,
     activate, set_value(value), select(index or row_path,column,activate),
-    set_cell(row_path,column,value), select_text(start,length).
+    set_cell(row_path,column,value), select_text(start,length). RT annotation
+    canvases expose draw(points=[[u,v],...]) in normalized image coordinates;
+    choose the normal pen/circle/arrow/eraser controls first. No desktop input.
     Normal unsaved-change and modal dialogs remain active; inspect and respond
     to them using their controls. queued is NOT completion: inspect operationId
     status before reporting success. Prefer known Shader/EID/resource tools for
@@ -5183,7 +5194,7 @@ def _capture_event_texture_evidence_receipt(
     white_point: float | None = None, crop: dict[str, int] | None = None,
     max_dimension: int | None = None, stage: str = "fragment",
     value_decode: str = "native",
-    flip_y: bool = False,
+    flip_y: bool = False, preserve_alpha: bool = False,
 ) -> str:
     """Internal JSON receipt path shared by the two image-returning tools."""
 
@@ -5283,6 +5294,7 @@ def _capture_event_texture_evidence_receipt(
                 "range_mode": range_mode,
                 "value_decode": value_decode,
                 "flip_y": flip_y,
+                **({"preserve_alpha": True} if preserve_alpha else {}),
                 "black_point": exact_black,
                 "white_point": exact_white,
                 "request_id": request_id,
@@ -5317,6 +5329,9 @@ def _capture_event_texture_evidence_receipt(
             value_decode=value_decode,
             flip_y=flip_y,
         )
+        if preserve_alpha and validated["artifact"]["status"] == "saved":
+            if validated["artifact"].get("display", {}).get("alphaMode") != "preserved":
+                raise RuntimeError("The texture receipt did not preserve the requested channels")
         if (attachment_kind in {"uav", "srv"}
                 and validated["artifact"].get("attachment", {}).get("stage") != stage):
             raise RuntimeError("The texture receipt does not match the requested Shader stage")
@@ -5546,6 +5561,9 @@ def pixel_history(resource_id: int, x: int, y: int, event_id: int) -> str:
 
     This is not automatically the whole-frame final history. ``event_id`` is
     the exact cutoff and does not depend on the user's later UI selection.
+    For object attribution prefer inspect_pixel_object, which retains Passed(),
+    depth/discard flags, primitive IDs and Shader outputs. This legacy list of
+    pre/post colors alone cannot distinguish failed attempts from visible writes.
 
     Args:
         resource_id: The render target texture resource ID.
@@ -10425,6 +10443,9 @@ def record_task_review(
     next_actions: list[str],
     blocker: str = "",
     decision_request: dict[str, Any] | None = None,
+    visual_review: str = '',
+    visual_checks: dict[str, str] | None = None,
+    reviewed_answer: dict[str, Any] | None = None,
 ) -> str:
     """Record the main Agent's self-review against the current user request.
 
@@ -10441,10 +10462,19 @@ def record_task_review(
     If only a real user choice remains, save concrete results and supply blocked
     with decision_request={question, options:[2-3 choices], evidence:[saved facts]}.
     Present that question and wait; automatic recovery must not resume behind it.
+    For a published visual answer, include visual_review after assessing the actual
+    overview, images, diagram relationships/results, stage code, precise links and
+    relevance against the question and loaded presentation rules. Correct feasible
+    omissions first. For a multi-layer marked effect, visual_checks must cover
+    overview, contributions, display, flow, source, links and inactive with concrete
+    evidence for each. Submit the standalone reviewed_answer with an overview,
+    steps [{text,events:[EID]}], combined result, and optional inactive explanation.
+    This records your presentation judgment, not a Host quality score.
     """
     try:
         return _ok(current_task_report_store().record_task_review(
-            verdict, criteria, findings, next_actions, blocker, decision_request))
+            verdict, criteria, findings, next_actions, blocker, decision_request, visual_review, visual_checks,
+            reviewed_answer))
     except Exception as error:
         return _err(error)
 
@@ -32028,6 +32058,16 @@ def _within_evidence_roots(path: str) -> Path:
         raise ValueError("path cannot be resolved: %s" % error) from error
     if resolved.is_symlink() or not resolved.is_file():
         raise ValueError("path is not a regular file")
+    # Native/file execution produces illustrations in the controller-owned task
+    # workspace. Admit only its validated ordinary artifacts, never a caller-
+    # supplied directory or arbitrary files merely adjacent to a Shader project.
+    from replaylab_agent.owned_workspace import OwnedWorkspace, AGENT_WORKSPACE_ROOT_ENV
+    working_root = os.environ.get(AGENT_WORKSPACE_ROOT_ENV, '')
+    if working_root:
+        try:
+            return OwnedWorkspace(Path(working_root)).path(str(candidate))
+        except (ValueError, OSError, RuntimeError):
+            pass
     roots = _evidence_roots()
     for root in roots:
         try:
@@ -32088,7 +32128,8 @@ def _saved_image_result(summary: dict[str, Any], inline: bool) -> list[Any]:
 @mcp.tool(structured_output=False)
 def capture_texture_image(resource_id: int, crop: dict[str, int] | None = None,
                           max_dimension: int = 512, mip: int = 0, slice: int = 0,
-                          inline: bool = True) -> list[Any]:
+                          inline: bool = True,
+                          display_transfer: Literal['auto','identity','linear-to-srgb']='auto') -> list[Any]:
     """Save one bound texture as a small picture you can actually look at.
 
     An input texture usually says what a material is at a glance — a tiled weave, a
@@ -32106,6 +32147,9 @@ def capture_texture_image(resource_id: int, crop: dict[str, int] | None = None,
     path is returned as well for a runtime that would rather open it, and ``inline=False``
     asks for the path alone. If no picture arrives, this connection cannot carry one —
     say so and work from other evidence. Never describe a picture you have not seen.
+    Auto encodes linear texture previews for sRGB display once, retaining sRGB
+    storage unchanged. Use identity when Shader evidence establishes already
+    display-encoded values in a linear-format resource. Asset export stays raw.
     """
 
     try:
@@ -32125,12 +32169,23 @@ def capture_texture_image(resource_id: int, crop: dict[str, int] | None = None,
                 "saved": False, "reason": str(payload.get("error") or "the texture was not saved"),
                 "applied": False,
             })]
+        if display_transfer not in ('auto','identity','linear-to-srgb'):raise ValueError('Unknown texture display transfer')
+        transfer=('linear-to-srgb'if payload.get('sourceColorSpace')=='linear'else'identity')if display_transfer=='auto'else display_transfer
+        if payload.get('sourceColorSpace')=='srgb':transfer='identity'
+        preview=dict(path=str(payload.get('saved')or destination))
+        if transfer=='linear-to-srgb':
+            from .display_colors import srgb_preview
+            folder=_event_texture_evidence_root()/'texture-previews'
+            _secure_event_artifact_directory(folder,_event_texture_evidence_root())
+            preview=srgb_preview(preview['path'],folder)
         return _saved_image_result({
             "schema": "replaylab-texture-image/v1",
             "schemaVersion": 1,
             "resourceId": int(resource_id),
             "saved": True,
-            "path": str(payload.get("saved") or destination),
+            **preview,
+            "sourceColorSpace":payload.get('sourceColorSpace','unknown'),
+            "displayTransfer":transfer,
             "reduction": payload.get("reduction"),
             "evidenceClass": "observed",
             "applied": False,
@@ -33079,7 +33134,7 @@ import sys as _unity_restoration_sys
 globals().update(_register_unity_restoration_tools(mcp, _unity_restoration_sys.modules[__name__]))
 
 from .effect_experiments import ExactSourceEdit, RelatedVertexEdit
-from .visual_replies import Card as VisualReplyCard
+from .visual_replies import Card as VisualReplyCard, EffectDrawExclusion
 
 
 @mcp.tool()
@@ -33099,9 +33154,11 @@ def inspect_vertex_effect_scope(event_id: int, observation_event_id: int) -> str
 
 @mcp.tool(structured_output=False)
 def run_shader_effect_experiment(workspace_path: str, expected_source_sha256: str,
-        edits: list[ExactSourceEdit], observation_event_id: int, attachment_index: int=0,
+        edits: list[ExactSourceEdit], observation_event_id: int=0, attachment_index: int=0,
         roi: list[float] | None=None, flip_y: bool=False, label: str='',
-        related_edits: list[RelatedVertexEdit] | None=None) -> list[Any]:
+        related_edits: list[RelatedVertexEdit] | None=None,
+        display_transfer: Literal['auto','identity','linear-to-srgb']='auto',
+        observation_scope: Literal['auto','appearance','stage']='auto') -> list[Any]:
     """Test a focused Shader calculation with a restored, controlled A/B/A replay.
 
     Source stays unchanged. edits are exact unique {old_text,new_text} spans in
@@ -33115,8 +33172,12 @@ def run_shader_effect_experiment(workspace_path: str, expected_source_sha256: st
     unchanged source is compiled and compared to original captured output at the
     SAME observation_event_id. Only a stable matching control permits the trial.
     Then the changed source is compiled, physical ABI checked and compared at that
-    output event, repeating A to check stability. Replacement is temporary and
-    shared across uses of the original Shader; preserve that scope in conclusions.
+    output event, repeating A to check stability. For a read-only fragment trial
+    observed at its own draw, the paired path isolates that draw with identical
+    inputs and exports its stored A/B snapshots without another replay. Other
+    supported trials use temporary shared-resource replacement across its uses.
+    Preserve the reported replacementScope in conclusions; a draw's output alone
+    does not prove the later final composite.
     For vertex motion, inspect_vertex_effect_scope finds related depth/color draws.
     Identical VS bytes can share a trial across the verified related resources.
     Different VS calculations require related_edits with their verified workspace,
@@ -33124,9 +33185,24 @@ def run_shader_effect_experiment(workspace_path: str, expected_source_sha256: st
     The exact previous replacement and visible event are restored in finally.
     If constant folding removes physical bindings, use a verified runtime-uniform
     gate to suppress the term for these captured inputs while retaining resources.
-    Use a same-or-later real draw's RTV or Present destination; roi=[left,top,right,bottom] is normalized
-    to the saved image. flip_y applies equally to both images and ROI orientation.
-    Standard display mapping is RGB 0..1. Fixed full-output raw numeric metrics
+    For final appearance, use observation_scope='appearance' or omit the observation
+    event and use the default 'auto'. The tool finds the actual downstream Present.
+    If an earlier draw is given with appearance scope and there is a single captured
+    Present, both legs automatically use that Present and its automatic display
+    transfer. For multiple candidates,
+    trace the relevant resource flow, then pass the exact Present EID. The receipt
+    records the selected EID and destination and checks both replay legs against them.
+    Use the same Present, orientation and transfer for every layer's on/off comparison.
+    For intermediate results use observation_scope='stage' and a real draw's RTV EID.
+    For compatibility, a positive EID with 'auto' also uses that exact event.
+    roi=[left,top,right,bottom] is normalized to the resolved output. Remap a region
+    marked on a different render target or omit the ROI when its mapping is unknown.
+    flip_y applies equally to both images and ROI orientation. Display range is RGB 0..1; auto encodes
+    floating-point linear targets to sRGB and retains stored normalized display
+    bytes. Use identity for already encoded outputs, linear-to-srgb for a verified
+    linear normalized target. sRGB-format storage is never encoded a second time.
+    Diagnostic texture/field colors need the appropriate transfer, not arbitrary
+    exposure or the game's grading. Fixed full-output raw numeric metrics
     and region metrics are retained. 'no-observed-change' means no effect in this
     tested region/input, not proof that an algorithm never matters. Failed compile,
     ABI, baseline control or stability is a real limit, never causal confirmation.
@@ -33139,7 +33215,8 @@ def run_shader_effect_experiment(workspace_path: str, expected_source_sha256: st
         changes=[e.model_dump()if isinstance(e,ExactSourceEdit)else e for e in edits]
         result=run(sys.modules[__name__],workspace_path,expected_source_sha256,changes,
             observation_event_id,attachment_index,roi,flip_y,label,
-            [e.model_dump() if isinstance(e, RelatedVertexEdit) else e for e in (related_edits or [])])
+            [e.model_dump() if isinstance(e, RelatedVertexEdit) else e for e in (related_edits or [])],
+            display_transfer, observation_scope)
         # Paths alone do not deliver pixels to API/subscription models.
         blocks=[_ok_compact(result)]
         for preview in model_previews(result):
@@ -33174,17 +33251,23 @@ def get_cbuffer_parameter_link(event_id: int, constant_block_index: int, variabl
 
 @mcp.tool()
 def get_mesh_uv_link(event_id: int, stage: str='vs-in',
-                     channel: str='', pair: int=0, texture_resource_id: int=0) -> str:
+                     channel: str='', pair: int=0, texture_resource_id: int=0,
+                     selection_mode: Literal['point','edge','face']='point',
+                     selected_vertices: list[int] | None=None) -> str:
     """Link to a verified mesh stage and UV channel, optionally with a bound 2D texture.
 
     An empty channel selects the native UV default. Use pair 0 for XY, 1 for ZW.
     Invalid choices return the captured channels and bound texture IDs.
+    selected_vertices are original vertex indices in this exact stage, not table
+    rows. Point selects those vertices; edge/face requires all constituent vertices.
+    Clicking restores the stage, channel, texture and component selection in both views.
     """
     try:
         from .visual_replies import save_navigation_target
         context = json.loads(get_current_renderdoc_context())
         observed = ipc.call('get_mesh_uv_navigation_target', dict(event_id=event_id, stage=stage,
-            channel=channel, pair=pair, texture_resource_id=texture_resource_id), timeout=60)
+            channel=channel, pair=pair, texture_resource_id=texture_resource_id,
+            selection_mode=selection_mode, selected_vertices=selected_vertices), timeout=60)
         if not observed.get('target'):
             return _ok(observed)
         return _ok(save_navigation_target(observed['target'], context.get('capture') or {}))
@@ -33192,11 +33275,185 @@ def get_mesh_uv_link(event_id: int, stage: str='vs-in',
         return _err(error)
 
 
+@mcp.tool(structured_output=False)
+def capture_mesh_uv_evidence(event_id: int, stage: str='vs-in', channel: str='', pair: int=0,
+        texture_resource_id: int | None=None, selection_mode: Literal['point','edge','face']='point',
+        selected_vertices: list[int] | None=None, focus: bool=False,
+        inline: bool=True, selection_expansion: Literal['none','connected']='none',
+        uv_bounds: list[float] | None=None, selected_elements: list[str] | None=None,
+        framing: Literal['context','selection','preserve']='context',
+        view_angles: list[float] | None=None, include_details: bool=True,
+        texture_path: str='', texture_label: str='') -> list[Any]:
+    """Capture native 3D + UV together, with full context, selected-region insets and an exact link.
+
+    A pixel/primitive is a seed, not the complete feature. Determine its extent
+    from this capture. Expand a seed through actual index connectivity with
+    selection_expansion='connected', or select all components intersecting
+    uv_bounds=[minU,minV,maxU,maxV]. Combining both restricts the connected
+    selection to that UV region. Bounds are UV data coordinates, not image pixels.
+    selected_vertices are original stage indices; selected_elements are exact
+    native keys returned by a previous snapshot. Omitted selections preserve state.
+    Inspect selectedCount and both pictures; refine an incomplete/overbroad set.
+
+    Context framing shows the whole mesh/UV layout and chooses a geometry-derived
+    viewing direction. view_angles=[yaw,pitch,optional_roll] in degrees overrides that choice;
+    inspect visibility and retry another direction if occluded or edge-on. Selection
+    framing zooms to the selection, preserve keeps the camera. Legacy focus=True
+    chooses selection framing. No capture Shader/parameter replacement changes.
+
+    Returns visualCard, a ready-to-publish type='mesh-uv' card containing native
+    overview images, selection circles, optional detail insets and a component
+    navigation link. Supply its concise title in the user's language and publish
+    both views together. Native inspection is not the game's fragment shading.
+
+    Choose the relevant bound 2D texture and its actual UV channel from Shader
+    reads/mapping, and pass its positive texture_resource_id. Both previews use
+    the same texture, whose name is retained in the card. Omitting the texture
+    returns available bound IDs for an explicit choice instead of silently
+    publishing an untextured illustration. Explicit 0 is geometry-only inspection.
+    Inspect meshTextureRendered and uvTextureRendered for a textured explanation.
+
+    texture_path optionally projects an authorized generated PNG onto the actual
+    captured mesh/UV. Derive its calculation and parameters from inspected source
+    first. This is explicitly an illustrative texture projection, not the game's
+    fragment Shader or proof of its final shading. It is retained as a verified
+    image asset and restored by the navigation link. Use its mesh image beside
+    the original 2D image in a diagram node; a full UV card is optional and only
+    useful when UV mapping itself explains the question.
+    """
+    try:
+        from .visual_replies import save_navigation_target, _asset, root_path
+        preview_texture = None
+        if texture_path:
+            if texture_resource_id:
+                raise ValueError('Choose either a captured texture_resource_id or illustrative texture_path')
+            source = _within_evidence_roots(texture_path)
+            if source.stat().st_size > 8 * 1024 * 1024:
+                raise ValueError('Explanation texture exceeds 8 MiB')
+            from PIL import Image
+            import io
+            with Image.open(source) as image:
+                if image.width * image.height > 16000000:
+                    raise ValueError('Explanation texture exceeds the pixel budget')
+                image = image.convert('RGBA')
+                image.thumbnail((1600,1600),Image.Resampling.LANCZOS)
+                png = io.BytesIO();image.save(png,format='PNG')
+            preview_texture = dict(asset=_asset(root_path(),png.getvalue(),'.png'),label=texture_label[:160])
+        if uv_bounds is not None and (len(uv_bounds)!=4 or any(not math.isfinite(v)or abs(v)>1e6 for v in uv_bounds)
+                or uv_bounds[0]>=uv_bounds[2]or uv_bounds[1]>=uv_bounds[3]):
+            raise ValueError('uv_bounds must be finite [minU,minV,maxU,maxV]')
+        if view_angles is not None and (len(view_angles)not in(2,3)or any(not math.isfinite(v)for v in view_angles)):
+            raise ValueError('view_angles requires finite yaw and pitch in degrees')
+        if view_angles is not None:view_angles=[math.remainder(v,360.)for v in view_angles]
+        if selected_elements is not None and (len(selected_elements)>4096 or
+                any(not isinstance(v,str)or not v.isdecimal()or not 0<=int(v)<2**64 for v in selected_elements)):
+            raise ValueError('selected_elements requires up to 4096 exact native decimal keys')
+        context=json.loads(get_current_renderdoc_context());capture=context.get('capture')or{}
+        observed=ipc.call('get_mesh_uv_navigation_target',dict(event_id=event_id,stage=stage,
+            channel=channel,pair=pair,texture_resource_id=texture_resource_id or 0,
+            selection_mode=selection_mode,selected_vertices=selected_vertices),timeout=60)
+        if not observed.get('target'):return [_ok_compact(observed)]
+        if texture_resource_id is None and not texture_path and observed.get('textureResourceIds'):
+            return [_ok_compact(dict(ready=False,resolved=False,textureSelectionRequired=True,
+                eventId=event_id,channelChoices=observed.get('channelChoices',[]),
+                textureResourceIds=observed['textureResourceIds'],
+                nextAction='Inspect bound textures and Shader UV mapping, then pass the relevant texture_resource_id.'))]
+        target=observed['target']
+        if preview_texture:target['previewTexture']=preview_texture
+        if selected_elements is not None:
+            target.update(selectionMode=selection_mode,selectedVertices=selected_vertices or[],selectedElements=selected_elements)
+        if uv_bounds is not None and selected_vertices is None and selected_elements is None and selection_expansion=='none':
+            target.update(selectionMode=selection_mode,selectedVertices=[])
+        request=dict(target,framing='selection'if focus else framing,selectionExpansion=selection_expansion)
+        if uv_bounds is not None:request['uvBounds']=uv_bounds
+        if view_angles is not None:request['viewAngles']=view_angles
+        def snapshot(request):
+            request_id=uuid.uuid4().hex
+            args=dict(expected_capture_session_id=capture['captureSessionId'],request_id=request_id,
+                      request=dict(request,requestId=request_id))
+            result=ipc.call('capture_mesh_uv_evidence',args,timeout=60);deadline=time.monotonic()+20
+            while not result.get('ready')and time.monotonic()<deadline:
+                time.sleep(.25);args.pop('request',None)
+                result=ipc.call('capture_mesh_uv_evidence',args,timeout=60)
+            if not result.get('ready'):raise RuntimeError('Native mesh/UV images did not become ready')
+            if result.get('eventId')!=event_id or result.get('stage')!=stage:
+                raise RuntimeError('Mesh event/stage changed during evidence collection')
+            images=[]
+            for key,view in [('meshPng','mesh'),('uvPng','uv')]:
+                data=base64.b64decode(result.pop(key),validate=True)
+                if len(data)>8*1024*1024:raise ValueError('Native preview image exceeds 8 MiB')
+                digest=hashlib.sha256(data).hexdigest();path=_event_texture_evidence_root()/'mesh-evidence'/(digest+'.png')
+                _secure_event_artifact_directory(path.parent,_event_texture_evidence_root());_publish_event_artifact_bytes(path,data)
+                images.append(dict(path=str(path),sha256=digest,view=view,saved=True))
+            return result,images
+        result,images=snapshot(request)
+        if (texture_resource_id or texture_path) and not(result.get('meshTextureRendered')and result.get('uvTextureRendered')):
+            raise RuntimeError('The selected texture did not reach both native mesh and UV previews')
+        target.update(channel=result['channel'],pair=result['pair'],textureResourceId=result['textureResourceId'])
+        if request['framing']!='preserve':
+            target.update(framing=request['framing'])
+            if view_angles is not None:target['viewAngles']=view_angles
+        if result.get('selectionComplete'):
+            target.update(selectionMode=result['selectionMode'],selectedVertices=sorted(result['selectedVertices']),
+                          selectedElements=sorted(result['selectedElements'],key=int))
+        packed_selection=result.pop('selectionKeyData','')
+        if packed_selection:
+            target.update(selectionKeyData=packed_selection,selectedCount=result['selectedCount'],
+                          selectedVertices=target['selectedVertices'][:64],selectedElements=target['selectedElements'][:64])
+            result.update(selectedVertices=result['selectedVertices'][:64],selectedElements=result['selectedElements'][:64],
+                          selectedVerticesComplete=False)
+        detail_images=[]
+        if include_details and request['framing']=='context'and result['selectedCount']:
+            detail_request=dict(target,framing='selection',viewAngles=result.get('viewAngles',[]))
+            _,detail_images=snapshot(detail_request)
+            # Return the native viewer to the same overview shown by the card.
+            snapshot(dict(target,framing='context',viewAngles=result.get('viewAngles',[])))
+        if json.loads(get_current_renderdoc_context()).get('capture',{}).get('captureSessionId')!=capture['captureSessionId']:
+            raise RuntimeError('Capture changed while collecting mesh/UV images')
+        navigation=save_navigation_target(target,capture)
+        if packed_selection:
+            navigation['target']={k:v for k,v in target.items()if k!='selectionKeyData'}
+        def circle(key):
+            bounds=result.get(key,[])
+            return [dict(type='ellipse',points=[bounds[:2],bounds[2:]],color='#ff4050')]if len(bounds)==4 and bounds[0]<bounds[2]and bounds[1]<bounds[3]else[]
+        visual=dict(type='mesh-uv',title='3D / UV',image=dict(path=images[0]['path']),
+                    secondImage=dict(path=images[1]['path']),annotations=circle('meshSelectionBounds'),
+                    secondAnnotations=circle('uvSelectionBounds'),links=[dict(label='3D / UV',url=navigation['url'])])
+        if result.get('textureName'):visual['caption']=result['textureName']
+        if detail_images:
+            visual.update(detailImage=dict(path=detail_images[0]['path']),secondDetailImage=dict(path=detail_images[1]['path']))
+        result.update(schema='bread-native-mesh-uv-evidence/v1',images=images,detailImages=detail_images,
+                      visualCard=visual,navigation=navigation,applied=False)
+        blocks=[_ok_compact(result)]
+        for item in images+detail_images:blocks.extend(_saved_image_result(item,inline))
+        return blocks
+    except Exception as error:return [_err(error)]
+
+
 @mcp.tool()
-def publish_visual_reply(title: str, cards: list[VisualReplyCard]) -> str:
+def publish_visual_reply(title: str, cards: list[VisualReplyCard],
+                         effect_exclusions: list[EffectDrawExclusion] | None = None) -> str:
     """Attach a compact interactive visual explanation to this chat answer.
 
-    Use 1..6 focused cards, then give a short text conclusion. All fixed UI labels
+    Publish one final bundle of 1..6 focused cards for this answer. A new
+    publication replaces its previous viewer, so revisions must include the
+    complete desired collection, not only the added card. When a calculation
+    diagram accompanies verified Shader effect comparisons, the final bundle
+    needs organized source excerpts for each tested Shader. An interim image
+    bundle can be published, but the completion review checks shaderCodeGaps.
+    Group comparisons
+    first in the intended order, then the graph and other views. For a layered effect,
+    cover every important contributor in the question's scope. Use a matched
+    final on/off pair per contribution. Show its intermediate results and key bound
+    textures on connected nodes leading to the final composite. Adjacent similar
+    draws are review candidates. To exclude one, inspect it and disable its layer
+    in a restored experiment. Use effect_exclusions=[{eventId,evidence,experimentReceipt}]
+    only with verified no change on the same final output and marked region.
+    The all-layers-enabled A image is the shared combined appearance.
+    Explain relevant inactive branches separately with the disabling value and
+    a labelled image or controlled activation, when supported. Reflect the inspected mixing operations: layers
+    may select, mask, multiply or merge rather than simply add.
+    All fixed UI labels
     are localized; write titles/captions/annotation text in the user's language.
     No replay, Shader or material is changed. The UI receives durable verified
     assets, not arbitrary HTML/image URLs. The reply survives capture closure.
@@ -33211,32 +33468,59 @@ def publish_visual_reply(title: str, cards: list[VisualReplyCard]) -> str:
     source once, including reference files. Inspect alignment before publishing.
 
     Compare: {type:'compare',title:'...',image:{eventId:...},secondImage:{eventId:...},
-    beforeLabel:'...',afterLabel:'...'}. Supports A/B, wipe and side by side. Two
+    beforeLabel:'...',afterLabel:'...'}. Supports A/B, wipe, side by side and
+    a pixel difference view for equal-size pairs. Two
     different EIDs compare stages; they do NOT prove an isolated effect on/off.
     Match orientation, display mapping and coordinates before interpreting changes.
+    Use comparisonScope='appearance' for final-frame on/off results. All appearance
+    cards share the same verified captured Present EID and display transfer.
+    If rejected, run the on/off experiment again with observation_scope='appearance'. Use
+    comparisonScope='stage' only when deliberately comparing intermediate stages.
 
-    Mesh: {type:'mesh',title:'...',eventId:1272,instance:0,stage:'vs-out'} uses bounded
-    real post-transform geometry with approximate projection. Or use meshFile:
-    'exported.obj' (Host evidence path), or primitive:'sphere'|'cube'|'plane'. A
-    material:{baseColor:[.5,.6,.7],roughness:.3,metalness:0,texture:{path:'...'}}
-    creates an INTERACTIVE ILLUSTRATIVE material, not the original game Shader.
-    Exported OBJ UVs are supported. A mesh preview does not prove pixel coverage.
-    Add meshEffect:{type:'inverted-hull',amount:.04,color:'#101018',enabled:true}
-    for normal extrusion with front-face culling, or type:'sine-displacement'
-    with amount/frequency/phase for a vertex-motion illustration. Users can
-    compare position.y += sin(position.x*frequency+phase)*amount for the latter.
-    orbit/zoom, tune the bounded preview parameters and compare synchronized
-    before/after renders. Normals/units are derived for this illustration; no
-    captured Shader is executed or capture parameter edited by these controls.
-    Link the actual Shader/CBuffer separately using links. Choose a recipe only
-    after checking the actual algorithm; do not call this a captured A/B trial.
+    Mesh cards inspect captured/exported geometry or show an explicitly labelled
+    illustration using the bounded controls in the schema. Derive any illustrated
+    computation from the current source/evidence first. A supported control name
+    is not evidence that the algorithm exists in this capture. Native mesh/UV
+    evidence is best published as the combined mesh-uv visualCard returned by
+    capture_mesh_uv_evidence, including overview, insets, marks and exact links.
 
     Diagram: {type:'diagram',title:'...',nodes:[{id:'a',text:'...',eventId:1296,
     image:{eventId:1296},calculation:'...',description:'...'},...],
     edges:[['a','b'],...],edgeLabels:['what changes',...]}. Each node may have an
-    RT thumbnail and links:[{label:'...',url:'rdoc://shader/...'}] to code,
-    resources or get_cbuffer_parameter_link URLs. Click goes to EID (or the first
-    link for calculation-only nodes); right-click lists all node targets.
+    RT thumbnail, or image + secondImage side by side with imageLabel and
+    secondImageLabel. Pair each relevant source texture with its sampled result
+    on the current subject, or pair distinct outputs such as normal and roughness.
+    Each thumbnail has an independent channel selector for its saved channels.
+    Each picture supports its own annotations/secondAnnotations. Supply actual
+    source images for calculation/output nodes when that visual explains the
+    question; an empty node does not generate its missing picture automatically.
+    Nodes also accept links:[{label:'...',url:'rdoc://shader/...'}] to code,
+    textures (rdoc://texture/<ResourceId>?eid=<EID>&kind=srv) or get_cbuffer_parameter_link
+    URLs. Use the actual consuming or producing EID and attachment kind (srv, uav,
+    rtv, dsv or present) for a texture. The viewer selects its bound input/output slot.
+    A click selects a node or
+    connection and shows its calculation below. Double-click navigates; the
+    context menu and inline detail links list exact targets. Node details can
+    explain the input, operation and downstream use more fully; keep description
+    to a short role. edgeDetails (one string per edge) explain each connection.
+    Write details in plain language with [relevant words](rdoc://...) inline links;
+    calculation is a few pseudocode statements shown only in the details below
+    the graph. Keep each short statement on one line and end it with an ASCII
+    semicolon. Use ASCII member-access periods and explicit multiplication.
+    Each computation node accepts codeBlocks:[{title:'...',
+    workspacePath:'...',expectedSourceSha256:'...',startLine:...,endLine:...,
+    sourceRanges:[{startLine:...,endLine:...},...]}]. These use the same saved-source
+    reader, syntax colors and precise line/token navigation as a code card and
+    appear as code pages after the visual cards; selecting a node/connection offers
+    a direct button to its code page. Keep calculation to a short key expression
+    for the selected stage. Include initialization and final
+    calculation, omitting unrelated gaps with sourceRanges. Use sourceRanges OR
+    exampleCode; do not supply both. Prefer saved source over retyping it.
+    Nodes can combine input texture on the left and the computed result on the
+    actual subject on the right. Generate these outputs through inspected Shader
+    calculations and controlled experiments; input textures alone do not explain
+    a computation. Include useful procedural, merged and final results too.
+    Do not add a numbered edge legend or operational/authenticity badges.
     Give each texture a named node and one short role. Use separate calculation
     nodes and concise connections for the verified flow. Use get_mesh_uv_link
     for UV channel/texture inspection.
@@ -33245,25 +33529,65 @@ def publish_visual_reply(title: str, cards: list[VisualReplyCard]) -> str:
     Code: {type:'code',title:'...',workspacePath:'...',sourceFile:'source/shader.hlsl',
     expectedSourceSha256:'64 hex from source read',startLine:100,endLine:115}.
     Host reads the exact saved source; every displayed line links to its workspace.
-    Optional exampleCode displays a simplified example whose lines jump to the
-    same verified starting calculation. Only use it for a real source mapping.
+    Code cards and diagram codeBlocks require current, finalized Shader organization.
+    Review readable calculations, CBuffer fields and resource names, validate with
+    finish_shader_workspace_organization and reconcile applicable display aliases
+    before publishing. A raw decompile or saved draft is investigation evidence.
+    Prefer key calculations. Optional sourceRanges:[{startLine:100,endLine:102},
+    {startLine:110,endLine:114}] keeps exact source lines and inserts // **** at
+    omitted gaps. Ordered ranges must retain necessary delimiters and display at
+    most 120 lines. A single range ending inside a block extends to its end.
+    Optional exampleCode displays simplified code; codeMappings:[{displayLine:1,
+    sourceLine:103},{displayLine:1,symbol:'weight',sourceLine:104,
+    sourceSymbol:'actualWeight'}] binds rows or tokens to inspected saved source.
+    Map important example rows and symbols, rather than sending every click to
+    the same function start. Source symbols must exist on their mapped lines.
+    Uniquely matching saved-source lines in the inspected range retain their
+    actual locations automatically; ambiguous or rewritten lines need mappings.
+    Delimiters, strings and comments are checked; omitted text is not executable.
     For a true controlled comparison pass experimentReceipt from
     run_shader_effect_experiment and exactly its before/after image paths.
     Circle annotations use type:'ellipse',points:[[left,top],[right,bottom]].
     Any card supports caption and links:[{label:'...',url:'rdoc://event/1296'}].
-    Use verified rdoc://resource/<ID> or rdoc://shader/<workspace>?path=... links.
+    Use verified event-scoped texture links, rdoc://resource/<ID> for other
+    resources, and rdoc://shader/<workspace>?path=... for organized code.
     Annotation points use the saved image's normalized top-left coordinates.
     """
     try:
-        from .visual_replies import publish
+        from contextlib import ExitStack
+        from .shader_organization_review import publication_review
+        from .shader_workspace.leases import WorkspaceSourceTransactionLease
+        from .shader_workspace.source_observation import source_observation_transaction
+        from .visual_replies import neighbouring_composite_draws, publish
         context=json.loads(get_current_renderdoc_context())
-        def capture_image(source):
+        store = current_task_report_store()
+
+        def effect_neighbours(event_id):
+            rows = ipc.call('get_draw_calls', dict(include_children=True, only_actions=True,
+                event_id_min=max(1, event_id - 128), event_id_max=event_id + 128))['actions']
+            return neighbouring_composite_draws(rows, event_id)
+
+        def effect_inputs(event_id):
+            inputs = ipc.call('inspect_event', dict(event_id=event_id))['drawCall']['inputs']
+            # When there is a sole sampled compressed input, show it as a source instead
+            # of presenting only the result. Multiple candidates need semantic selection.
+            textures = {str(row['resourceId']) for row in inputs if row.get('stage') == 'fragment'
+                        and row.get('access') == 'shader-read' and not row.get('staticallyUnused')
+                        and re.match(r'^(BC[1-7]|ETC2|ASTC)', row.get('format') or '')}
+            return sorted(textures) if len(textures) == 1 else []
+
+        if effect_exclusions:
+            reviewed = store.inspected_effect_draws()
+            if any(row.eventId not in reviewed for row in effect_exclusions):
+                raise ValueError('Inspect every excluded draw with inspect_event in the current task before excluding it.')
+        def capture_image(source, *, preserve_alpha=False):
             receipt=json.loads(_capture_event_texture_evidence_receipt(
                 event_id=source.eventId,attachment_kind=source.attachmentKind,
                 attachment_index=source.attachmentIndex,channel=source.channel,
                 mip=source.mip,slice=source.slice,sample=source.sample,
                 range_mode=source.rangeMode,black_point=source.blackPoint,
-                white_point=source.whitePoint,flip_y=False,max_dimension=1600,stage=source.stage))
+                white_point=source.whitePoint,flip_y=False,max_dimension=1600,stage=source.stage,
+                preserve_alpha=preserve_alpha))
             artifact=receipt.get("artifact") or {}
             if receipt.get("error") or artifact.get("status")!="saved":
                 raise ValueError("Captured visual source unavailable: "+str(receipt.get("error") or artifact.get("skipReason")))
@@ -33273,27 +33597,56 @@ def publish_visual_reply(title: str, cards: list[VisualReplyCard]) -> str:
             return json.loads(get_post_vs_data(card.eventId,card.instance,0,card.stage,16384,49152))
         def read_code(card):
             from urllib.parse import urlencode,quote
-            root,status=_workspace_file_context(card.workspacePath)
-            relative=card.sourceFile or str(Path(status['source']['path']).relative_to(root)).replace('\\','/')
+            root=Path(card.workspacePath).expanduser().resolve()
+            canonical, sources = organized[root]
+            relative=card.sourceFile or canonical.relative_to(root).as_posix()
             target=_workspace_file_target(root,relative)
-            canonical=Path(status['source']['path']).resolve()
-            if target.resolve()!=canonical and not relative.startswith('source/'):
-                raise ValueError('Code excerpts must come from saved Shader source/includes')
             raw=_read_workspace_text_bytes(target);digest=hashlib.sha256(raw).hexdigest()
-            if digest!=card.expectedSourceSha256:raise ValueError('Shader source changed; read its current hash before publishing')
-            lines=raw.decode('utf-8-sig').splitlines()
-            if card.endLine>len(lines):raise ValueError('Code range is outside the saved source')
-            excerpt='\n'.join(lines[card.startLine-1:card.endLine])
-            if len(excerpt)>16000:raise ValueError('Code excerpt exceeds 16000 characters')
+            if sources.get(target)!=digest or digest!=card.expectedSourceSha256:
+                raise ValueError('Code excerpts must match the finalized Shader source or one of its validated includes; refresh the source ranges and hash.')
+            from .code_excerpts import presentation_excerpt
+            excerpt=presentation_excerpt(raw.decode('utf-8-sig'),card.startLine,card.endLine,
+                                        ranges=card.sourceRanges,example=card.exampleCode,
+                                        mappings=card.codeMappings)
             query=urlencode({'path':str(target),'line':card.startLine,'column':1,'sourceSha256':digest},quote_via=quote)
-            return dict(text=card.exampleCode or excerpt,example=bool(card.exampleCode),
-                        startLine=card.startLine,sha256=digest,language=target.suffix.lstrip('.'),
-                        url='rdoc://shader/?'+query,path=str(target))
-        result=publish(title,cards,context,capture_image=capture_image,capture_mesh=capture_mesh,
-                       authorize_file=_within_evidence_roots,read_code=read_code)
+            return dict(excerpt,
+                        sha256=digest,language=target.suffix.lstrip('.'),
+                        url='rdoc://shader/?'+query,path=str(target),workspacePath=str(root))
+        workspaces = {Path(block.workspacePath).expanduser().resolve()
+                      for card in cards
+                      for block in ([card] if card.type == 'code' else
+                                    [block for node in card.nodes for block in node.codeBlocks]
+                                    if card.type == 'diagram' else [])}
+        organized = {}
+        with ExitStack() as transactions:
+            for workspace in sorted(workspaces):
+                root, _ = _workspace_file_context(str(workspace))
+                transactions.enter_context(WorkspaceSourceTransactionLease(root))
+                transactions.enter_context(source_observation_transaction(root))
+                try:
+                    status = _shader_workspace_service().status(str(root))
+                    gate = _shader_organization_manager().validate_publication_gate(str(root), status)
+                    review = publication_review(str(root), gate['organizationId'])
+                    if not review['ready'] or review['sourceSha256'] != gate['finalSourceSha256']:
+                        raise ValueError(review.get('reason') or 'The finalized source review is stale.')
+                except (ValueError, RuntimeError, OSError) as error:
+                    raise ValueError(
+                        'Organize and validate this Shader before publishing explanatory code. '
+                        'Use the Shader workbench workflow, including CBuffer/resource naming, '
+                        'then finish_shader_workspace_organization and read the finalized source. '
+                        f'Workspace: {root}. Current evidence: {error}') from error
+                canonical = Path(status['source']['path']).resolve()
+                dependencies = (status['latestCompiled'].get('sourceDependencies') or {}).get('documents', [])
+                sources = {Path(row['sourcePath']).resolve(): row['sourceSha256'] for row in dependencies}
+                sources[canonical] = gate['finalSourceSha256']
+                organized[root] = canonical, sources
+            result=publish(title,cards,context,capture_image=capture_image,capture_mesh=capture_mesh,
+                           authorize_file=_within_evidence_roots,read_code=read_code,
+                           effect_neighbours=effect_neighbours,effect_inputs=effect_inputs,
+                           effect_exclusions=effect_exclusions)
         if json.loads(get_current_renderdoc_context()).get('capture',{}).get('captureSessionId')!=context.get('capture',{}).get('captureSessionId'):
             raise ValueError("Capture changed while collecting the visual answer")
-        result['publishedToChat']=current_task_report_store().register_reply_visual(result['id'])
+        result['publishedToChat']=store.register_reply_visual(result['id'],result['presentation'])
         return _ok(result)
     except Exception as error:
         return _err(error)

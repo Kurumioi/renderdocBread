@@ -9,6 +9,20 @@ import pytest
 from src import server
 
 
+def test_generated_image_is_admitted_only_from_current_owned_workspace(tmp_path,monkeypatch):
+    owned=tmp_path/'owned';owned.mkdir()
+    image=owned/'field.png';image.write_bytes(b'controlled-image')
+    outside=tmp_path/'outside.png';outside.write_bytes(b'private')
+    monkeypatch.setenv('REPLAYLAB_AGENT_WORKSPACE_ROOT',str(owned))
+    monkeypatch.setattr(server,'_evidence_roots',lambda:[])
+    assert server._within_evidence_roots(str(image))==image
+    with pytest.raises(ValueError,match='outside'):
+        server._within_evidence_roots(str(outside))
+    monkeypatch.delenv('REPLAYLAB_AGENT_WORKSPACE_ROOT')
+    with pytest.raises(ValueError,match='outside'):
+        server._within_evidence_roots(str(image))
+
+
 PS_723 = 1000000000000000723
 PS_755 = 1000000000000000755
 
@@ -38,6 +52,19 @@ def test_sync_resource_wrapper_preserves_python_integers_and_unrelated_arguments
     assert wrapped(str(PS_755), 11384) == (PS_755, 11384)
 
 
+def test_uv_selection_enum_survives_resource_id_transport_and_instrumentation():
+    proxy = server._DeferredFastMCP()
+    proxy.tool()(server.get_mesh_uv_link)
+    proxy.tool(structured_output=False)(server.capture_mesh_uv_evidence)
+    tools = asyncio.run(proxy._build().list_tools())
+    assert {tool.name for tool in tools} == {'get_mesh_uv_link', 'capture_mesh_uv_evidence'}
+    for tool in tools:
+        properties = tool.inputSchema['properties']
+        assert properties['selection_mode']['enum'] == ['point', 'edge', 'face']
+        expected = {'integer', 'string', 'null'} if tool.name == 'capture_mesh_uv_evidence' else {'integer', 'string'}
+        assert {branch['type'] for branch in properties['texture_resource_id']['anyOf']} == expected
+
+
 def test_async_optional_resource_wrapper_preserves_none_and_legacy_resource_prefix():
     async def resource_probe(texture_id: int | None = None) -> int | None:
         return texture_id
@@ -46,6 +73,18 @@ def test_async_optional_resource_wrapper_preserves_none_and_legacy_resource_pref
     assert asyncio.run(wrapped()) is None
     assert asyncio.run(wrapped(None)) is None
     assert asyncio.run(wrapped("ResourceId::" + str(PS_723))) == PS_723
+
+
+def test_mesh_evidence_requires_an_explicit_texture_choice_when_inputs_are_bound():
+    observed = dict(target=dict(kind='uv', eventId=1291, textureResourceId='0'),
+                    channelChoices=['_input1'], textureResourceIds=[66250, 4047])
+    context = json.dumps(dict(capture=dict(captureSessionId='a'*32)))
+    with mock.patch.object(server, 'get_current_renderdoc_context', return_value=context), \
+         mock.patch.object(server.ipc, 'call', return_value=observed) as call:
+        result = json.loads(server.capture_mesh_uv_evidence(1291, inline=False)[0])
+    assert result['textureSelectionRequired'] and not result['ready']
+    assert result['textureResourceIds'] == [66250, 4047]
+    assert call.call_count == 1 and call.call_args.args[0] == 'get_mesh_uv_navigation_target'
 
 
 @pytest.mark.parametrize("value", [float(PS_723), float("inf"), float("nan"), True])

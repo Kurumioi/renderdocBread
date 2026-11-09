@@ -1583,7 +1583,8 @@ def _doctor_command(args: argparse.Namespace, store: ProfileStore) -> int:
         if not pending:
             next_index += 1
     profile = _selected_profile(store, args.profile)
-    catalog = _catalog(_tools_config(getattr(args, "tools_config", None)))
+    tools = _tools_config(getattr(args, "tools_config", None))
+    catalog = _catalog(tools)
     checks = list(run_doctor(profile, catalog, mcp_executable=args.mcp_host, progress_callback=emit))
     if getattr(args, "execution_test", False):
         from .connection_readiness import run_execution_check, check_portable_tools, check_host_tools
@@ -1601,7 +1602,7 @@ def _doctor_command(args: argparse.Namespace, store: ProfileStore) -> int:
         if not any(check.status == "error" for check in checks
                    if check.name not in {"portable-tool-execution", "bread-host-execution", "model-context", "model-context-enabled"}):
             emit(DoctorCheck("model-tool-execution", "running", "Checking connection", "connection.check-running"), pending=True)
-            for check in asyncio.run(run_execution_check(profile, timeout=args.timeout)):
+            for check in asyncio.run(run_execution_check(profile, timeout=args.timeout, tools_config=tools)):
                 checks.append(check)
                 emit(check)
     if streaming:
