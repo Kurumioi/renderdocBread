@@ -218,7 +218,8 @@ class NativeAgentEngine:
         host_facts: list[dict[str, Any]] = []
         latest_tool_state: dict[str, Any] = {}
         clarification: ClarificationRequest | None = None
-        receipt_store.begin_task_review(work_identity({"prompt": request.prompt, "intent": request.intent}))
+        receipt_store.begin_task_review(work_identity({"prompt": request.prompt, "intent": request.intent}),
+            marked_render_target=any(item.context and item.context.annotation for item in envelope.request.attachments))
         activity_tracker = TaskActivityTracker(receipt_store)
         review_loop = TaskReviewLoop.for_intent(request.intent)
         review_decision = TaskReviewDecision()
@@ -388,6 +389,10 @@ class NativeAgentEngine:
             text = remaining or clarification.question
             status = "needs-user-input"
         else:
+            reviewed_explanation = (review_decision.reviewed_explanation()
+                                    if not provider_interrupted and not provider_output_limited else '')
+            if reviewed_explanation:
+                text = reviewed_explanation
             missing_answer = not text
             interruption_note = (
                 "模型连接在重试后仍然中断；Bread 已保留并重新核对 Host 收据，"
@@ -422,7 +427,7 @@ class NativeAgentEngine:
             if review_decision.action == "partial" and not provider_interrupted and not provider_output_limited:
                 status = "partial"
                 text = review_decision.incomplete_text(language, text)
-            elif review_decision.action == "accept" and status == "completed":
+            elif review_decision.action == "accept" and status == "completed" and not reviewed_explanation:
                 note = review_decision.unchanged_note(language)
                 if note:
                     text += "\n\n" + note
@@ -957,15 +962,20 @@ class NativeAgentEngine:
         }
         if tool_kind:
             data["toolKind"] = tool_kind
+        retry_title = event.get("activityTitleId")
         if (source == "codex-app-server" and kind == "providerRetry"
-                and event.get("activityTitleId") == "task.provider.retry-capacity"):
+                and retry_title in {"task.provider.retry-capacity", "task.provider.retry-session"}):
             retry_args = event.get("activityTitleArgs")
             if (isinstance(retry_args, (list, tuple)) and len(retry_args) == 3
                     and all(isinstance(value, (str, int, float)) and len(str(value)) <= 16
                             for value in retry_args)):
-                data["activityTitleId"] = "task.provider.retry-capacity"
+                data["activityTitleId"] = retry_title
                 data["activityTitleArgs"] = [str(value) for value in retry_args]
                 data["statusSource"] = "local"
+        if (source == "codex-app-server" and kind == "providerRetry"
+                and retry_title == "task.provider.session-ready"
+                and event.get("status") == "completed"):
+            data.update(activityTitleId=retry_title, activityTitleArgs=[], statusSource="local")
         if source == "codex-app-server" and kind == "nativeCapability":
             # The connector emits this once after verifying the handshake, not
             # from model content. Keep capability downgrade evidence visible.

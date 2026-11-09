@@ -35,6 +35,34 @@ def completion():
             "choices":[{"index":0,"message":{"role":"assistant","content":"connected"},"finish_reason":"stop"}]}
 
 
+@pytest.mark.parametrize('responses',[False,True])
+def test_lookaround_schema_is_portable_on_wire_without_changing_tool_contract(responses):
+    pattern=r'^(?!reserved$)[A-Za-z][A-Za-z0-9_-]*$'
+    original={'type':'object','properties':{'name':{'type':'string','pattern':pattern},
+              'color':{'type':'string','pattern':r'^#[a-f0-9]{6}$'}},'required':['name'],'additionalProperties':False}
+    async def invoke(**arguments):return arguments
+    tool=_langchain_tool('named_target',invoke,args_schema=original)
+    requests=[]
+    def handler(request):
+        body=json.loads(request.content);requests.append(body)
+        schema=body['tools'][0]['parameters']if responses else body['tools'][0]['function']['parameters']
+        assert 'pattern'not in schema['properties']['name']
+        assert pattern in schema['properties']['name']['description']
+        assert schema['properties']['color']['pattern']==r'^#[a-f0-9]{6}$'
+        assert schema['required']==['name']and schema['additionalProperties']is False
+        if not responses:return httpx.Response(200,json=completion())
+        return httpx.Response(200,json={'id':'resp-test','object':'response','created_at':1,
+            'model':'exact-model','status':'completed','output':[{'id':'msg-test','type':'message',
+            'role':'assistant','status':'completed','content':[{'type':'output_text','text':'connected','annotations':[]}]}]})
+    client=httpx.Client(transport=httpx.MockTransport(handler))
+    model=compatible_chat_model(ChatOpenAI,dict(model='exact-model',api_key='test-key',base_url='https://gateway.example/v1',
+        use_responses_api=responses,max_retries=0,http_client=client))
+    assert model.bind_tools([tool]).invoke('inspect name').text=='connected'
+    assert len(requests)==1
+    assert original['properties']['name']['pattern']==pattern
+    assert tool.args_schema['properties']['name']['pattern']==pattern
+
+
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_root_and_responses_negotiate_to_v1_chat_without_changing_model(asynchronous):
     calls = []

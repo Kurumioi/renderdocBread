@@ -1839,6 +1839,7 @@ CONSOLE_QUIET_REQUEST_METHODS = frozenset((
     "get_shader_cbuffer_display_identity",
     "get_shader_workspace_ui_state",
     "get_application_ui_state",
+    "capture_mesh_uv_evidence",
     "recover_shader_candidate_shared_resource_operation",
     "get_symbol_alias_transaction",
     "get_event_cbuffer_override_status",
@@ -1876,9 +1877,9 @@ def _selection_independent_request(request):
         "ping", "get_capture_status", "get_shader_workspace_ui_state", "read_shader_workspace_source",
         "get_frame_summary", "get_draw_calls", "get_pass_classification_inputs",
         "get_current_frame_flow_inputs",
-        "get_application_ui_state", "control_application_ui", "open_document",
+        "get_application_ui_state", "control_application_ui", "open_document", "capture_mesh_uv_evidence",
         "get_shader_cbuffer_display_identity",
-        "get_frame_render_flow_outline", "show_frame_render_flow",
+        "get_frame_render_flow_outline", "show_frame_render_flow", "resolve_shader_effect_presentation",
         "get_saved_frame_render_flow", "save_frame_render_flow",
         "show_shader_organization_preview",
     )
@@ -6144,12 +6145,17 @@ def _current_texture_context(warnings):
             x = _safe_int(getattr(location, "first", -1), -1)
             y = _safe_int(getattr(location, "second", -1), -1)
         picked = {"x": int(x), "y": int(y)} if int(x) >= 0 and int(y) >= 0 else None
+        try:
+            flip_y = bool(viewer.Widget().property("textureDisplayFlipY"))
+        except (AttributeError, RuntimeError):
+            # An unavailable display flag must not discard the captured RT binding.
+            flip_y = False
         return {
             "resourceId": resource_id,
             "name": name,
             "subresource": selected,
             "pickedPixel": picked,
-            "flipY": bool(viewer.Widget().property("textureDisplayFlipY")),
+            "flipY": flip_y,
         }
     except Exception as exc:
         warnings.append("Texture Viewer context is unavailable: %s" % str(exc))
@@ -6644,8 +6650,9 @@ def _run_current_context_freeze_job(job_id, ctrl):
 def _begin_current_context_freeze(
         focus_stage="", expected_current_event_id="",
         expected_selected_event_id="",
-        expected_capture_session_id="", _job_id=""):
+        expected_capture_session_id="", _job_id="", _for_chat=False):
     """Capture GUI facts and queue replay work without waiting for replay."""
+    global _project_ai_inspection
     now = time.monotonic()
     with _current_context_freeze_jobs_guard:
         _cleanup_current_context_freeze_jobs(now)
@@ -6664,18 +6671,22 @@ def _begin_current_context_freeze(
             expected_capture_session_id=expected_capture_session_id))
     job_id = str(_job_id or uuid.uuid4().hex).lower()
     result_path = _current_context_freeze_result_path(job_id)
-    try:
-        aliases = json.loads(json.dumps(
-            _symbol_alias_overlay.get("aliases", []),
-            ensure_ascii=True, separators=(",", ":")))
-    except Exception:
-        aliases = []
+    session = str(facts.get("capture", {}).get("captureSessionId", "") or "")
+    restore_client = None
+    if _for_chat and expected_capture_session_id and session and facts.get("capture", {}).get("loaded"):
+        # A submitted chat owns its replay evidence. Cancel only this window's
+        # passive startup job, and suppress late association callbacks for this
+        # capture session. The explicit project launcher uses a separate client.
+        if _project_ai_inspection[0] != session:
+            _project_ai_inspection = (session, _project_auto_restore_client)
+            if _project_auto_restore_client is not None:
+                _project_auto_restore_client.cancel_for_inspection()
+        restore_client = _project_ai_inspection[1]
     replay_manager = _ctx.Replay() if facts.get("capture", {}).get("loaded") else None
     job = {
         "jobId": job_id,
         "status": "queued",
-        "captureSessionId": str(
-            facts.get("capture", {}).get("captureSessionId", "") or ""),
+        "captureSessionId": session,
         "currentEventId": _safe_int(
             facts.get("events", {}).get("currentEventId", 0), 0),
         "selectedEventId": _safe_int(
@@ -6685,7 +6696,7 @@ def _begin_current_context_freeze(
         "replayManager": replay_manager,
         "facts": facts,
         "compatibleStages": tuple(compatible_stages),
-        "aliases": aliases,
+        "aliases": [],
         "resultPath": result_path,
         "context": None,
         "error": "",
@@ -6715,19 +6726,38 @@ def _begin_current_context_freeze(
     with _current_context_freeze_jobs_guard:
         job["timeoutTimer"] = timeout_timer
     timeout_timer.start()
-    try:
-        replay_manager.AsyncInvoke(
-            CURRENT_CONTEXT_FREEZE_REPLAY_TAG_PREFIX + job_id,
-            lambda ctrl, token=job_id:
-            _run_current_context_freeze_job(token, ctrl))
-    except Exception as exc:
+
+    def queue_after_project_restore():
         with _current_context_freeze_jobs_guard:
-            job["status"] = "failed"
-            job["error"] = "%s: %s" % (type(exc).__name__, str(exc))
-            job["failureCode"] = "enqueue-failed"
-            job["updatedMonotonic"] = time.monotonic()
-            job["finishedMonotonic"] = job["updatedMonotonic"]
-            _write_current_context_freeze_terminal(job)
+            if job["status"] != "queued":
+                return
+        if restore_client is not None and _project_auto_restore_client is restore_client:
+            QtCore.QTimer.singleShot(100, queue_after_project_restore)
+            return
+        try:
+            if restore_client is not None and not restore_client.replay_inspection_safe:
+                raise RuntimeError("Project restore rollback could not be verified for this capture")
+            try:
+                job["aliases"] = json.loads(json.dumps(
+                    _symbol_alias_overlay.get("aliases", []),
+                    ensure_ascii=True, separators=(",", ":")))
+            except (TypeError, ValueError):
+                job["aliases"] = []
+            replay_manager.AsyncInvoke(
+                lambda ctrl, token=job_id: _run_current_context_freeze_job(token, ctrl),
+                CURRENT_CONTEXT_FREEZE_REPLAY_TAG_PREFIX + job_id)
+        except Exception as exc:
+            with _current_context_freeze_jobs_guard:
+                if job["status"] != "queued":
+                    return
+                job["status"] = "failed"
+                job["error"] = "%s: %s" % (type(exc).__name__, str(exc))
+                job["failureCode"] = "enqueue-failed"
+                job["updatedMonotonic"] = time.monotonic()
+                job["finishedMonotonic"] = job["updatedMonotonic"]
+                _write_current_context_freeze_terminal(job)
+
+    queue_after_project_restore()
     return _current_context_freeze_job_snapshot(job)
 
 
@@ -13126,6 +13156,13 @@ def _get_mesh_uv_navigation_target(params):
     channel = str(params.get('channel', ''))
     pair = int(params.get('pair', 0))
     texture = int(params.get('texture_resource_id', 0))
+    selection_mode = params.get('selection_mode', 'point')
+    select_components = params.get('selected_vertices') is not None
+    selected = params.get('selected_vertices') or []
+    if (selection_mode not in ('point', 'edge', 'face') or not isinstance(selected, list) or
+            len(selected) > 4096 or any(isinstance(v, bool) or not isinstance(v, int) or
+                                      not 0 <= v <= 0xffffffff for v in selected)):
+        raise ValueError('Selection requires up to 4096 original vertex indices and point/edge/face mode')
     if not 0 < event_id <= 0xffffffff or mesh_stage not in ('vs-in', 'vs-out', 'gs-out') or pair not in (0, 1):
         raise ValueError('A draw EID, mesh stage and UV component pair are required')
     visible = _request_visible_event_id(0)
@@ -13159,12 +13196,41 @@ def _get_mesh_uv_navigation_target(params):
                         bound.add(rid)
             if not choices or (channel and channel not in choices) or (texture and texture not in bound):
                 return dict(resolved=False, channelChoices=choices, textureResourceIds=sorted(bound))
-            return dict(resolved=True, target=dict(kind='uv', eventId=event_id, stage=mesh_stage,
-                channel=channel, pair=pair, textureResourceId=str(texture)))
+            target = dict(kind='uv', eventId=event_id, stage=mesh_stage,
+                          channel=channel, pair=pair, textureResourceId=str(texture))
+            if select_components:
+                target.update(selectionMode=selection_mode, selectedVertices=sorted(set(selected)))
+            return dict(resolved=True, target=target, channelChoices=choices,
+                        textureResourceIds=sorted(bound))
         finally:
             _set_frame_event(ctrl, visible, True, allow_background_preemption=False)
 
     return _replay(run)
+
+
+def _capture_mesh_uv_evidence(params):
+    session = _require_capture_session_id(params.get('expected_capture_session_id'))
+    request = params.get('request')
+    def ui():
+        if session != _capture_session_id:
+            raise RuntimeError('Capture changed during mesh evidence collection')
+        if request:
+            event = int(request['eventId'])
+            if int(_ctx.CurEvent()) != event or int(_ctx.CurSelectedEvent()) != event:
+                _ctx.SetEventID([], event, event, True)
+            _ctx.ShowMeshPreview()
+        widget = _ctx.GetMeshPreview().Widget()
+        if widget.metaObject().indexOfProperty('meshEvidence') < 0:
+            raise RuntimeError('This application does not support native mesh/UV evidence snapshots')
+        if request:
+            # JSON preserves nested lists across PySide's QVariant boundary.
+            widget.setProperty('meshEvidenceRequest', json.dumps(request, ensure_ascii=False))
+        result = dict(widget.property('meshEvidence') or {})
+        if result.get('requestId') != params.get('request_id'):
+            raise RuntimeError('The mesh evidence request was superseded')
+        result['captureSessionId'] = session
+        return result
+    return _invoke_on_ui_sync(ui)
 
 
 def _shared_cbuffer_transaction(params, rollback=False):
@@ -14742,7 +14808,7 @@ def _begin_export_shader_catalog(params):
         # back to the legacy lane would let a long catalog job monopolise user
         # replay work on builds that lack background scheduling support.
         _ctx.Replay().AsyncInvoke(
-            SHADER_CATALOG_REPLAY_TAG_PREFIX + job_id, callback)
+            callback, SHADER_CATALOG_REPLAY_TAG_PREFIX + job_id)
     except Exception:
         with _shader_catalog_export_jobs_guard:
             _shader_catalog_export_jobs.pop(job_id, None)
@@ -16016,7 +16082,9 @@ def _save_texture(params):
                 reduction = None
                 if crop or max_dimension:
                     reduction = _reduce_saved_image(output_path, crop, max_dimension)
-                return {"saved": output_path, "type": "2D", "reduction": reduction}
+                return {"saved": output_path, "type": "2D", "reduction": reduction,
+                        "sourceFormat": _fmt_str(target_tex.format),
+                        "sourceColorSpace": "srgb" if target_tex.format.SRGBCorrected() else "linear"}
             return {"error": "Save failed: %s" % str(ret)}
 
         # CubeMap handling
@@ -17344,7 +17412,8 @@ def _event_texture_evidence_hash(path, maximum_bytes):
     return total, digest.hexdigest()
 
 
-def _reduce_saved_image(path, crop, max_dimension, opaque_rgb=False, flip_y=False):
+def _reduce_saved_image(path, crop, max_dimension, opaque_rgb=False, flip_y=False,
+                        preserve_channels=False):
     """Crop and shrink a saved image, using Qt's own image code.
 
     A model reading this has a finite context, and a 4K render target spends it on
@@ -17394,7 +17463,8 @@ def _reduce_saved_image(path, crop, max_dimension, opaque_rgb=False, flip_y=Fals
         if longest > int(max_dimension):
             image = image.scaled(
                 int(max_dimension), int(max_dimension),
-                QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+                QtCore.Qt.KeepAspectRatio,
+                QtCore.Qt.FastTransformation if preserve_channels else QtCore.Qt.SmoothTransformation)
             if image.isNull():
                 raise RuntimeError("scaling the evidence PNG produced no image")
     applied["scaledTo"] = {"width": int(image.width()), "height": int(image.height())}
@@ -17421,8 +17491,11 @@ def _capture_event_texture_evidence(params, _controller=None, _original_event=No
     """
 
     flip_y = params.get("flip_y", False)
+    preserve_alpha = params.get("preserve_alpha", False)
     if type(flip_y) is not bool:
         raise ValueError("flip_y must be a boolean")
+    if type(preserve_alpha) is not bool:
+        raise ValueError("preserve_alpha must be a boolean")
     event_id = _event_texture_evidence_int(
         params.get("event_id"), "event_id", 1, 0xFFFFFFFF)
     attachment_kind = params.get("attachment_kind")
@@ -17844,8 +17917,8 @@ def _capture_event_texture_evidence(params, _controller=None, _original_event=No
             save.sample.sampleIndex = sample
             save.channelExtract = channel_extract
             if hasattr(rd, "AlphaMapping"):
-                save.alpha = rd.AlphaMapping.Discard
-            display["alphaMode"] = "opaque-rgb"
+                save.alpha = rd.AlphaMapping.Preserve if preserve_alpha else rd.AlphaMapping.Discard
+            display["alphaMode"] = "preserved" if preserve_alpha else "opaque-rgb"
             save.comp.blackPoint = display["blackPoint"]
             save.comp.whitePoint = display["whitePoint"]
             try:
@@ -17874,7 +17947,8 @@ def _capture_event_texture_evidence(params, _controller=None, _original_event=No
                         raise RuntimeError(
                             "RenderDoc did not produce a valid PNG evidence file")
                 reduction = _reduce_saved_image(
-                    temporary_path, crop, max_dimension, opaque_rgb=True, flip_y=flip_y)
+                    temporary_path, crop, max_dimension, opaque_rgb=not preserve_alpha,
+                    flip_y=flip_y, **({"preserve_channels": True} if preserve_alpha else {}))
                 if reduction is not None:
                     temporary_size = os.lstat(temporary_path).st_size
                 if temporary_size > MAX_EVENT_TEXTURE_EVIDENCE_PNG_BYTES:
@@ -17945,6 +18019,11 @@ def _capture_event_texture_evidence(params, _controller=None, _original_event=No
     # The private batch path already owns the replay callback and restores once
     # after all channels. It never consults Qt objects from a worker thread.
     return _do(_controller) if _controller is not None else _replay(_do)
+
+
+def _resolve_shader_effect_presentation(params):
+    from .shader_validation import resolve_effect_presentation
+    return resolve_effect_presentation(sys.modules[__name__], params)
 
 
 def _compare_shader_organization_candidates(params):
@@ -21922,9 +22001,8 @@ def _queue_project_shader_resource_index_slice(job_id):
     if replay_manager is None:
         raise RuntimeError("Project Shader resource-index replay manager is unavailable")
     replay_manager.AsyncInvoke(
-        PROJECT_SHADER_INDEX_REPLAY_TAG_PREFIX + str(job_id),
-        lambda ctrl, token=job_id:
-        _run_project_shader_resource_index_job(token, ctrl))
+        lambda ctrl, token=job_id: _run_project_shader_resource_index_job(token, ctrl),
+        PROJECT_SHADER_INDEX_REPLAY_TAG_PREFIX + str(job_id))
 
 
 def _run_project_shader_resource_index_job(job_id, ctrl):
@@ -25554,6 +25632,7 @@ METHODS = {
     "pick_pixel": _pick_pixel,
     "capture_event_texture_evidence": _capture_event_texture_evidence,
     "fingerprint_event_outputs": _fingerprint_event_outputs,
+    "resolve_shader_effect_presentation": _resolve_shader_effect_presentation,
     "compare_shader_organization_candidates": _compare_shader_organization_candidates,
     "get_shader_cbuffer_alias_identity": _get_shader_cbuffer_alias_identity,
     "get_shader_cbuffer_display_identity": _get_shader_cbuffer_display_identity,
@@ -25586,6 +25665,7 @@ METHODS = {
     "get_constant_buffer_values": _get_constant_buffer_values,
     "get_cbuffer_navigation_target": _get_cbuffer_navigation_target,
     "get_mesh_uv_navigation_target": _get_mesh_uv_navigation_target,
+    "capture_mesh_uv_evidence": _capture_mesh_uv_evidence,
     "inspect_vertex_effect_scope": _inspect_vertex_effect_scope,
     "get_texture_fingerprints": _get_texture_fingerprints,
     "release_texture_fingerprint_cache": _release_texture_fingerprint_cache,
@@ -26237,6 +26317,7 @@ def _ensure_project_async_executor():
 
 _project_auto_restore_result = None
 _project_auto_restore_progress_stop = None
+_project_ai_inspection = ("", None)
 
 
 def _stop_project_auto_restore_progress():
@@ -26748,10 +26829,10 @@ def _schedule_project_auto_activation():
                             "ReplayLabProjects",
                             "Active project: %1"),
                             project.get("name", "")), 5000)
-                    if _project_restore_client_protocol is None:
+                    if _project_restore_client_protocol is None or _project_ai_inspection[0] == session_id:
                         return
                     restore_client = _project_restore_client_protocol.ReplayLabRestoreHostClient(
-                        internal_executable=executable)
+                        internal_executable=executable, confirm_replay_rollback=True)
                     previous_client = _project_auto_restore_client
                     _project_auto_restore_client = restore_client
                     _project_auto_restore_result = None
@@ -27627,7 +27708,7 @@ def begin_native_context_freeze_json(
         snapshot = _begin_current_context_freeze(
             focus_stage, expected_current_event_id,
             expected_selected_event_id, expected_capture_session_id,
-            _job_id=job_id)
+            _job_id=job_id, _for_chat=True)
     except Exception as exc:
         _publish_current_context_freeze_console_event({
             "jobId": job_id,

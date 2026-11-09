@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 from urllib.parse import urlsplit
 
-from PIL import Image
+from PIL import Image, ImageChops, ImageStat
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 MAX_ASSET_BYTES = 8 * 1024 * 1024
@@ -51,6 +51,54 @@ class ImageSource(Spec):
         if any(x is not None and not math.isfinite(x) for x in (self.blackPoint,self.whitePoint)):
             raise ValueError("Display points must be finite")
         return self
+
+
+class EffectDrawExclusion(Spec):
+    eventId: int = Field(ge=1, le=0xffffffff)
+    evidence: str = Field(min_length=20, max_length=600)
+    experimentReceipt: str = Field(min_length=1, max_length=32768)
+
+
+def neighbouring_composite_draws(actions: list[dict], event_id: int) -> list[int]:
+    """Find adjacent draws worth checking, without asserting that they contribute."""
+    index = next((i for i, row in enumerate(actions) if row['eventId'] == event_id), None)
+    if index is None or not actions[index].get('outputs') or not actions[index].get('numIndices'):
+        return []
+    fields = ('markerPath', 'outputs', 'flags', 'numIndices', 'numInstances')
+    signature = tuple(actions[index].get(key) for key in fields)
+    neighbours = []
+    for step in (-1, 1):
+        for offset in range(1, 5):
+            pos = index + step * offset
+            if not 0 <= pos < len(actions):
+                break
+            row = actions[pos]
+            if tuple(row.get(key) for key in fields) != signature:
+                break
+            neighbours.append(row['eventId'])
+    return sorted(neighbours)
+
+
+def _combined_baseline_matches(cards: list[dict], root: Path) -> bool:
+    if len(cards) < 2:
+        return True
+    first = cards[0]
+    with Image.open(root/'blobs'/first['image']['file']) as image:
+        width, height = image.size
+        roi = first['experiment']['roi']
+        box = (int(roi[0]*width), int(roi[1]*height), math.ceil(roi[2]*width), math.ceil(roi[3]*height))
+        baseline = image.crop(box).convert('RGB')
+    for card in cards[1:]:
+        if card['image']['sha256'] == first['image']['sha256']:
+            continue
+        with Image.open(root/'blobs'/card['image']['file']) as image:
+            if image.size != (width, height):
+                return False
+            delta = ImageChops.difference(baseline, image.crop(box).convert('RGB'))
+        # Validated replay baselines may differ by one quantization step.
+        if any(maximum > 1 for _, maximum in delta.getextrema()):
+            return False
+    return True
 
 
 class Mark(Spec):
@@ -96,14 +144,59 @@ class Material(Spec):
         return self
 
 
+class CodeRange(Spec):
+    startLine: int = Field(ge=1,le=10000000)
+    endLine: int = Field(ge=1,le=10000000)
+
+    @model_validator(mode='after')
+    def order(self):
+        if self.endLine < self.startLine:
+            raise ValueError('Code range end must follow its start')
+        return self
+
+
+class CodeMapping(Spec):
+    displayLine: int = Field(ge=1,le=120)
+    sourceLine: int = Field(ge=1,le=10000000)
+    symbol: str = Field(default='',pattern=r'^[A-Za-z_][A-Za-z0-9_]*$|^$')
+    sourceSymbol: str = Field(default='',pattern=r'^[A-Za-z_][A-Za-z0-9_]*$|^$')
+
+
+class CodeBlock(Spec):
+    title: str = Field(default='',max_length=160)
+    workspacePath: str = Field(min_length=1,max_length=32768)
+    sourceFile: str = Field(default='',max_length=2048)
+    startLine: int = Field(default=1,ge=1,le=10000000)
+    endLine: int = Field(default=1,ge=1,le=10000000)
+    expectedSourceSha256: str = Field(pattern=r'^[0-9a-f]{64}$')
+    exampleCode: str = Field(default='',max_length=16000)
+    sourceRanges: list[CodeRange] = Field(default_factory=list,max_length=12)
+    codeMappings: list[CodeMapping] = Field(default_factory=list,max_length=240)
+
+    @model_validator(mode='after')
+    def source(self):
+        if self.startLine>self.endLine or (not self.sourceRanges and self.endLine>=self.startLine+120):
+            raise ValueError('Code blocks need an ordered source range of at most 120 lines')
+        if self.exampleCode and self.sourceRanges:
+            raise ValueError('Choose sourceRanges or exampleCode, not both')
+        return self
+
+
 class Node(Spec):
     id: str = Field(pattern=r"^[a-zA-Z0-9_-]{1,64}$")
     text: str = Field(min_length=1,max_length=240)
     eventId: int = Field(default=0,ge=0,le=0xffffffff)
     image: ImageSource | None = None
-    calculation: str = Field(default='',max_length=400)
+    secondImage: ImageSource | None = None
+    imageLabel: str = Field(default='',max_length=80)
+    secondImageLabel: str = Field(default='',max_length=80)
+    annotations: list[Mark] = Field(default_factory=list,max_length=16)
+    secondAnnotations: list[Mark] = Field(default_factory=list,max_length=16)
+    calculation: str = Field(default='',max_length=1200)
     description: str = Field(default='',max_length=400)
-    links: list[Link] = Field(default_factory=list,max_length=4)
+    details: str = Field(default='',max_length=4000)
+    links: list[Link] = Field(default_factory=list,max_length=8)
+    codeBlocks: list[CodeBlock] = Field(default_factory=list,max_length=4)
 
 
 class MeshEffect(Spec):
@@ -116,11 +209,13 @@ class MeshEffect(Spec):
 
 
 class Card(Spec):
-    type: Literal["image","compare","mesh","diagram","code"]
+    type: Literal["image","compare","mesh-uv","mesh","diagram","code"]
     title: str = Field(min_length=1,max_length=160)
     caption: str = Field(default="",max_length=1600)
     image: ImageSource | None = None
     secondImage: ImageSource | None = None
+    detailImage: ImageSource | None = None
+    secondDetailImage: ImageSource | None = None
     beforeLabel: str = Field(default="",max_length=120)
     afterLabel: str = Field(default="",max_length=120)
     annotations: list[Mark] = Field(default_factory=list,max_length=32)
@@ -136,19 +231,24 @@ class Card(Spec):
     nodes: list[Node] = Field(default_factory=list,max_length=12)
     edges: list[list[str]] = Field(default_factory=list,max_length=24)
     edgeLabels: list[str] = Field(default_factory=list,max_length=24)
+    edgeDetails: list[str] = Field(default_factory=list,max_length=24)
     workspacePath: str = Field(default='',max_length=32768)
     sourceFile: str = Field(default='',max_length=2048)
     startLine: int = Field(default=1,ge=1,le=10000000)
     endLine: int = Field(default=1,ge=1,le=10000000)
     expectedSourceSha256: str = Field(default='',max_length=64)
     exampleCode: str = Field(default='',max_length=16000)
+    sourceRanges: list[CodeRange] = Field(default_factory=list,max_length=12)
+    codeMappings: list[CodeMapping] = Field(default_factory=list,max_length=240)
     experimentReceipt: str = Field(default='',max_length=32768)
+    comparisonScope: Literal['auto', 'appearance', 'stage'] = Field(default='auto',
+        description='Appearance requires a verified on/off experiment at the same captured Present as the other appearance cards. Stage explicitly compares intermediate results.')
 
     @model_validator(mode="after")
     def shape(self):
-        if self.type in {"image","compare"} and self.image is None:
+        if self.type in {"image","compare","mesh-uv"} and self.image is None:
             raise ValueError("Image cards require an image source")
-        if self.type=="compare" and self.secondImage is None:
+        if self.type in {"compare","mesh-uv"} and self.secondImage is None:
             raise ValueError("Comparison cards require both sources")
         if self.type=="mesh" and sum((bool(self.eventId),bool(self.meshFile),bool(self.primitive)))!=1:
             raise ValueError("Mesh needs one eventId, exported meshFile, or illustrative primitive")
@@ -159,8 +259,11 @@ class Card(Spec):
             raise ValueError("Diagram requires nodes")
         if self.edgeLabels and (len(self.edgeLabels)!=len(self.edges) or any(len(v)>240 for v in self.edgeLabels)):
             raise ValueError('Edge labels must match edges and contain at most 240 characters')
+        if self.edgeDetails and (len(self.edgeDetails)!=len(self.edges) or any(len(v)>2000 for v in self.edgeDetails)):
+            raise ValueError('Edge details must match edges and contain at most 2000 characters')
         if self.type=='code' and (not self.workspacePath or not _HEX.fullmatch(self.expectedSourceSha256)
-                                  or not self.startLine<=self.endLine<self.startLine+120):
+                                  or not self.startLine<=self.endLine
+                                  or (not self.sourceRanges and self.endLine>=self.startLine+120)):
             raise ValueError('Code cards need an exact saved-source hash and a range of at most 120 lines')
         if sum(len(m.points) for m in self.annotations+self.secondAnnotations)>1024:
             raise ValueError("Visual annotation point budget exceeded")
@@ -195,6 +298,7 @@ def save_navigation_target(target: dict, capture: dict) -> dict:
     if identity.get('local') and identity.get('path'):
         st=Path(identity['path']).stat();identity.update(size=st.st_size,mtimeMs=st.st_mtime_ns//1_000_000)
     data=_json({'schema':'bread-ai-navigation/v1','capture':identity,'target':target})
+    if len(data)>MAX_ASSET_BYTES:raise ValueError('Navigation data exceeds the 8 MiB inspection payload limit')
     digest=hashlib.sha256(data).hexdigest()
     _write(root_path()/'targets'/(digest+'.json'),data)
     kind = 'uv' if target.get('kind') == 'uv' else 'cbuffer'
@@ -279,7 +383,9 @@ def obj_mesh(data: bytes) -> dict:
 
 def publish(title: str, cards: list[dict], context: dict, *, capture_image: Callable,
             capture_mesh: Callable, authorize_file: Callable, root: Path | None = None,
-            read_code: Callable | None = None) -> dict:
+            read_code: Callable | None = None, effect_neighbours: Callable | None = None,
+            effect_inputs: Callable | None = None,
+            effect_exclusions: list[EffectDrawExclusion] | None = None) -> dict:
     if not isinstance(title,str) or not 1<=len(title)<=160:raise ValueError("Visual answer needs a short title")
     if not 1<=len(cards)<=6:raise ValueError("A visual answer needs 1..6 focused cards")
     specs=[Card.model_validate(c)for c in cards]
@@ -287,10 +393,11 @@ def publish(title: str, cards: list[dict], context: dict, *, capture_image: Call
     capture=dict(context.get("capture") or {})
     if capture.get("loaded") and capture.get("local") and capture.get("path"):
         st=Path(capture['path']).stat();capture.update(size=st.st_size,mtimeMs=st.st_mtime_ns//1_000_000)
-    def image(source: ImageSource):
+    def image(source: ImageSource, *, diagram=False):
         metadata={}
         if source.eventId:
-            metadata=capture_image(source)
+            metadata = (capture_image(source, preserve_alpha=True)
+                        if diagram and source.channel == "rgba" else capture_image(source))
             if not metadata.get("path"):raise ValueError("The captured image was not saved")
             path=Path(metadata['path']);provenance="captured"
         else:path=authorize_file(source.path);provenance="reference"
@@ -315,28 +422,65 @@ def publish(title: str, cards: list[dict], context: dict, *, capture_image: Call
                           source=dict(source.model_dump(exclude={'path'}), flipY=bool(flip)),
                           presentationFlipApplied=bool(flip),
                           sourceSha256=hashlib.sha256(data).hexdigest())
+            if metadata.get('resourceId'):
+                result['resourceId'] = str(metadata['resourceId'])
             return result
     built=[]
     for spec in specs:
-        card=spec.model_dump(exclude={'image','secondImage','meshFile','material','workspacePath','sourceFile',
+        card=spec.model_dump(exclude={'image','secondImage','detailImage','secondDetailImage','meshFile','material','workspacePath','sourceFile',
                                       'expectedSourceSha256','experimentReceipt','exampleCode'})
         if spec.image:card['image']=image(spec.image)
         if spec.secondImage:card['secondImage']=image(spec.secondImage)
+        if spec.detailImage:card['detailImage']=image(spec.detailImage)
+        if spec.secondDetailImage:card['secondDetailImage']=image(spec.secondDetailImage)
         if spec.type=='diagram':
             card['nodes']=[]
             for node in spec.nodes:
-                saved=node.model_dump(exclude={'image'})
+                saved=node.model_dump(exclude={'image','secondImage','codeBlocks'})
                 if node.image:
-                    saved['image']=image(node.image)
+                    saved['image']=image(node.image, diagram=True)
                     if not saved['eventId'] and node.image.eventId:saved['eventId']=node.image.eventId
+                if node.secondImage:
+                    saved['secondImage'] = image(node.secondImage, diagram=True)
+                saved['codeBlocks']=[]
+                for block in node.codeBlocks:
+                    if read_code is None:raise ValueError('Saved Shader source reader unavailable')
+                    code=read_code(block)
+                    from .code_excerpts import validate_fragment
+                    validate_fragment(code['text'])
+                    saved['codeBlocks'].append(dict(code,title=block.title))
                 card['nodes'].append(saved)
         if spec.type=='code':
             if read_code is None:raise ValueError('Saved Shader source reader unavailable')
             card['code']=read_code(spec)
+            from .code_excerpts import validate_fragment
+            validate_fragment(card['code']['text'])
         if spec.experimentReceipt:
             from .effect_experiments import verified_comparison
             card['experiment']=verified_comparison(authorize_file(spec.experimentReceipt),capture,
                                                     card.get('image',{}),card.get('secondImage',{}))
+        if spec.type=='compare':
+            if card['image']['sha256']==card['secondImage']['sha256']:
+                raise ValueError('Comparison inputs have identical displayed pixels. Publish one image for no visible difference, or collect the actual changed output.')
+            if (card['image']['width'],card['image']['height'])==(card['secondImage']['width'],card['secondImage']['height']):
+                with Image.open(root/'blobs'/card['image']['file']) as a, Image.open(root/'blobs'/card['secondImage']['file']) as b:
+                    delta=ImageChops.difference(a.convert('RGB'),b.convert('RGB'))
+                    bounds=delta.getbbox()
+                    def changed_pixels(im):
+                        bands=im.split()
+                        return im.width*im.height-ImageChops.lighter(ImageChops.lighter(bands[0],bands[1]),bands[2]).histogram()[0]
+                    stats={'differentPixels':changed_pixels(delta),
+                           'bounds':list(bounds)if bounds else None,'meanAbsoluteDifference':ImageStat.Stat(delta).mean}
+                    if not stats['differentPixels']:
+                        raise ValueError('Comparison inputs have identical displayed pixels. Publish one image for no visible difference, or collect the actual changed output.')
+                    roi=card.get('experiment',{}).get('roi')
+                    if roi:
+                        box=(int(roi[0]*a.width),int(roi[1]*a.height),max(1,int(math.ceil(roi[2]*a.width))),max(1,int(math.ceil(roi[3]*a.height))))
+                        regional=delta.crop(box)
+                        stats['regionDifferentPixels']=changed_pixels(regional)
+                        if card['experiment']['outcome']=='changed'and not stats['regionDifferentPixels']:
+                            raise ValueError('The displayed experiment pair has no change inside its stated region. Recheck output, coordinates and display mapping before attributing the effect.')
+                    card['comparisonStats']=stats
         if spec.type=='mesh':
             material=spec.material.model_dump(exclude={'texture'})
             if spec.material.texture:material['texture']=image(spec.material.texture)
@@ -353,10 +497,109 @@ def publish(title: str, cards: list[dict], context: dict, *, capture_image: Call
             else:geometry=None
             if geometry:card['geometry']=_asset(root,_json(geometry),'.json');card['geometryInfo']={k:v for k,v in geometry.items()if k not in {'vertices','triangles','uvs'}}
         built.append(card)
+    built.sort(key=lambda card: card['type'] != 'compare')
+    appearance_cards = [card for card in built
+                        if card['type'] == 'compare' and card['comparisonScope'] != 'stage']
+    presentation_bases = [(card, (card.get('experiment') or {}).get('presentationBasis'),
+                           (card.get('experiment') or {}).get('capturedPresent', False))
+                          for card in appearance_cards]
+    verified_basis = next((basis for _, basis, present in presentation_bases if present), None)
+    final_basis = verified_basis or next((basis for _, basis, _ in presentation_bases if basis), None)
+    for card, basis, present in presentation_bases:
+        if ((final_basis is not None and basis != final_basis)
+                or (card['comparisonScope'] == 'appearance' and not present)):
+            target = f" EID {verified_basis['eventId']}" if verified_basis else ''
+            raise ValueError(f"Comparison '{card['title']}' must use a verified pair at the same final "
+                             f"presentation output{target}, with the same display mapping. Re-run "
+                             "the layer's on/off experiment with observation_scope='appearance'. "
+                             "Use comparisonScope='stage' only to explain intermediate results.")
+    diagrams = [card for card in built if card['type'] == 'diagram']
+    nodes = [node for diagram in diagrams for node in diagram['nodes']]
+    effect_cards = [(card, card['experiment']) for card in appearance_cards if 'experiment' in card]
+    effect_sources = {exp['sourceEventId'] for _, exp in effect_cards if exp.get('sourceEventId')}
+    effect_outputs = {exp['observationEventId'] for _, exp in effect_cards}
+    linked_draws = set()
+    for card, _ in effect_cards:
+        for link in card['links']:
+            url = urlsplit(link['url'])
+            if url.netloc in {'event', 'eid'} and re.fullmatch(r'/[1-9][0-9]{0,9}', url.path):
+                linked_draws.add(int(url.path[1:]))
+    layer_events = effect_sources | (linked_draws - effect_outputs)
+    displayed_events = {node['eventId'] for node in nodes if node.get('image') or node.get('secondImage')}
+    code_blocks = [card['code'] for card in built if 'code' in card]
+    code_blocks.extend(block for node in nodes for block in node['codeBlocks'])
+    covered = {Path(block['workspacePath']).resolve() for block in code_blocks if block.get('workspacePath')}
+    missing = {}
+    for card in built:
+        experiment = card.get('experiment') or {}
+        if experiment.get('verified') and experiment.get('workspacePath') and (diagrams or card['comparisonScope'] != 'stage'):
+            path = Path(experiment['workspacePath']).resolve()
+            if path not in covered:
+                missing[path] = dict(workspacePath=str(path), eventId=experiment['sourceEventId'],
+                                     stage=experiment['stage'])
+    marked_effect = (dict(relatedEvents=sorted(layer_events),
+                          missingLayerViews=sorted(layer_events - effect_sources - displayed_events),
+                          needsDiagram=len(layer_events) > 1 and not any(d['edges'] for d in diagrams),
+                          needsFinalReplay=[card['title'] for card, exp in effect_cards if not exp.get('capturedPresent')])
+                     if effect_cards else None)
+    if marked_effect is not None and effect_neighbours is not None:
+        from .effect_experiments import verify_layer_exclusion
+        candidates = {eid for anchor in effect_sources for eid in effect_neighbours(anchor)}
+        reference = next((exp for _, exp in effect_cards if exp['capturedPresent']), None)
+        exclusions = {}
+        for row in effect_exclusions or []:
+            if reference is None or row.eventId not in candidates - effect_sources:
+                raise ValueError('An exclusion must identify an unconfirmed neighbouring draw and a final comparison.')
+            digest = verify_layer_exclusion(authorize_file(row.experimentReceipt), capture, row.eventId, reference)
+            exclusions[row.eventId] = dict(evidence=row.evidence, receiptSha256=digest)
+        known_layers = (layer_events | candidates) - exclusions.keys()
+        # An adjacent raw RT pair can show pipeline order. It cannot prove an isolated final effect.
+        final_layers = {exp['sourceEventId'] for _, exp in effect_cards if exp.get('capturedPresent')}
+        if len(known_layers) > 1:
+            connected_events = set()
+            input_images = set()
+            outputs = {eid for eid in effect_outputs if eid}
+            baseline_hashes = {card['image']['sourceSha256'] for card, exp in effect_cards
+                               if exp.get('capturedPresent')}
+            final_cards = [card for card, exp in effect_cards if exp.get('capturedPresent')]
+            for diagram in diagrams:
+                def images(node):
+                    return [node[key] for key in ('image', 'secondImage') if key in node]
+                # Walk back from the final composite, rather than counting unrelated edges.
+                connected_ids = {node['id'] for node in diagram['nodes'] if any(
+                    image['source']['eventId'] in outputs or image['sourceSha256'] in baseline_hashes
+                    for image in images(node))}
+                previous_count = -1
+                while previous_count != len(connected_ids):
+                    previous_count = len(connected_ids)
+                    connected_ids.update(start for start, end in diagram['edges'] if end in connected_ids)
+                for node in diagram['nodes']:
+                    if node['id'] not in connected_ids or not images(node):
+                        continue
+                    connected_events.add(node['eventId'])
+                    input_images.update((image['source']['eventId'], image.get('resourceId'))
+                                        for image in images(node) if image['source']['attachmentKind'] == 'srv')
+            missing_final = sorted(known_layers - final_layers)
+            missing_nodes = sorted(known_layers - connected_events)
+            missing_inputs = []
+            if effect_inputs is not None:
+                for eid in sorted(final_layers):
+                    missing_inputs.extend(dict(eventId=eid, resourceId=rid) for rid in effect_inputs(eid)
+                                          if (eid, rid) not in input_images)
+            marked_effect.update(relatedEvents=sorted(known_layers),
+                                 candidateExclusions=exclusions, missingFinalLayerComparisons=missing_final,
+                                 missingLayerViews=missing_nodes, missingInputTextures=missing_inputs,
+                                 combinedBaselineMismatch=not _combined_baseline_matches(final_cards, root),
+                                 needsDiagram=not any(d['edges'] for d in diagrams))
     manifest={'schema':'bread-ai-visual/v1','title':title,'capture':capture,'cards':built,
               'replayModified':False,'materialIsIllustrative':True}
     data=_json(manifest)
     if len(data)>MAX_MANIFEST_BYTES:raise ValueError("Visual manifest is too large")
     digest=hashlib.sha256(data).hexdigest();_write(root/(digest+'.json'),data)
     return {'schema':'bread-ai-visual-receipt/v1','id':digest,'path':str(root/(digest+'.json')),
-            'cardCount':len(built),'applied':False}
+            'cardCount':len(built),'applied':False,'presentation':{'shaderCodeGaps':list(missing.values()),
+                **({'markedEffect': marked_effect} if marked_effect else {}), 'cards':[
+                dict(type=c['type'],title=c['title'],nodes=[dict(id=n['id'],title=n['text'],
+                    imageCount=int(bool(n.get('image')))+int(bool(n.get('secondImage'))),
+                    codeBlockCount=len(n.get('codeBlocks',[])),hasDetails=bool(n.get('details')))
+                    for n in c.get('nodes',[])])for c in built]}}

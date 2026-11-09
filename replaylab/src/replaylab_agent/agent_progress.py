@@ -156,6 +156,11 @@ class ProgressReporter:
                 data={"stream": "provider", "reset": False},
             )
 
+    def discard_main_message(self) -> None:
+        self._main_text_chars = 0
+        self.writer.emit("message-delta", profile=self.profile_id, text="",
+                         data={"stream": "provider", "reset": True})
+
     def main_reasoning(self, payload: Mapping[str, Any]) -> None:
         data = dict(payload)
         data.setdefault("agentId", "main")

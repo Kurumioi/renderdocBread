@@ -371,10 +371,13 @@ DECLARE_REFLECTION_STRUCT(BugReport);
   DOCUMENT(                                                                                        \
       "The near plane used in the mesh viewers display."                                           \
       "\n"                                                                                         \
-      "Defaults to ``0.1``."                                                                       \
+      "Defaults to ``0.0001``."                                                                    \
       ""                                                                                           \
       ":type: float");                                                                             \
-  CONFIG_SETTING_VAL(public, float, float, MeshViewer_CameraNear, 0.1f)                            \
+  CONFIG_SETTING_VAL(public, float, float, MeshViewer_CameraNear, 0.0001f)                         \
+  DOCUMENT("The field of view in degrees of the mesh preview camera.\n:type: int");                \
+  CONFIG_SETTING_VAL(public, int, int, MeshViewer_CameraFov, 90)                                   \
+  DOCUMENT("The mouse navigation preset for the mesh viewer.\n:type: int");                        \
   CONFIG_SETTING_VAL(public, int, int, MeshViewer_CameraNavigation, 0)                             \
                                                                                                    \
   DOCUMENT(                                                                                        \

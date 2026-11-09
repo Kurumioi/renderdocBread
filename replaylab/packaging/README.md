@@ -3,14 +3,20 @@
 Before packaging, read [RELEASE_REQUIREMENTS.md](RELEASE_REQUIREMENTS.md) and the
 [sealed dependency and redistribution inventory](../dependencies/README.md).
 These are standing release requirements, also linked from the root `AGENTS.md` and
-`CLAUDE.md`; previous chat history is not required to discover them.
+`CLAUDE.md`.
 
-For GitHub delivery, follow the
+Start packaging only after the user explicitly authorizes it for the current
+task. Keep work under development uncommitted on its local branch. Obtain
+explicit authorization before committing, pushing, opening a PR, merging,
+deleting a branch, tagging, uploading or publishing.
+The user may authorize several named steps together.
+
+For authorized GitHub delivery, follow the
 [branch and release completion workflow](../../CLAUDE.md#branch-and-release-completion)
-and [release completion requirements](RELEASE_REQUIREMENTS.md#8-github-主分支合并与分支清理):
-verify the `origin` repository and actual default branch, merge validated work
-before public publication, then verify inclusion and delete the task's remote and
-local branch. Use an explicit `--repo Straw1997/renderdocBread` for `gh` commands.
+and [release completion requirements](RELEASE_REQUIREMENTS.md#8-github-主分支合并与分支清理).
+Verify the `origin` repository and its actual default branch. Verify inclusion
+before any authorized branch cleanup. Use an explicit
+`--repo Straw1997/renderdocBread` for `gh` commands.
 Preserve published tags/artifacts and unrelated work. Documentation-only follow-ups
 do not require rebuilding an existing release.
 

@@ -1326,6 +1326,19 @@ void TextureViewer::EditAIAnnotation(
     return;
   }
   ++m_AIAnnotationSerial;
+  QRectF imageViewRect;
+  if(MatchesAIAnnotation(context))
+  {
+    // TextureDisplay uses physical pixels and the full base-level extent, even for a mip.
+    // The immutable AI snapshot can be downsampled; map its whole image onto the same
+    // logical rectangle instead of fitting it to the smaller annotation canvas.
+    const ViewRequest request = CurrentViewRequest();
+    const qreal dpr = ui->render->devicePixelRatioF();
+    imageViewRect = QRectF(
+        QPointF(ui->render->mapToGlobal(QPoint())) +
+            QPointF(request.display.xOffset / dpr, request.display.yOffset / dpr),
+        QSizeF(request.texture.width, request.texture.height) * (request.display.scale / dpr));
+  }
   QPointer<TextureViewer> self(this);
   m_AIAnnotation = new AITextureAnnotation(
       original, title, context, accept,
@@ -1336,6 +1349,8 @@ void TextureViewer::EditAIAnnotation(
       m_AIAnnotationStack);
   m_AIAnnotationStack->addWidget(m_AIAnnotation);
   m_AIAnnotationStack->setCurrentWidget(m_AIAnnotation);
+  if(imageViewRect.isValid())
+    m_AIAnnotation->SetImageViewRect(imageViewRect);
 }
 
 void TextureViewer::BeginAIAnnotation(
@@ -1361,8 +1376,14 @@ void TextureViewer::BeginAIAnnotation(
   const int mip = qMin(31U, request.display.subresource.mip);
   const QSize textureSize(qMax(1U, request.texture.width >> mip),
                           qMax(1U, request.texture.height >> mip));
-  QSize imageSize = textureSize.scaled(QSize(1600, 1600), Qt::KeepAspectRatio).boundedTo(textureSize);
-  imageSize = QSize(qMax(1, imageSize.width()), qMax(1, imageSize.height()));
+  // The editor inherits the live viewport transform. Capture its source at one
+  // texel per pixel so opening the brush never adds a second resampling step.
+  const QSize imageSize = textureSize;
+  if(qint64(imageSize.width()) * imageSize.height() > 64LL * 1024 * 1024)
+  {
+    error(tr("The render target image could not be read for annotation."));
+    return;
+  }
   QJsonObject context =
       ReplayLabAIResourceContext(m_Ctx, request.display.resourceId, "texture-viewer");
   QJsonObject capture = captureBinding;
@@ -1411,7 +1432,7 @@ void TextureViewer::BeginAIAnnotation(
     else
     {
       TextureDisplay display = request.display;
-      display.scale = -1.0f;
+      display.scale = 1.0f;
       display.xOffset = display.yOffset = 0;
       const uint64_t generation = r->GetShaderReplacementGeneration(0);
       IReplayOutput *output =
@@ -1441,15 +1462,7 @@ void TextureViewer::BeginAIAnnotation(
                   : diagnostic);
         return;
       }
-      self->m_AIAnnotation = new AITextureAnnotation(
-          image, title, context, accept,
-          [self]() {
-            if(self)
-              self->CloseAIAnnotation();
-          },
-          self->m_AIAnnotationStack);
-      self->m_AIAnnotationStack->addWidget(self->m_AIAnnotation);
-      self->m_AIAnnotationStack->setCurrentWidget(self->m_AIAnnotation);
+      self->EditAIAnnotation(image, title, context, accept);
     });
   });
 }
@@ -2923,6 +2936,41 @@ void TextureViewer::ViewFollowedResource(FollowType followType, ShaderStage stag
   }
 
   qWarning() << "Couldn't find matching bound resource";
+}
+
+bool TextureViewer::FollowBoundTexture(ResourceId id, const QString &attachmentKind)
+{
+  static const QMap<QString, FollowType> kinds = {
+      {QLatin1String("srv"), FollowType::ReadOnly},
+      {QLatin1String("uav"), FollowType::ReadWrite},
+      {QLatin1String("dsv"), FollowType::OutputDepth},
+      {QLatin1String("dsr"), FollowType::OutputDepthResolve},
+      {QLatin1String("rtv"), FollowType::OutputColor},
+      {QLatin1String("present"), FollowType::OutputColor},
+  };
+  const auto kind = kinds.constFind(attachmentKind);
+  if(!attachmentKind.isEmpty() && kind == kinds.constEnd())
+    return false;
+  ResourcePreview *selection = nullptr;
+  for(const auto &thumbs : {ui->outputThumbs->thumbs(), ui->inputThumbs->thumbs()})
+  {
+    for(ResourcePreview *preview : thumbs)
+    {
+      if(!preview->isActive() || preview->property("id").value<ResourceId>() != id)
+        continue;
+      const Following follow = preview->property("f").value<Following>();
+      if(kind != kinds.constEnd() && follow.Type != *kind)
+        continue;
+      if(!selection || follow == m_Following)
+        selection = preview;
+    }
+  }
+  ToolWindowManagerArea *tabs = ui->dockarea->areaOf(ui->renderContainer);
+  if(!selection || !tabs)
+    return false;
+  SelectPreview(selection);
+  tabs->setCurrentWidget(ui->renderContainer);
+  return GetCurrentResource() == id;
 }
 
 uint64_t TextureViewer::BeginTemporaryOutputFollow(uint32_t index)

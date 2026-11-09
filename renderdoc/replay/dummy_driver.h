@@ -170,7 +170,7 @@ public:
   void SetProxyBufferData(ResourceId bufid, byte *data, size_t dataSize);
 
   void RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secondaryDraws,
-                  const MeshDisplay &cfg);
+                  const MeshDisplay &cfg, const MeshComponentHighlight &components);
   bool RenderTexture(TextureDisplay cfg);
 
   void SetCustomShaderIncludes(const rdcarray<rdcstr> &directories);

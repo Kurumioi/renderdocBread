@@ -90,7 +90,7 @@ class DirectProjectRestoreTests(unittest.TestCase):
             "QtCore": types.SimpleNamespace(QTimer=Timer, QCoreApplication=types.SimpleNamespace(translate=lambda c,s:s)),
             "_project_auto_activation_generation":0, "_project_auto_activation_timer":None,
             "_project_auto_restore_client":None, "_project_auto_restore_result":None, "_capture_session_id":self.session,
-            "_project_auto_restore_progress_stop":None,
+            "_project_auto_restore_progress_stop":None, "_project_ai_inspection":("", None),
             "_active_capture_token":("loaded",os.path.normcase(self.path)),
             "_project_async_executor":None, "_project_launcher_protocol":protocol,
             "_project_restore_client_protocol":types.SimpleNamespace(ReplayLabRestoreHostClient=client,
@@ -215,6 +215,15 @@ class DirectProjectRestoreTests(unittest.TestCase):
         self.assertEqual(self.clients[0].calls, [(self.match["project"]["projectRoot"], self.path, self.session)])
         self.assertEqual(self.refreshes, [{"force":True}])
         self.assertIsNone(self.ns["_project_auto_restore_client"])
+
+    def test_pending_auto_match_does_not_start_restore_after_chat_admission(self):
+        self.ns["_schedule_project_auto_activation"]()
+        self.ns["_project_auto_activation_timer"].timeout.emit()
+        self.ns["_project_ai_inspection"] = (self.session, None)
+        _, match, matched = self.executor.jobs[0]
+        matched(match(), "")
+        self.assertEqual(len(self.executor.jobs), 1)
+        self.assertEqual(self.clients, [])
 
     def test_ambiguous_or_unmatched_project_never_starts_restore(self):
         self.match = {"activated": False, "matchCount":2, "project":None}

@@ -286,7 +286,7 @@ public:
   void SetProxyBufferData(ResourceId bufid, byte *data, size_t dataSize);
 
   void RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secondaryDraws,
-                  const MeshDisplay &cfg);
+                  const MeshDisplay &cfg, const MeshComponentHighlight &components);
 
   bool RenderTexture(TextureDisplay cfg);
 
@@ -569,6 +569,7 @@ private:
     ID3D12Resource *col;
     ID3D12Resource *colResolve;
     ID3D12Resource *depth;
+    ID3D12Resource *componentHighlight = NULL;
     D3D12_CPU_DESCRIPTOR_HANDLE rtv;
     D3D12_CPU_DESCRIPTOR_HANDLE dsv;
     D3D12_RESOURCE_DESC bbDesc;

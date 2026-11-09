@@ -13,6 +13,9 @@ parser.add_argument('--run',type=Path,required=True)
 parser.add_argument('--ui-script',type=Path)
 parser.add_argument('--result-name',default='visual-history-result.json')
 parser.add_argument('--shader-config-workspace',type=Path)
+parser.add_argument('--timeout',type=int,default=200)
+parser.add_argument('--bundled-agent',action='store_true')
+parser.add_argument('--use-user-local-data',action='store_true')
 args=parser.parse_args()
 repo=Path(__file__).resolve().parents[2];root=args.run.resolve(strict=True)
 if not args.ui_script:
@@ -20,6 +23,12 @@ if not args.ui_script:
 env={k:v for k,v in os.environ.items()if not k.startswith(('REPLAYLAB_','RENDERDOC_','BREAD_','PYTHON','QT_'))}
 env.update(RENDERDOC_CONFIG_DIR=str(root/'config'),LOCALAPPDATA=str(root/'local'),APPDATA=str(root/'roaming'),
            RD_ANNOTATION_RUN=str(root),PYTHONIOENCODING='utf-8',RD_VISUAL_FIXTURE_ROOT=str(repo/'replaylab/tests/fixtures'))
+if args.use_user_local_data:
+    # Reuse the connection's own provider state without copying account files.
+    # RENDERDOC_CONFIG_DIR still isolates the Qt conversation/configuration store.
+    env['LOCALAPPDATA']=os.environ['LOCALAPPDATA']
+if args.bundled_agent:
+    env['REPLAYLAB_AI_CLI']=str(args.app.resolve().parent/'replaylab/replaylab-ai.exe')
 if args.shader_config_workspace:
     plan=json.loads((args.shader_config_workspace/'manifest.json').read_text(encoding='utf-8'))['routePlan']
     env['RENDERDOC_ULTRA_SHADER_TOOLS_CONFIG']=str(Path(plan['toolRegistryPath']).resolve(strict=True))
@@ -47,7 +56,7 @@ block=ctypes.create_unicode_buffer('\0'.join(k+'='+v for k,v in sorted(env.items
 try:
     if not kernel.CreateProcessW(str(args.app.resolve()),command,None,None,False,0x08000400,block,str(root),ctypes.byref(startup),ctypes.byref(process)):
         raise ctypes.WinError(ctypes.get_last_error())
-    deadline=time.monotonic()+200
+    deadline=time.monotonic()+args.timeout
     while kernel.WaitForSingleObject(process.process,1000)==258:
         if time.monotonic()>deadline:
             kernel.TerminateProcess(process.process,1);raise TimeoutError('Owned history process timed out')

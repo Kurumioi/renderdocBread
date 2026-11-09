@@ -122,6 +122,12 @@ RT_ANNOTATION_GUIDANCE = (
     "pass reorganization, a published report or an editable Shader workspace. Keep work "
     "focused on the marked targets and the dependencies that can affect them; do not "
     "create those extra deliverables just to satisfy a generic review/outline workflow. "
+    "A chat-local explanation graph is different: when several related calculations, layers or passes "
+    "combine to make the marked effect, show those relationships and useful computed results in one "
+    "local visual bundle. This also applies to multiple calculations inside one Shader, not only multiple "
+    "draws. Choose the graph from the actual computation, not a fixed rendering recipe. Keep node "
+    "expressions short; put each stage's detailed source into the later linked code pages. A simple "
+    "question can use a simpler presentation when those relationships are not central. "
     "Reuse verified observations within this investigation. Once the referent and main "
     "causes are supported, answer with the conclusion, a few decisive facts and links, "
     "keeping raw tool dumps and investigation housekeeping out of the reply. "
@@ -179,9 +185,8 @@ RT_ANNOTATION_GUIDANCE = (
     "RGB description. A concise final answer does not mean a shallow investigation. "
     "Before finishing, check that the answer explains why, rather than merely where the "
     "final color was copied or what its channels contain. Trace multiple "
-    "passes as needed: geometry/material color, direct or indirect lighting, reflections, "
-    "emissive spill/Bloom and final composition can contribute differently. These are possible "
-    "causes, not a required checklist or assumed technologies. Test the user's suggested cause "
+    "passes as needed according to observed inputs, calculations and outputs. "
+    "Do not assume a named mechanism or use an effect checklist. Test the user's suggested cause "
     "rather than accepting it: nearby UI or a bright object is not automatically a light source. "
     "Use representative interior pixels and a nearby control, matched intermediate views, "
     "shader reads/calculations, blend state and actual resource versions to support the ranking. "
@@ -190,8 +195,15 @@ RT_ANNOTATION_GUIDANCE = (
     "briefly instead of presenting a guessed order. Distinguish a bound or sampled resource "
     "from an observed contribution at the marked pixels. Give clickable rdoc://event/<EID> "
     "links for the decisive events; use verified workspace/source links when available. "
-    "For an ordinary why/how question, explain a concrete parameter or A/B check the user "
-    "can try without silently changing replay. When the user also asks for editable Shader "
+    "For an ordinary why/how question, use a supported restored A/B experiment when authorized "
+    "to verify the proposed cause, and publish its matched slider plus a local texture diagram "
+    "for relevant multi-pass explanations. Determine all feature components, not only one pixel's primitive; "
+    "use paired native mesh/UV context and detail images with readable selection and viewpoint. "
+    "Display the relevant captured texture on both the 3D mesh and UV atlas; verify its actual Shader read, "
+    "UV mapping and both texture-rendered flags, and retain the texture name. "
+    "Keep restoration/reuse/check status in evidence rather than normal reply prose. "
+    "If replay changes are prohibited, retain that limit and "
+    "offer a concrete check instead of calling an untested hypothesis confirmed. When the user also asks for editable Shader "
     "debugging or organization, load the Shader workbench Skill and deliver the most relevant "
     "captured target through its supported source, review and validation route, preserving "
     "existing user source. Only claim editability, replacement or live debugging when its "
@@ -1255,6 +1267,12 @@ def prepare_provider_conversation_input(
             ),
             "conversation": conversation,
         }
+        if not envelope.messages and not envelope.omitted_message_count:
+            projection['conversationBoundary'] = (
+                'This is the first request in a new chat. Start from its current question, attachments and capture. '
+                'Do not refer to previous chats or treat a saved Shader or visual artifact as a previous answer. '
+                'Build and verify the explanation from the current evidence, then answer in full.'
+            )
         if envelope.omitted_message_count:
             # A bounded local transcript is not a semantic summary. State the gap
             # plainly so the model does not treat the retained suffix as complete.

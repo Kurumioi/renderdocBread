@@ -23,15 +23,18 @@
  ******************************************************************************/
 
 #include "AITextureAnnotation.h"
+#include "3rdparty/flowlayout/FlowLayout.h"
 
 #include <QButtonGroup>
 #include <QColorDialog>
+#include <QGridLayout>
 #include <QHBoxLayout>
 #include <QJsonArray>
 #include <QLabel>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPushButton>
+#include <QResizeEvent>
 #include <QShortcut>
 #include <QSpinBox>
 #include <QToolButton>
@@ -143,7 +146,7 @@ class AIAnnotationCanvas : public QWidget
 public:
   explicit AIAnnotationCanvas(const QImage &image, QWidget *parent) : QWidget(parent), image(image)
   {
-    setMinimumSize(120, 100);
+    setMinimumSize(120, 48);
     setCursor(Qt::CrossCursor);
     setFocusPolicy(Qt::StrongFocus);
     setMouseTracking(true);
@@ -215,8 +218,18 @@ public:
 
   void fit()
   {
-    zoom = 1.0;
-    pan = QPointF();
+    fitted = true;
+    update();
+  }
+
+  void setImageViewRect(const QRectF &rect)
+  {
+    if(!rect.isValid())
+      return;
+    // Keep the image in panel coordinates: wrapping the toolbar or resizing the canvas
+    // must not change the inherited pixel scale or move the image with the toolbar.
+    viewRect = rect.translated(pos());
+    fitted = false;
     update();
   }
 
@@ -277,10 +290,17 @@ public:
 protected:
   void paintEvent(QPaintEvent *) override
   {
+    // i18n-ignore: native annotation API state, in canvas-local logical pixels.
+    const QRectF bounds = imageRect();
+    setProperty("annotationImageRect",
+                QVariantList{bounds.x(), bounds.y(), bounds.width(), bounds.height()});
+    setProperty("annotationStrokeCount", marks.size());
+    setProperty("annotationSourceSize", image.size());
     QPainter painter(this);
     painter.fillRect(rect(), palette().brush(QPalette::Dark));
-    painter.setRenderHint(QPainter::SmoothPixmapTransform);
-    painter.drawImage(imageRect(), image);
+    painter.setRenderHint(QPainter::SmoothPixmapTransform,
+                          bounds.width() * devicePixelRatioF() < image.width());
+    painter.drawImage(bounds, image);
     QImage overlay(size(), QImage::Format_ARGB32_Premultiplied);
     overlay.fill(Qt::transparent);
     QPainter ink(&overlay);
@@ -338,7 +358,7 @@ protected:
       update();
     if(panning)
     {
-      pan += event->localPos() - lastPan;
+      setImageViewRect(imageRect().translated(event->localPos() - lastPan));
       lastPan = event->localPos();
       update();
       return;
@@ -380,26 +400,27 @@ protected:
     const QPointF point = event->posF();
     const QPointF uv((point.x() - before.left()) / before.width(),
                      (point.y() - before.top()) / before.height());
-    zoom = qBound(1.0, zoom * std::pow(1.25, event->angleDelta().y() / 120.0), 16.0);
-    const QRectF after = imageRect();
-    pan += point -
-           QPointF(after.left() + uv.x() * after.width(), after.top() + uv.y() * after.height());
-    if(zoom == 1.0)
-      pan = QPointF();
-    update();
+    const double scale = before.width() / image.width();
+    const double nextScale =
+        qBound(0.001, scale * std::pow(1.25, event->angleDelta().y() / 120.0), 16384.0);
+    const QSizeF size = before.size() * (nextScale / scale);
+    setImageViewRect(QRectF(point - QPointF(uv.x() * size.width(), uv.y() * size.height()), size));
     event->accept();
   }
 
 private:
   bool drawing = false;
   bool panning = false;
-  double zoom = 1.0;
-  QPointF pan, lastPan, cursorPoint;
+  bool fitted = true;
+  QRectF viewRect;
+  QPointF lastPan, cursorPoint;
   Mark current;
   QRectF imageRect() const
   {
-    const QSizeF size = QSizeF(image.size()).scaled(QSizeF(this->size()), Qt::KeepAspectRatio) * zoom;
-    return QRectF(QPointF((width() - size.width()) / 2, (height() - size.height()) / 2) + pan, size);
+    if(!fitted)
+      return viewRect.translated(-pos());
+    const QSizeF size = QSizeF(image.size()).scaled(QSizeF(this->size()), Qt::KeepAspectRatio);
+    return QRectF(QPointF((width() - size.width()) / 2, (height() - size.height()) / 2), size);
   }
   static void thinPen(Mark &mark)
   {
@@ -444,8 +465,10 @@ AITextureAnnotation::AITextureAnnotation(const QImage &image, const QString &tit
   layout->setContentsMargins(4, 4, 4, 4);
   QLabel *identity = new QLabel(title, this);
   identity->setWordWrap(true);
-  layout->addWidget(identity);
-  QHBoxLayout *tools = new QHBoxLayout();
+  m_Header = new QGridLayout();
+  m_Header->addWidget(identity, 0, 0);
+  m_Toolbar = new QWidget(this);
+  FlowLayout *tools = new FlowLayout(m_Toolbar, 0, 4, 3);
   QButtonGroup *group = new QButtonGroup(this);
   m_Canvas = new AIAnnotationCanvas(image, this);
   m_Canvas->loadStrokes(
@@ -491,9 +514,12 @@ AITextureAnnotation::AITextureAnnotation(const QImage &image, const QString &tit
   tools->addWidget(width);
   connect(width, static_cast<void (QSpinBox::*)(int)>(&QSpinBox::valueChanged), this,
           [this](int value) { m_Canvas->penWidth = value; });
-  QLabel *eraserLabel = new QLabel(tr("Eraser width"), this);
-  tools->addWidget(eraserLabel);
-  QSpinBox *eraserWidth = new QSpinBox(this);
+  QWidget *eraserSettings = new QWidget(this);
+  QHBoxLayout *eraserLayout = new QHBoxLayout(eraserSettings);
+  eraserLayout->setContentsMargins(0, 0, 0, 0);
+  eraserLayout->setSpacing(4);
+  QLabel *eraserLabel = new QLabel(tr("Eraser width"), eraserSettings);
+  QSpinBox *eraserWidth = new QSpinBox(eraserSettings);
   // i18n-ignore: stable QObject identifier used by native UI tests.
   eraserWidth->setObjectName(QLatin1String("aiAnnotationEraserWidth"));
   eraserWidth->setRange(4, 256);
@@ -502,7 +528,9 @@ AITextureAnnotation::AITextureAnnotation(const QImage &image, const QString &tit
   eraserWidth->setToolTip(
       tr("Eraser diameter in view pixels; the circle previews the erased area."));
   eraserLabel->setBuddy(eraserWidth);
-  tools->addWidget(eraserWidth);
+  eraserLayout->addWidget(eraserLabel);
+  eraserLayout->addWidget(eraserWidth);
+  tools->addWidget(eraserSettings);
   connect(eraserWidth, static_cast<void (QSpinBox::*)(int)>(&QSpinBox::valueChanged), this,
           [this](int value) {
             m_Canvas->eraserWidth = value;
@@ -512,17 +540,14 @@ AITextureAnnotation::AITextureAnnotation(const QImage &image, const QString &tit
   fit->setText(tr("Fit"));
   tools->addWidget(fit);
   connect(fit, &QToolButton::clicked, this, [this]() { m_Canvas->fit(); });
-  tools->addStretch();
-  layout->addLayout(tools);
-  layout->addWidget(m_Canvas, 1);
-  QLabel *hint = new QLabel(
+  m_Hint = new QLabel(
       tr("Mark the object or color region, then add it to the conversation and describe "
          "your question. Refer to marks by color. Only the marked image is shown in chat; "
          "the clean original is also sent to AI. Wheel to zoom; "
          "middle-drag to pan. Up to 64 marks."),
       this);
-  hint->setWordWrap(true);
-  layout->addWidget(hint);
+  m_Hint->setWordWrap(true);
+  m_Canvas->setToolTip(m_Hint->text());
   QHBoxLayout *actions = new QHBoxLayout();
   QPushButton *undo = new QPushButton(tr("Undo"), this);
   QPushButton *redo = new QPushButton(tr("Redo"), this);
@@ -534,19 +559,35 @@ AITextureAnnotation::AITextureAnnotation(const QImage &image, const QString &tit
   cancel->setMinimumSize(104, 36);
   add->setMinimumSize(148, 36);
   // i18n-ignore: action colors and states are Qt stylesheet rules.
-  cancel->setStyleSheet(
-      QLatin1String("QPushButton:enabled { background:#a82e38; color:white; }"
-                    "QPushButton:hover { background:#bd3944; }"));
+  cancel->setStyleSheet(QLatin1String(
+      "QPushButton { background-color:#8e3039; border:1px solid #a7545b; border-radius:4px; "
+      "padding:4px 12px; color:#ffffff; }"
+      "QPushButton:hover { background-color:#a53a44; }"
+      "QPushButton:pressed { background-color:#742730; }"
+      "QPushButton:focus { border-color:#ffd1d4; }"));
   // i18n-ignore: action colors and states are Qt stylesheet rules.
-  add->setStyleSheet(
-      QLatin1String("QPushButton:enabled { background:#227346; color:white; }"
-                    "QPushButton:hover { background:#288653; }"));
+  add->setStyleSheet(QLatin1String(
+      "QPushButton { background-color:#236443; border:1px solid #528e6d; border-radius:4px; "
+      "padding:4px 12px; color:#ffffff; }"
+      "QPushButton:hover:enabled { background-color:#2c7951; }"
+      "QPushButton:pressed { background-color:#1c5137; }"
+      "QPushButton:focus { border-color:#c3efd6; }"
+      "QPushButton:disabled { background-color:#304b3e; border-color:#456354; color:#b5c8bd; }"));
+  QWidget *history = new QWidget(this);
+  QHBoxLayout *historyLayout = new QHBoxLayout(history);
+  historyLayout->setContentsMargins(0, 0, 0, 0);
+  historyLayout->setSpacing(4);
   for(QPushButton *button : {undo, redo, clear})
-    actions->addWidget(button);
-  actions->addStretch();
+    historyLayout->addWidget(button);
+  tools->addWidget(history);
   actions->addWidget(cancel);
   actions->addWidget(add);
-  layout->addLayout(actions);
+  m_Header->addLayout(actions, 0, 1);
+  m_Header->addWidget(m_Toolbar, 1, 0, 1, 2);
+  m_Header->setColumnStretch(0, 1);
+  layout->addLayout(m_Header);
+  layout->addWidget(m_Canvas, 1);
+  layout->addWidget(m_Hint);
   m_Canvas->changed = [this, undo, redo, clear, add]() {
     undo->setEnabled(!m_Canvas->undo.isEmpty());
     redo->setEnabled(!m_Canvas->redo.isEmpty());
@@ -572,4 +613,29 @@ AITextureAnnotation::AITextureAnnotation(const QImage &image, const QString &tit
   QShortcut *redoKey = new QShortcut(QKeySequence::Redo, this);
   redoKey->setContext(Qt::WidgetWithChildrenShortcut);
   connect(redoKey, &QShortcut::activated, redo, &QPushButton::click);
+}
+
+void AITextureAnnotation::SetImageViewRect(const QRectF &globalImageRect)
+{
+  m_Canvas->setImageViewRect(globalImageRect.translated(-m_Canvas->mapToGlobal(QPoint())));
+}
+
+void AITextureAnnotation::resizeEvent(QResizeEvent *event)
+{
+  QWidget::resizeEvent(event);
+  if(!m_Hint)
+    return;
+
+  const QMargins margins = layout()->contentsMargins();
+  const int width = qMax(1, event->size().width() - margins.left() - margins.right());
+  QLayout *tools = m_Toolbar->layout();
+  // FlowLayout needs the assigned width before it can report the height of wrapped rows.
+  tools->setGeometry(QRect(0, 0, width, m_Toolbar->height()));
+  m_Toolbar->setFixedHeight(tools->heightForWidth(width));
+  const int headerHeight =
+      qMax(m_Header->minimumSize().height(), m_Header->totalHeightForWidth(width));
+  const int requiredHeight = headerHeight + m_Canvas->minimumHeight() +
+                             m_Hint->heightForWidth(width) + margins.top() + margins.bottom() +
+                             2 * layout()->spacing();
+  m_Hint->setVisible(event->size().height() >= requiredHeight);
 }

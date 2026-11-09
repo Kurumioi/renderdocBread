@@ -59,6 +59,8 @@ public:
   void Shutdown();
   void SetTextureDisplay(const TextureDisplay &o);
   void SetMeshDisplay(const MeshDisplay &o);
+  void SetMeshComponentOverlay(const FloatVector *vertices, uint32_t count, Topology topology,
+                               uint32_t selectedVertices);
   void SetDimensions(int32_t width, int32_t height);
   bytebuf ReadbackOutputTexture();
   rdcpair<int32_t, int32_t> GetDimensions();
@@ -163,6 +165,8 @@ private:
     TextureDisplay texDisplay;
     MeshDisplay meshDisplay;
   } m_RenderData;
+
+  MeshComponentHighlight m_ComponentHighlight;
 
   friend struct ReplayController;
 };

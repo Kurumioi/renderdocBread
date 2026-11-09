@@ -3,13 +3,14 @@ name: replaylab-core
 description: Shared Bread AI guidance for capture identity, evidence, tool effects and honest reporting.
 metadata:
   replaylab-category: core
-  replaylab-version: "32"
+  replaylab-version: "38"
 ---
 
 # Bread AI shared boundaries
 
 The user defines the outcome; the Agent chooses the method and relevant domain
-Skill. Host responses supply observations, capabilities, operation results and
+Skill. Derive conclusions from current evidence and revise contradicted ideas.
+Host responses supply observations, capabilities, operation results and
 concrete errors, not a semantic completion decision or required tool sequence.
 
 Use the latest requested target, then conversation history; UI selection is a
@@ -34,10 +35,9 @@ Do not repeat catalog or synonym searches when a known tool answers the task.
 Use concrete failure diagnostics and supported recovery. Perform routine setup
 within existing authorization; a Skill cannot grant access or override denial.
 
-When a tool limitation blocks an otherwise authorized task, investigate and
-repair the missing capability instead of treating the current inventory as the
-limit of the Agent's methods. For Shader/compiler or application-interface gaps,
-use [capability-recovery.md](references/capability-recovery.md) when needed.
+Investigate missing or failing capabilities within authorization. For Shader,
+compiler or application-interface gaps, see
+[capability-recovery.md](references/capability-recovery.md).
 
 Prefer domain tools for UI work; otherwise use `get_application_ui_state` and
 `control_application_ui` with returned IDs. Inspect queued operation results

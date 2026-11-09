@@ -150,6 +150,7 @@ public:
   void ViewTexture(ResourceId ID, CompType typeCast, bool focus) override;
   void ViewFollowedResource(FollowType followType, ShaderStage stage, int32_t index,
                             int32_t arrayElement) override;
+  bool FollowBoundTexture(ResourceId id, const QString &attachmentKind);
   uint64_t BeginTemporaryOutputFollow(uint32_t index) override;
   bool UpdateTemporaryOutputFollow(uint64_t token, uint32_t index) override;
   bool ShowTemporaryTexturePreview(uint64_t token, const TextureDescription &texture) override;

@@ -563,9 +563,17 @@ QString safeMarkdown(QString text)
   QString html;
   html.reserve(text.size() + text.size() / 4);
   bool codeBlock = false;
+  bool codeInList = false;
   QString codeLanguage;
   QStringList codeLines;
   int listKind = 0;
+  bool listItemOpen = false;
+  auto closeLists = [&]() {
+    if(listItemOpen)
+      html += lit("</li>");    // i18n-ignore: closing HTML list-item tag.
+    listItemOpen = false;
+    closeList(html, listKind);
+  };
 
   for(int row = 0; row < lines.size(); ++row)
   {
@@ -573,12 +581,17 @@ QString safeMarkdown(QString text)
     const QString trimmed = line.trimmed();
     if(trimmed.startsWith(lit("```")))
     {
-      closeList(html, listKind);
+      if(!codeBlock)
+        codeInList =
+            listItemOpen && (line.startsWith(lit("  ")) || line.startsWith(QLatin1Char('\t')));
+      if(!codeInList)
+        closeLists();
       if(codeBlock)
       {
         html += renderFencedCode(codeLines, codeLanguage);
         codeLines.clear();
         codeLanguage.clear();
+        codeInList = false;
       }
       else
       {
@@ -594,14 +607,28 @@ QString safeMarkdown(QString text)
     }
     if(trimmed.isEmpty())
     {
-      closeList(html, listKind);
+      int next = row + 1;
+      while(next < lines.size() && lines[next].trimmed().isEmpty())
+        ++next;
+      row = next - 1;
+      int orderedStart = 0;
+      const bool continues =
+          listKind && next < lines.size() &&
+          (lines[next].startsWith(lit("  ")) || lines[next].startsWith(QLatin1Char('\t')) ||
+           (lines[next].trimmed().startsWith(QLatin1Char('[')) &&
+            lines[next].trimmed().endsWith(QLatin1Char(')'))) ||
+           (listKind == 2 && orderedListLine(lines[next], orderedStart)) ||
+           (listKind == 1 &&
+            (lines[next].startsWith(lit("- ")) || lines[next].startsWith(lit("* ")))));
+      if(!continues)
+        closeLists();
       continue;
     }
 
     const QStringList cells = markdownTableCells(line);
     if(row + 1 < lines.size() && markdownTableRule(markdownTableCells(lines[row + 1]), cells.size()))
     {
-      closeList(html, listKind);
+      closeLists();
       html += QLatin1String("<table border=\"1\" cellspacing=\"0\" cellpadding=\"4\"><tr>");
       for(const QString &cell : cells)
         html += QLatin1String("<th>") + inlineMarkdown(cell) + QLatin1String("</th>");
@@ -627,7 +654,7 @@ QString safeMarkdown(QString text)
       ++heading;
     if(heading > 0 && heading < line.size() && line[heading].isSpace())
     {
-      closeList(html, listKind);
+      closeLists();
       html += lit("<h") + QString::number(heading + 2) + lit(">") +
               inlineMarkdown(line.mid(heading + 1)) + lit("</h") + QString::number(heading + 2) +
               lit(">");
@@ -638,11 +665,15 @@ QString safeMarkdown(QString text)
     {
       if(listKind != 1)
       {
-        closeList(html, listKind);
+        closeLists();
         html += lit("<ul>");
         listKind = 1;
       }
-      html += lit("<li>") + inlineMarkdown(line.mid(2)) + lit("</li>");
+      if(listItemOpen)
+        html += lit("</li>");    // i18n-ignore: closing HTML list-item tag.
+      // i18n-ignore: opening HTML list-item tag, no user-visible prose.
+      html += lit("<li>") + inlineMarkdown(line.mid(2));
+      listItemOpen = true;
       continue;
     }
 
@@ -651,22 +682,36 @@ QString safeMarkdown(QString text)
     {
       if(listKind != 2)
       {
-        closeList(html, listKind);
+        closeLists();
         html += lit("<ol>");
         listKind = 2;
       }
-      html += lit("<li>") + inlineMarkdown(line.mid(orderedStart)) + lit("</li>");
+      if(listItemOpen)
+        html += lit("</li>");    // i18n-ignore: closing HTML list-item tag.
+      // i18n-ignore: opening HTML list-item tag, no user-visible prose.
+      html += lit("<li>") + inlineMarkdown(line.mid(orderedStart));
+      listItemOpen = true;
       continue;
     }
 
-    closeList(html, listKind);
+    if(listItemOpen && !line.startsWith(lit("> ")))
+    {
+      // A Qt 5 list item is one QTextBlock. Line breaks keep explanatory text
+      // and source links in that item instead of restarting the next number.
+      const bool citation =
+          trimmed.startsWith(QLatin1Char('[')) && trimmed.endsWith(QLatin1Char(')'));
+      // i18n-ignore: whitespace and structural HTML line break, no prose.
+      html += (citation ? lit(" ") : lit("<br />")) + inlineMarkdown(trimmed);
+      continue;
+    }
+    closeLists();
     if(line.startsWith(lit("> ")))
       html += lit("<blockquote>") + inlineMarkdown(line.mid(2)) + lit("</blockquote>");
     else
       html += lit("<p>") + inlineMarkdown(line) + lit("</p>");
   }
 
-  closeList(html, listKind);
+  closeLists();
   if(codeBlock)
     html += renderFencedCode(codeLines, codeLanguage);
   return html;
@@ -1620,6 +1665,14 @@ QString renderMessageAttachments(const QVector<AIChatAttachment> &attachments,
 class AIRoundedTextBrowser : public QTextBrowser
 {
 public:
+  struct ElapsedOverlay
+  {
+    QTextCursor cursor;
+    int length = 0;
+    QTextCharFormat format;
+    QString text;
+  };
+
   explicit AIRoundedTextBrowser(QWidget *parent = NULL) : QTextBrowser(parent)
   {
     // The background is painted here (base colour, then the opaque rounded cards)
@@ -1637,6 +1690,12 @@ public:
   void setBubbleAnchors(const QVector<QPair<QString, QString>> &anchors)
   {
     m_BubbleCursors = resolveAnchorPairs(anchors);
+    viewport()->update();
+  }
+
+  void setElapsedOverlays(const QVector<ElapsedOverlay> &overlays)
+  {
+    m_ElapsedOverlays = overlays;
     viewport()->update();
   }
 
@@ -1708,6 +1767,42 @@ protected:
       }
     }
     QTextBrowser::paintEvent(event);
+    // Keep clocks out of QTextDocument's incremental rich-text layout. Qt 5.9
+    // can invalidate a QTextLine when a duration is edited amid streamed tables.
+    // The original span still owns selection, links and document geometry.
+    if(!m_ElapsedOverlays.isEmpty())
+    {
+      QPainter clock(viewport());
+      clock.setClipRect(event->rect());
+      const QTextCursor selection = textCursor();
+      for(const ElapsedOverlay &overlay : m_ElapsedOverlays)
+      {
+        if(overlay.cursor.isNull() || overlay.cursor.document() != document())
+          continue;
+        const int position = overlay.cursor.position();
+        if(selection.hasSelection() && selection.selectionStart() < position + overlay.length &&
+           selection.selectionEnd() > position)
+          continue;
+        QTextCursor end = overlay.cursor;
+        end.setPosition(position + overlay.length);
+        const QRect first = cursorRect(overlay.cursor), last = cursorRect(end);
+        if(first.top() != last.top())
+          continue;
+        const QFont labelFont = overlay.format.font().resolve(font());
+        clock.setFont(labelFont);
+        const qreal width =
+            qMax<qreal>(last.left() - first.left(), QFontMetricsF(labelFont).width(overlay.text)) + 2;
+        const QRectF area(first.left(), first.top(),
+                          qMin<qreal>(width, viewport()->width() - first.left()), first.height());
+        if(area.width() <= 0 || !area.intersects(QRectF(event->rect())))
+          continue;
+        clock.fillRect(area, palette().brush(QPalette::Base));
+        clock.setPen(overlay.format.foreground().style() == Qt::NoBrush
+                         ? palette().color(QPalette::Text)
+                         : overlay.format.foreground().color());
+        clock.drawText(area, Qt::AlignLeft | Qt::AlignVCenter | Qt::TextSingleLine, overlay.text);
+      }
+    }
     if(m_BubbleCursors.isEmpty() || !document())
       return;
 
@@ -1738,6 +1833,7 @@ protected:
 private:
   QVector<QPair<QTextCursor, QTextCursor>> m_BubbleCursors;
   QVector<QPair<QTextCursor, QTextCursor>> m_CardCursors;
+  QVector<ElapsedOverlay> m_ElapsedOverlays;
 };
 
 static QColor blendedColor(const QColor &from, const QColor &to, int toPercent)
@@ -2462,16 +2558,20 @@ void AIConversationView::rebuildElapsedCursors()
 
 void AIConversationView::advanceElapsedText()
 {
-  // Replace each complete running duration, including its translated units. The
-  // surrounding document, selection, scroll position and toggle links stay intact.
+  // Paint changing durations over their stable spans. Never edit the rich-text
+  // document from a clock tick: streamed tables and lazy layout can otherwise
+  // leave Qt 5.9's incremental layout with an invalid QTextLine.
   if(!m_Browser || !m_Browser->document() || m_ElapsedCursors.isEmpty())
   {
+    if(m_Browser)
+      static_cast<AIRoundedTextBrowser *>(m_Browser)->setElapsedOverlays({});
     if(m_ElapsedTimer)
       m_ElapsedTimer->stop();
     return;
   }
   const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
   bool stale = false;
+  QVector<AIRoundedTextBrowser::ElapsedOverlay> overlays;
   for(auto it = m_ElapsedCursors.begin(); it != m_ElapsedCursors.end(); ++it)
   {
     ElapsedCursor &entry = it.value();
@@ -2483,24 +2583,21 @@ void AIConversationView::advanceElapsedText()
     edit.setPosition(position);
     edit.setPosition(position + entry.length, QTextCursor::KeepAnchor);
     const QString current = edit.selectedText();
-    if(current == text)
-      continue;
-    // Replace this span only while it still holds exactly what this view put there.
-    // Anything else means the document moved on (a re-render between ticks, a span
-    // that spells the label differently); overwriting it then corrupts the label,
-    // and the repair is to find the label again, not to write over what is there.
+    // A structural render or live insertion may have moved the span. Resolve it
+    // again rather than painting over unrelated text.
     if(current != entry.text)
     {
       stale = true;
       continue;
     }
-    edit.insertText(text, entry.format);
-    entry.length = text.size();
-    entry.text = text;
-    m_ElapsedAnchors[it.key()].second = text;
-    // insertText leaves the tracking cursor after the new text; keep it at the start.
-    entry.cursor.setPosition(position);
+    AIRoundedTextBrowser::ElapsedOverlay overlay;
+    overlay.cursor = entry.cursor;
+    overlay.length = entry.length;
+    overlay.format = entry.format;
+    overlay.text = text;
+    overlays.push_back(overlay);
   }
+  static_cast<AIRoundedTextBrowser *>(m_Browser)->setElapsedOverlays(overlays);
   if(stale)
     rebuildElapsedCursors();
 }
@@ -2642,7 +2739,10 @@ void AIConversationView::clear()
   if(m_TurnRail)
     m_TurnRail->setTurns(QVector<AITurnRailWidget::Turn>());
   if(m_Browser)
+  {
+    static_cast<AIRoundedTextBrowser *>(m_Browser)->setElapsedOverlays({});
     m_Browser->clear();
+  }
   if(m_SelectionAction)
     m_SelectionAction->hide();
   updateTailControl();
@@ -3377,8 +3477,26 @@ void AIConversationView::activateLink(const QUrl &url)
     return;
   }
 
+  QUrl target = url;
+  if(url.scheme() == QLatin1String("rdoc") && url.host() == QLatin1String("resource"))
+  {
+    QUrlQuery query(url);
+    const QString identity = query.queryItemValue(QLatin1String("visual"));
+    if(AIVisualReply::validIdentity(identity))
+    {
+      query.removeAllQueryItems(QLatin1String("visual"));
+      target.setQuery(query.isEmpty() ? QString() : query.toString());
+      QJsonObject capture;
+      const QUrl scoped = AIVisualReply::resolveLegacyTextureLink(target, identity, capture);
+      if(!scoped.isEmpty() && m_VisualLinkHandler)
+      {
+        m_VisualLinkHandler(scoped, capture);
+        return;
+      }
+    }
+  }
   if(m_LinkHandler)
-    m_LinkHandler(url);
+    m_LinkHandler(target);
 }
 
 void AIConversationView::render(bool preserveScroll)
@@ -3642,6 +3760,7 @@ void AIConversationView::render(bool preserveScroll)
   for(int messageIndex = 0; messageIndex < m_Messages.size(); ++messageIndex)
   {
     const AIChatMessage &message = m_Messages[messageIndex];
+    const QStringList visualIdentities = AIVisualReply::visibleIdentities(message.visuals);
     const QString anchor = m_MessageAnchors.value(message.id);
     // i18n-ignore: Message role is a backend protocol identifier used only for routing.
     if(message.role == lit("user"))
@@ -3689,6 +3808,16 @@ void AIConversationView::render(bool preserveScroll)
     // i18n-ignore: Message role is a backend protocol identifier used only for routing.
     else if(message.role == lit("assistant"))
     {
+      QString formattedText = safeMarkdown(message.text);
+      if(!visualIdentities.isEmpty())
+      {
+        // Older resource links did not encode the EID. Carry the visual identity
+        // so the click can resolve the event from its verified diagram.
+        static const QRegularExpression resourceHref(
+            QStringLiteral(R"link(href="(rdoc://resource/(?:ResourceId::)?[0-9]+)")link"));
+        formattedText.replace(
+            resourceHref, QStringLiteral("href=\"\\1?visual=%1\"").arg(visualIdentities.last()));
+      }
       if(!message.artifacts.isEmpty())
         // i18n-ignore: Generated anchor prefixes are internal transcript identifiers.
         cardAnchors.push_back(qMakePair(lit("replaylab-card-start-") + QString::number(messageIndex),
@@ -3697,9 +3826,8 @@ void AIConversationView::render(bool preserveScroll)
       html += lit("<div class=\"assistant\"><a class=\"message-marker\" name=\"") +
               anchor.toHtmlEscaped() +
               // i18n-ignore: Structural transcript HTML and zero-width marker contain no prose.
-              lit("\">&#8203;</a>") +
-              renderMessageAttachments(message.attachments, document) +
-              safeMarkdown(message.text) +
+              lit("\">&#8203;</a>") + renderMessageAttachments(message.attachments, document) +
+              formattedText +
               renderMessageArtifacts(message, m_ExpandedArtifactMessages.contains(message.id),
                                      messageIndex) +
               // i18n-ignore: Structural transcript HTML contains no user-visible prose.
@@ -3743,12 +3871,8 @@ void AIConversationView::render(bool preserveScroll)
               // i18n-ignore: Structural transcript HTML contains no user-visible prose.
               lit("</div>") + safeMarkdown(message.provisionalText) + lit("</div>");
     }
-    for(int visualIndex = 0; visualIndex < qMin(8, message.visuals.size()); ++visualIndex)
+    for(const QString &identity : visualIdentities)
     {
-      const QString identity =
-          message.visuals[visualIndex].toObject().value(QLatin1String("id")).toString();
-      if(!AIVisualReply::validIdentity(identity))
-        continue;
       const QString slot =
           QLatin1String("bread-visual-slot:") + message.id + QLatin1Char(':') + identity;
       QImage transparent(1, 1, QImage::Format_ARGB32);
@@ -3771,6 +3895,7 @@ void AIConversationView::render(bool preserveScroll)
   m_ElapsedCursors.clear();
   static_cast<AIRoundedTextBrowser *>(m_Browser)->setBubbleAnchors({});
   static_cast<AIRoundedTextBrowser *>(m_Browser)->setCardAnchors({});
+  static_cast<AIRoundedTextBrowser *>(m_Browser)->setElapsedOverlays({});
   // QTextEdit deletes its original control-owned document, but not externally supplied ones.
   // QPointer covers both cases; do not accumulate a document for every streamed update.
   QPointer<QTextDocument> previousDocument = m_Browser->document();

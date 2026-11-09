@@ -25,7 +25,10 @@
 #pragma once
 
 #include <QFrame>
+#include <QMatrix4x4>
 #include <QMutex>
+#include <QVector3D>
+#include <atomic>
 #include <memory>
 #include "Code/Interface/QRDInterface.h"
 #include "Code/QRDUtils.h"
@@ -57,9 +60,14 @@ class CameraWrapper;
 class ArcballWrapper;
 class FlycamWrapper;
 class MeshUVView;
+class MeshUVTextureView;
+class QRubberBand;
+class QStackedWidget;
 class QComboBox;
 class QSplitter;
 struct MeshUVData;
+struct MeshUVGeometry;
+struct MeshUVHighlight;
 struct BufferData;
 struct PopulateBufferData;
 struct CalcBoundingBoxData;
@@ -102,6 +110,9 @@ class BufferViewer : public QFrame, public IBufferViewer, public ICaptureViewer
   Q_OBJECT
 
   Q_PROPERTY(QVariant persistData READ persistData WRITE setPersistData DESIGNABLE false SCRIPTABLE false)
+  Q_PROPERTY(QVariantMap meshEvidence READ meshEvidence DESIGNABLE false SCRIPTABLE false)
+  Q_PROPERTY(QString meshEvidenceRequest READ meshEvidenceRequest WRITE setMeshEvidenceRequest
+                 DESIGNABLE false SCRIPTABLE false)
 
 public:
   explicit BufferViewer(ICaptureContext &ctx, bool meshview, QWidget *parent = 0);
@@ -114,6 +125,13 @@ public:
   void ViewCBuffer(const ShaderStage stage, uint32_t slot, uint32_t idx);
   void NavigateCBufferVariable(const QString &path, qint64 byteOffset, int component);
   void NavigateMeshUV(int stage, const QString &channel, int component, ResourceId texture);
+  void NavigateMeshSelection(const QString &mode, const QVariantList &vertices,
+                             const QVariantList &elements = QVariantList(),
+                             const QString &packed = QString());
+  QVariantMap meshEvidence();
+  void setMeshEvidence(const QVariantMap &request);
+  QString meshEvidenceRequest() const;
+  void setMeshEvidenceRequest(const QString &request);
   void ViewTexture(ResourceId id, const Subresource &sub, const rdcstr &format = "");
 
   // IBufferViewer
@@ -215,19 +233,50 @@ private:
   QSplitter *m_MeshSplit = NULL;
   QWidget *m_UVPanel = NULL;
   MeshUVView *m_UVCanvas = NULL;
-  MeshUVView *m_UVModel = NULL;
+  MeshUVTextureView *m_UVTextureView = NULL;
+  QWidget *m_UVTextureContainer = NULL;
+  QStackedWidget *m_MeshStack = NULL;
+  QToolButton *m_UVBox = NULL;
+  QRubberBand *m_UVMeshBox = NULL;
+  QPoint m_UVMeshPress;
+  bool m_MeshCameraInitialised = false;
+  bool m_MeshCameraRecovering = false;
+  bool m_UVMeshSelecting = false;
+  bool m_UVMeshDragged = false;
+  bool m_UVGeometryRunning = false;
+  bool m_UVSelectionUpdating = false;
+  std::shared_ptr<const MeshUVGeometry> m_MeshClipGeometry;
+  QMatrix4x4 m_MeshClipModel;
+  QVector3D m_MeshClipMin, m_MeshClipMax;
+  bool m_MeshClipValid = false;
+  QSet<int> m_UVSelectedRows;
+  MeshDataStage m_UVSelectionStage = MeshDataStage::VSIn;
+  std::shared_ptr<const MeshUVHighlight> m_UVHighlight;
+  QVector<QVector4D> m_UVTexturedSelection;
+  unsigned int m_UVSelectionPrimitive = 0;
   QComboBox *m_UVChannels = NULL;
+  void SetMeshUVTextureChannels(uint32_t mask);
   QComboBox *m_UVTextures = NULL;
+  QImage m_UVExplanationTexture;
   QComboBox *m_CameraPreset = NULL;
   QToolButton *m_UVToggle = NULL;
   QLabel *m_UVStatus = NULL;
   uint32_t m_UVEvent = 0;
-  uint32_t m_UVTextureSerial = 0;
+  int m_UVDataSequence = -1;
+  uint32_t m_UVGeometrySerial = 0;
+  std::atomic<uint32_t> m_UVTextureSerial{0};
+  uint32_t m_UVTextureEvent = 0;
+  Descriptor m_UVTextureBinding;
+  IReplayOutput *m_UVThumbnailOutput = NULL;
   bool m_UVLinkPending = false;
   QString m_UVLinkChannel;
   QString m_UVManualChannel;
   int m_UVLinkComponent = 0;
   ResourceId m_UVLinkTexture;
+  QVariantMap m_MeshEvidenceRequest;
+  bool m_MeshEvidenceSelectionPending = false;
+  bool m_MeshEvidencePrepared = true;
+  uint32_t m_UVTextureReadySerial = 0;
   rdcarray<Descriptor> m_UVTextureBindings;
 
   // cached data from PostVS data
@@ -440,8 +489,19 @@ private:
   int UVTextureMode() const;
   void UpdateMeshUV();
   void UpdateMeshUVGeometry();
+  void StartMeshUVGeometry();
   void UpdateMeshUVTexture();
   void UpdateMeshUVPreview();
+  void UpdateMeshUVSelection();
+  void SyncMeshUVTableSelection();
+  void UpdateMeshCameraClip();
+  bool RecoverMeshCamera();
+  QMatrix4x4 MeshPreviewTransform() const;
+  void RemapCameraPivots(const MeshDisplay &previous);
+  QVector4D MeshPreviewPosition(const QVector4D &position, uint32_t index) const;
+  void FocusMeshSelection(bool wholeMesh = false);
+  bool PrepareMeshEvidence();
+  void QueueMeshPreview();
   void SetupRawView();
 
   void SetMeshFilter(MeshFilter filter, uint32_t taskGroup = ~0U, uint32_t meshGroup = ~0U);

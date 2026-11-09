@@ -115,6 +115,11 @@ class TaskReviewDecision:
     def unchanged_note(self, language: str) -> str:
         return self.shader.unchanged_note(language)
 
+    def reviewed_explanation(self) -> str:
+        if self.action != 'accept' or self.state.get('fresh') is not True:
+            return ''
+        return str(((self.state.get('review') or {}).get('visualReview') or {}).get('answer') or '')
+
     def continuation_prompt(self) -> str:
         recovery = self.reason == "blocker-recovery-review"
         prompt = ((
@@ -140,11 +145,44 @@ class TaskReviewDecision:
             "verdict complete|needs_work|blocked, findings, next_actions, and a concrete blocker if blocked. "
             "Use complete only when every requirement is satisfied. This is your assessment, not a Host score. "
             "Call the review tool after substantive work and any required Shader review/save; then provide the "
-            "final answer. A text-only answer can be corrected directly and marked complete without inventing tool work.\n\n"
+            "full standalone final answer to the original user request, even if only verification changed. "
+            "Do not answer with a progress report or a reference to an earlier draft. "
+            "A text-only answer can be corrected directly and marked complete without inventing tool work.\n\n"
             "Current completion review: " + json.dumps(dict(self.state), ensure_ascii=False, separators=(",", ":"))
         )
         if self.shader.action == "continue" or self.shader.reason == "blocked":
             prompt += "\n\nShader-specific checks remain in this same continuation:\n" + self.shader.continuation_prompt()
+        if self.state.get('visualPublication'):
+            publication = self.state['visualPublication']
+            marked_effect = publication.get('markedEffect') if self.state.get('markedRenderTarget') else None
+            prompt += ("\n\nReview the actual published visual explanation against the loaded presentation rules. "
+                "Decide whether its important calculations and relationships need a graph, and whether each useful "
+                "computation has its result image and relevant source. Repair feasible gaps in the same task. "
+                "Keep short expressions in selected node details; source-linked code belongs to later code pages. "
+                "Keep the opening overview plain and brief, with useful inline links; put detailed equations/code "
+                "in the graph/code pages rather than display-math blocks in the overview. Omit mesh/UV views that "
+                "do not help the question. Record that assessment in visual_review after the final publication. "
+                "This inventory is an observation, not a requirement that every question use every view: "+
+                json.dumps(publication,ensure_ascii=False,separators=(',',':')))
+            if marked_effect:
+                prompt += ("\n\nFor the marked effect, fix any markedEffect gaps. Check adjacent candidate draws "
+                    "against their actual shaders and captured state. For each relevant layer, show a controlled pair at "
+                    "the verified captured Present with observation_scope='appearance'. Connect the computed results "
+                    "and key input textures to the final composite. Use the same output, display mapping and all-layers baseline. "
+                    "Exclude candidates only using a restored experiment showing no change in the marked region. "
+                    "Review the full draft and visuals with visual_checks: overview, contributions, display, flow, "
+                    "source, links, inactive. Explain relevant disabled calculations with the captured value and a "
+                    "labelled comparison or result where supported. Submit reviewed_answer with overview, steps "
+                    "[{text,events}], combined, and optional inactive. Mention every related layer in the steps. "
+                    "That standalone explanation is shown in chat instead of a status-only reply.")
+            if publication.get('shaderCodeGaps') and (marked_effect or
+                    any(card['type'] == 'diagram' for card in publication.get('cards', []))):
+                prompt += (
+                    "\n\nThe listed shaderCodeGaps are required deliverables for these tested effects. "
+                    "Use the Shader workbench to organize and review each listed workspace, name the CBuffers "
+                    "and resources, and finish with validation and no permanent replay apply. "
+                    "Reuse the saved observations and comparison images. Republish the full explanation with "
+                    "organized source excerpts for the missing Shader workspaces before recording complete.")
         advisory_unity = [row for row in self.state.get("unityRestorations", []) if row.get("diagnosticsOnly")]
         if advisory_unity:
             prompt += ("\n\nUnity observations are advisory. Choose the next useful action from actual artifacts and the user's goal; "

@@ -18,9 +18,9 @@ def recovery_note(receipt: Any, language: str) -> str:
     if not path:
         return ""
     if retained_task_outputs(receipt):
-        if language == "zh_CN":
-            return "本地任务输出已保留，原路径有效：[打开输出目录](<" + path + ">)。"
-        return "Local task outputs are retained at their original paths: [open output directory](<" + path + ">)."
+        # Successful retention is recorded by emit_draft_recovery and the task
+        # inspector; it is not part of the substantive user answer.
+        return ""
     if language == "zh_CN":
         return "本地着色器草稿恢复位置：[查看恢复记录](<" + path + ">)。该副本尚不能代表已导入工作区源码或完成回放替换。"
     return ("Local Shader draft recovery: [open recovery record](<" + path

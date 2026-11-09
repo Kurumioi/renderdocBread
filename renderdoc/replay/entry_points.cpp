@@ -23,6 +23,7 @@
  * THE SOFTWARE.
  ******************************************************************************/
 
+#include <cmath>
 #include "android/android.h"
 #include "api/replay/renderdoc_replay.h"
 #include "api/replay/version.h"
@@ -192,6 +193,69 @@ extern "C" RENDERDOC_API float RENDERDOC_CC RENDERDOC_HalfToFloat(uint16_t half)
 extern "C" RENDERDOC_API uint16_t RENDERDOC_CC RENDERDOC_FloatToHalf(float f)
 {
   return ConvertToHalf(f);
+}
+
+extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_SetMeshPreviewFov(ICamera *camera, float degrees)
+{
+  if(camera && degrees >= 1.0f && degrees <= 150.0f)
+    static_cast<Camera *>(camera)->SetFieldOfView(degrees);
+}
+
+extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_SetMeshPreviewOrbit(ICamera *camera, float yaw,
+                                                                         float pitch)
+{
+  if(camera && std::isfinite(yaw) && std::isfinite(pitch))
+    static_cast<Camera *>(camera)->SetTurntableRotation(yaw, pitch);
+}
+
+extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_RotateMeshPreviewOrbit(ICamera *camera,
+                                                                            float yaw, float pitch,
+                                                                            bool inverted)
+{
+  if(camera)
+    static_cast<Camera *>(camera)->RotateMeshPreviewOrbit(yaw, pitch, inverted);
+}
+
+static Matrix4f MeshPreviewModelTransform(const MeshDisplay &cfg, GraphicsAPI api)
+{
+  Matrix4f model = Matrix4f(cfg.axisMapping);
+  if(cfg.position.unproject)
+  {
+    Matrix4f guess = cfg.position.farPlane != FLT_MAX
+                         ? Matrix4f::Perspective(cfg.fov, cfg.position.nearPlane,
+                                                 cfg.position.farPlane, cfg.aspect)
+                         : Matrix4f::ReversePerspective(cfg.fov, cfg.position.nearPlane, cfg.aspect);
+    if(cfg.ortho)
+      guess = Matrix4f::Orthographic(cfg.position.nearPlane, cfg.position.farPlane);
+    if(cfg.position.flipY)
+      guess[5] *= -1.0f;
+    model = guess.Inverse();
+    if(api == GraphicsAPI::Vulkan)
+      for(size_t i = 4; i < 8; ++i)
+        model[i] *= -1.0f;
+  }
+  return model;
+}
+
+extern "C" RENDERDOC_API void RENDERDOC_CC
+RENDERDOC_GetMeshPreviewModelTransform(const MeshDisplay &cfg, GraphicsAPI api, float *transform)
+{
+  const Matrix4f model = MeshPreviewModelTransform(cfg, api);
+  for(size_t i = 0; i < 16; ++i)
+    transform[i] = model[i];
+}
+
+extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_GetMeshPreviewTransform(const MeshDisplay &cfg,
+                                                                             GraphicsAPI api,
+                                                                             float outputAspect,
+                                                                             float *transform)
+{
+  Camera *cam = static_cast<Camera *>(cfg.cam);
+  const Matrix4f projection = Camera::MeshProjection(cfg.cam, outputAspect);
+  const Matrix4f view = cam ? cam->GetMatrix() : Matrix4f::Identity();
+  const Matrix4f mvp = projection.Mul(view.Mul(MeshPreviewModelTransform(cfg, api)));
+  for(size_t i = 0; i < 16; ++i)
+    transform[i] = mvp[i];
 }
 
 extern "C" RENDERDOC_API ICamera *RENDERDOC_CC RENDERDOC_InitCamera(CameraType type)
