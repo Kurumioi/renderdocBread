@@ -8066,7 +8066,7 @@ Would you like to disable python extensions?</source>
         <translation>未知作者</translation>
     </message>
     <message>
-        <location line="+269"/>
+        <location line="+267"/>
         <source>No extension commands configured</source>
         <translation>未配置扩展命令</translation>
     </message>
@@ -20108,19 +20108,19 @@ Documentation is available: https://renderdoc.org/docs/python_api/index.html</so
     <name>QRDUtils</name>
     <message>
         <location filename="../Code/QRDUtils.cpp" line="+447"/>
-        <location line="+41"/>
+        <location line="+43"/>
         <source>Error running program as root</source>
         <translation>以 root 身份运行程序时出错</translation>
     </message>
     <message>
-        <location line="-40"/>
+        <location line="-42"/>
         <source>Couldn&apos;t find graphical or terminal sudo program!
 Please run &apos;%1&apos; with args &apos;%2&apos; manually.</source>
         <translation>找不到图形界面或终端 sudo 程序！
 请手动运行 &apos;%1&apos;，参数为 &apos;%2&apos;。</translation>
     </message>
     <message>
-        <location line="+41"/>
+        <location line="+43"/>
         <source>Couldn&apos;t find graphical or terminal emulator to launch sudo!
 Please manually run: sudo &quot;%1&quot; %2</source>
         <translation>找不到可用于启动 sudo 的图形界面或终端模拟器！
@@ -20130,7 +20130,7 @@ Please manually run: sudo &quot;%1&quot; %2</source>
 <context>
     <name>RDDialog</name>
     <message>
-        <location line="-790"/>
+        <location line="-792"/>
         <source>Executables (*.exe);;All Files (*)</source>
         <translation>可执行文件 (*.exe);;所有文件 (*)</translation>
     </message>
@@ -26196,7 +26196,7 @@ This option overrides that and will always replay locally if the local context i
     </message>
     <message>
         <location/>
-        <location filename="../Windows/Dialogs/SettingsDialog.cpp" line="+806"/>
+        <location filename="../Windows/Dialogs/SettingsDialog.cpp" line="+803"/>
         <source>Ignored DLLs for callstack symbol resolution</source>
         <translation>调用栈符号解析时忽略的 DLL</translation>
     </message>
@@ -26476,7 +26476,7 @@ Only happens if the capture is not in the recent files list.</source>
         <translation>最大连接超时时间（秒）</translation>
     </message>
     <message>
-        <location filename="../Windows/Dialogs/SettingsDialog.cpp" line="-753"/>
+        <location filename="../Windows/Dialogs/SettingsDialog.cpp" line="-750"/>
         <source>Simplified Chinese</source>
         <translation>简体中文</translation>
     </message>
@@ -26512,7 +26512,7 @@ Only happens if the capture is not in the recent files list.</source>
         <translation>进程</translation>
     </message>
     <message>
-        <location line="+109"/>
+        <location line="+107"/>
         <location line="+1"/>
         <source> (Requires Restart)</source>
         <translation> （需要重启）</translation>
@@ -26533,7 +26533,7 @@ Only happens if the capture is not in the recent files list.</source>
         <translation>选择捕获的默认保存目录</translation>
     </message>
     <message>
-        <location line="+141"/>
+        <location line="+140"/>
         <source>Shader debug info search paths</source>
         <translation>着色器调试信息搜索路径</translation>
     </message>
@@ -26588,7 +26588,7 @@ Only happens if the capture is not in the recent files list.</source>
         <translation>选择 debugpy 模块的位置</translation>
     </message>
     <message>
-        <location line="+24"/>
+        <location line="+25"/>
         <source>Choose location of code executable</source>
         <translation>选择 code 可执行文件的位置</translation>
     </message>
@@ -27433,7 +27433,7 @@ Output file is %5 bytes</source>
     </message>
     <message>
         <location/>
-        <location filename="../Windows/ShaderViewer.cpp" line="+4280"/>
+        <location filename="../Windows/ShaderViewer.cpp" line="+4283"/>
         <source>The replay currently has the original shader active</source>
         <translation>重放当前使用原始着色器</translation>
     </message>
@@ -27543,13 +27543,13 @@ Output file is %5 bytes</source>
         <translation>编译器：</translation>
     </message>
     <message>
-        <location filename="../Windows/ShaderViewer.cpp" line="-640"/>
-        <location line="+2052"/>
+        <location filename="../Windows/ShaderViewer.cpp" line="-643"/>
+        <location line="+2055"/>
         <source>Add to chat</source>
         <translation>添加到聊天</translation>
     </message>
     <message>
-        <location line="-1991"/>
+        <location line="-1994"/>
         <source>Definition: %1:%2</source>
         <translation>定义：%1:%2</translation>
     </message>
@@ -27559,7 +27559,7 @@ Output file is %5 bytes</source>
         <translation>查找结果</translation>
     </message>
     <message>
-        <location line="+46"/>
+        <location line="+49"/>
         <location line="+1548"/>
         <source>Disassembly</source>
         <translation>反汇编</translation>
@@ -32743,7 +32743,7 @@ The buffer is %3 bytes in length.
         </translation>
     </message>
     <message>
-        <location line="+3819"/>
+        <location line="+3821"/>
         <source>%1 seconds</source>
         <translation>%1 秒</translation>
     </message>

@@ -140,7 +140,7 @@ static void ParsePERva(const wchar_t* fileName)
   }
 }
 
-DWORD GetFunctionRVA(const wchar_t* fileName, const char* functionName, bool optional)
+DWORD GetFunctionRVA(const wchar_t *fileName, const char *functionName, bool optional)
 {
   try
   {

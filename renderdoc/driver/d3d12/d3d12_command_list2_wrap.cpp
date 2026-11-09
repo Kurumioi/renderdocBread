@@ -63,7 +63,8 @@ bool WrappedID3D12GraphicsCommandList::Serialise_WriteBufferImmediate(
       {
         const ResourceId resource = WrappedID3D12Resource::GetResIDFromAddr(pParams[i].Dest);
         if(resource != ResourceId())
-          m_Cmd->m_LoadingEventNode.resourceUsage.push_back(make_rdcpair(resource, ResourceUsage::CopyDst));
+          m_Cmd->m_LoadingEventNode.resourceUsage.push_back(
+              make_rdcpair(resource, ResourceUsage::CopyDst));
       }
     }
   }

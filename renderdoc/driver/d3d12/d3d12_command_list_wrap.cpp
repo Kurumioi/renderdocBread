@@ -3980,6 +3980,15 @@ void WrappedID3D12GraphicsCommandList::FinaliseExecuteIndirectEvents(BakedCmdLis
       count = RDCMIN(count, *(uint32_t *)&data[0]);
   }
 
+  // Active replay uses one event extent per recorded list. A second execution cannot resize it
+  // without also invalidating the already-published EIDs for its first execution.
+  if(exec.countResolved && count != exec.reservedCount)
+  {
+    m_pDevice->ReportFatalError(RDResult(
+        ResultCode::APIReplayFailed, "ExecuteIndirect count changed between list executions"));
+    return;
+  }
+
   const uint32_t sigSize = (uint32_t)comSig->sig.arguments.size();
 
   D3D12_RANGE range = {0, D3D12CommandData::m_IndirectSize};
@@ -4056,7 +4065,11 @@ void WrappedID3D12GraphicsCommandList::FinaliseExecuteIndirectEvents(BakedCmdLis
   }
 
   if(countExtraActions != 0)
-    info.ShiftReplayMetadata(uint32_t(idx + sigSize * exec.reservedCount), countExtraActions * sigSize);
+    info.ShiftReplayMetadata(uint32_t(idx + sigSize * exec.reservedCount),
+                             countExtraActions * sigSize);
+
+  eventNodes[nodeIdx].executeData.reservedCount = count;
+  eventNodes[nodeIdx].executeData.countResolved = true;
 
   size_t countNodes = eventNodes.size();
   for(uint32_t i = 0; i < count; i++)
@@ -4075,6 +4088,8 @@ void WrappedID3D12GraphicsCommandList::FinaliseExecuteIndirectEvents(BakedCmdLis
       }
 
       D3D12EventNode &eventNode = eventNodes[idx];
+      if(exec.countResolved)
+        eventNode.resourceUsage.clear();
       ActionDescription &curAction = eventNodes[idx].action;
 
       SDChunk *fakeChunk = new SDChunk(""_lit);

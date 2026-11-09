@@ -227,10 +227,8 @@ SettingsDialog::SettingsDialog(ICaptureContext &ctx, QWidget *parent)
   ui->TextureViewer_PerTexYFlip->setEnabled(ui->TextureViewer_PerTexSettings->isChecked());
 
   ui->AlwaysReplayLocally->setChecked(m_Ctx.Config().AlwaysReplayLocally);
-  ui->CaptureDialog_ShowMonitorScript->setChecked(
-      m_Ctx.Config().CaptureDialog_ShowMonitorScript);
-  ui->CaptureDialog_ShowCustomInjectDLL->setChecked(
-      m_Ctx.Config().CaptureDialog_ShowCustomInjectDLL);
+  ui->CaptureDialog_ShowMonitorScript->setChecked(m_Ctx.Config().CaptureDialog_ShowMonitorScript);
+  ui->CaptureDialog_ShowCustomInjectDLL->setChecked(m_Ctx.Config().CaptureDialog_ShowCustomInjectDLL);
 
   {
     const SDObject *getPaths = RENDERDOC_GetConfigSetting("DXBC.Debug.SearchDirPaths");
@@ -625,8 +623,7 @@ void SettingsDialog::updateCaptureDialogOptionalSettings()
   if(!m_Ctx.HasCaptureDialog())
     return;
 
-  CaptureDialog *captureDialog =
-      qobject_cast<CaptureDialog *>(m_Ctx.GetCaptureDialog()->Widget());
+  CaptureDialog *captureDialog = qobject_cast<CaptureDialog *>(m_Ctx.GetCaptureDialog()->Widget());
   if(captureDialog)
     captureDialog->UpdateOptionalSettingsVisibility();
 }
@@ -955,9 +952,10 @@ void SettingsDialog::on_Python_DebugPyDir_textEdited(const QString &dir)
 
 void SettingsDialog::on_Python_VSCodePathBrowse_clicked()
 {
-  QString dir = RDDialog::getExecutableFileName(this, tr("Choose location of code executable"),
-                                                // i18n-ignore: Python module filename or VS Code executable name.
-                                                m_Ctx.Config().Python_VSCodePath, lit("code"));
+  QString dir = RDDialog::getExecutableFileName(
+      this, tr("Choose location of code executable"),
+      // i18n-ignore: Python module filename or VS Code executable name.
+      m_Ctx.Config().Python_VSCodePath, lit("code"));
 
   if(!dir.isEmpty() && QFileInfo(dir).isExecutable())
   {

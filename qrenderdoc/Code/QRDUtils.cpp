@@ -3918,7 +3918,9 @@ bool RunProcessAsAdmin(const QString &fullExecutablePath, const QStringList &par
     // run terminal sudo with emulator
     QStringList termParams;
     // i18n-ignore: Executable, argument, or shell command used to start a terminal.
-    termParams << term.second << lit("bash") << lit("-c")
+    termParams << term.second << lit("bash")
+               // i18n-ignore: Shell argument for running a command string.
+               << lit("-c")
                // i18n-ignore: Executable, argument, or shell command used to start a terminal.
                << lit("echo Running \"%1 %2\" as root.;echo;sudo %1 %2")
                       .arg(fullExecutablePath)

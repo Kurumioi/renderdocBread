@@ -49,9 +49,9 @@ RDOC_DEBUG_CONFIG(bool, Vulkan_Debug_SingleSubmitFlushing, false,
                   "the source of problems.");
 
 #include "replay/resource_usage.h"
+#include "vk_buffer_patches.inl"
 #include "vk_checkpoint.inl"
 #include "vk_live_forward.inl"
-#include "vk_buffer_patches.inl"
 static rdcarray<int> ShaderStagesForAction(const ActionFlags flags)
 {
   if(flags & ActionFlags::Dispatch)
@@ -7694,8 +7694,7 @@ TEST_CASE("Vulkan replay binding snapshots share immutable recording values acro
       recorded.replayPatchDescriptorSets;
   VulkanEventNode submitted = recorded;
   rdcarray<VulkanEventNode> occurrences = {submitted, submitted};
-  CHECK((recorded.replayPatchDescriptorSets.get() ==
-         occurrences[1].replayPatchDescriptorSets.get()));
+  CHECK((recorded.replayPatchDescriptorSets.get() == occurrences[1].replayPatchDescriptorSets.get()));
   CHECK((recorded.replayCheckpointAttachments.get() ==
          occurrences[0].replayCheckpointAttachments.get()));
   CHECK(budget.storageBytes == charged);

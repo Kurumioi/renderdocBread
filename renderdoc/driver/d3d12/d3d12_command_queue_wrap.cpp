@@ -637,6 +637,11 @@ bool WrappedID3D12CommandQueue::Serialise_ExecuteCommandLists(SerialiserType &se
         m_Cmd.m_ReplaySubmissionQueues[(uint32_t)m_Cmd.m_EventNodes.size() + 1] = GetResID(pQueue);
         // insert the baked command buffer into the root events, resolving indirect actions
         SDObject *localAnnotations = m_Cmd.InsertEventNodes(m_ReplayList, cmd, cmdListInfo);
+        if(m_pDevice->HasFatalError())
+        {
+          delete localAnnotations;
+          return false;
+        }
 
         {
           action.customName =

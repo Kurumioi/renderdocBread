@@ -48,6 +48,7 @@ struct D3D12ExecuteData
   WrappedID3D12CommandSignature *sig = NULL;
   UINT maxCount = 0;
   UINT reservedCount = 0;
+  bool countResolved = false;
 };
 
 struct D3D12EventNode
@@ -57,6 +58,9 @@ struct D3D12EventNode
   D3D12EventNode(const D3D12EventNode &other) { *this = other; }
   D3D12EventNode &operator=(const D3D12EventNode &a)
   {
+    if(this == &a)
+      return *this;
+    SAFE_DELETE(state);
     event = a.event;
     action = a.action;
     if(a.state)

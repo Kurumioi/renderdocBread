@@ -375,13 +375,12 @@ bool WrappedID3D12GraphicsCommandList::Serialise_BeginRenderPass(
       {
         for(UINT i = 0; i < NumRenderTargets; i++)
           if(pRenderTargets[i].BeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR)
-            event.resourceUsage.push_back(make_rdcpair(
-                RTVs[i].GetResResourceId(), ResourceUsage::Clear));
+            event.resourceUsage.push_back(
+                make_rdcpair(RTVs[i].GetResResourceId(), ResourceUsage::Clear));
         if(pDepthStencil &&
            (pDepthStencil->DepthBeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR ||
             pDepthStencil->StencilBeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR))
-          event.resourceUsage.push_back(make_rdcpair(
-              DSV.GetResResourceId(), ResourceUsage::Clear));
+          event.resourceUsage.push_back(make_rdcpair(DSV.GetResResourceId(), ResourceUsage::Clear));
       }
 
       stateUpdate = true;
@@ -699,12 +698,10 @@ bool WrappedID3D12GraphicsCommandList::Serialise_EndRenderPass(SerialiserType &s
       const auto addResolveUsage = [&](const D3D12_RENDER_PASS_ENDING_ACCESS &access) {
         if(access.Type == D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_RESOLVE)
         {
-          event.resourceUsage.push_back(make_rdcpair(
-              GetResID(access.Resolve.pSrcResource),
-              ResourceUsage::ResolveSrc));
-          event.resourceUsage.push_back(make_rdcpair(
-              GetResID(access.Resolve.pDstResource),
-              ResourceUsage::ResolveDst));
+          event.resourceUsage.push_back(
+              make_rdcpair(GetResID(access.Resolve.pSrcResource), ResourceUsage::ResolveSrc));
+          event.resourceUsage.push_back(
+              make_rdcpair(GetResID(access.Resolve.pDstResource), ResourceUsage::ResolveDst));
         }
       };
       for(const D3D12_RENDER_PASS_RENDER_TARGET_DESC &target : state.rpRTs)

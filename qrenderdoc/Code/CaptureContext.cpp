@@ -318,7 +318,7 @@ CaptureContext::CaptureContext(PersistentConfig &cfg) : m_Config(cfg)
   if(!replayLabError.isEmpty())
     qWarning() << tr("Built-in Bread integration is unavailable:") << replayLabError;
 
-  m_ExtensionWatcher = new QFileSystemWatcher({}, GetMainWindow()->Widget());
+  m_ExtensionWatcher = new QFileSystemWatcher(GetMainWindow()->Widget());
 
   QObject::connect(m_ExtensionWatcher, &QFileSystemWatcher::directoryChanged,
                    [this](const QString &path) { ExtensionTouched(path); });
@@ -870,16 +870,15 @@ void CaptureContext::MenuDisplaying(ContextMenu contextMenu, QMenu *menu,
   {
     if(item->context == contextMenu || item->context == contextMenuAlt)
     {
-      AddSortedMenuItem(menu, true, item->showExtensionIcon, item->submenus,
-                        [item, data]() {
-                          rdcarray<rdcpair<rdcstr, PyObject *>> args;
+      AddSortedMenuItem(menu, true, item->showExtensionIcon, item->submenus, [item, data]() {
+        rdcarray<rdcpair<rdcstr, PyObject *>> args;
 
-                          PythonContext::ConvertPyArgs(data, args);
+        PythonContext::ConvertPyArgs(data, args);
 
-                          item->callback(PythonContext::GetExtensionPyrenderdoc(), args);
+        item->callback(PythonContext::GetExtensionPyrenderdoc(), args);
 
-                          PythonContext::FreePyArgs(args);
-                        });
+        PythonContext::FreePyArgs(args);
+      });
     }
   }
 }
@@ -891,8 +890,7 @@ void CaptureContext::MenuDisplaying(PanelMenu panelMenu, QMenu *menu, QWidget *e
   {
     if(item->panel == panelMenu)
     {
-      AddSortedMenuItem(menu, false, item->showExtensionIcon, item->submenus,
-                        [item, data]() {
+      AddSortedMenuItem(menu, false, item->showExtensionIcon, item->submenus, [item, data]() {
         rdcarray<rdcpair<rdcstr, PyObject *>> args;
 
         PythonContext::ConvertPyArgs(data, args);

@@ -185,8 +185,7 @@ static SDObject *XML2Config(pugi::xml_node &obj)
   rdcstr name = obj.name();
   if(name == "node" && obj.attribute("name"))
     name = obj.attribute("name").as_string();
-  SDObject *ret =
-      new SDObject(name, obj.attribute("type") ? "setting"_lit : "category"_lit);
+  SDObject *ret = new SDObject(name, obj.attribute("type") ? "setting"_lit : "category"_lit);
 
   if(ret->type.name == "category"_lit)
   {

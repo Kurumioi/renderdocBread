@@ -38,12 +38,13 @@
 RDOC_CONFIG(bool, NV_BlockNVAPI, false,
             "Completely block nvapi from activating, pretend no NV GPU is present");
 
-RDOC_CONFIG(bool, NV_AllowVendorExtension, true,
-            "Enable the NVAPI vendor extension inside the target process. With this disabled, "
-            "every NVAPI call that RenderDoc does not explicitly know about returns NULL, which "
-            "makes engines that read the NV driver version or enumerate GPUs through NVAPI "
-            "conclude the hardware is unsupported and refuse to start. This is the same effect as the "
-            "host-side AllowUnsupportedVendorExtensions capture option, applied by default.");
+RDOC_CONFIG(
+    bool, NV_AllowVendorExtension, true,
+    "Enable the NVAPI vendor extension inside the target process. With this disabled, "
+    "every NVAPI call that RenderDoc does not explicitly know about returns NULL, which "
+    "makes engines that read the NV driver version or enumerate GPUs through NVAPI "
+    "conclude the hardware is unsupported and refuse to start. This is the same effect as the "
+    "host-side AllowUnsupportedVendorExtensions capture option, applied by default.");
 
 namespace
 {

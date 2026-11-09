@@ -351,9 +351,12 @@ ShaderViewer::ShaderViewer(ICaptureContext &ctx, QWidget *parent)
   m_FindResults->setMarginWidthN(1, 0);
   m_FindResults->setMarginWidthN(2, 0);
 
-  QObject::connect(m_FindReplace, &FindReplace::performFindRequested, this, &ShaderViewer::performFind);
-  QObject::connect(m_FindReplace, &FindReplace::performFindAllRequested, this, &ShaderViewer::performFindAll);
-  QObject::connect(m_FindReplace, &FindReplace::performReplaceRequested, this, &ShaderViewer::performReplace);
+  QObject::connect(m_FindReplace, &FindReplace::performFindRequested, this,
+                   &ShaderViewer::performFind);
+  QObject::connect(m_FindReplace, &FindReplace::performFindAllRequested, this,
+                   &ShaderViewer::performFindAll);
+  QObject::connect(m_FindReplace, &FindReplace::performReplaceRequested, this,
+                   &ShaderViewer::performReplace);
   QObject::connect(m_FindReplace, &FindReplace::performReplaceAllRequested, this,
                    &ShaderViewer::performReplaceAll);
   QObject::connect(m_FindReplace, &FindReplace::searchChanged, [this]() {

@@ -24,8 +24,8 @@
 
 #include "vk_manager.h"
 #include <algorithm>
-#include "vk_core.h"
 #include "core/settings.h"
+#include "vk_core.h"
 
 RDOC_CONFIG(bool, Vulkan_Hack_RestoreASInCreationOrder, false,
             "Restore same-type acceleration structures in handle creation order during replay. "
@@ -1069,12 +1069,12 @@ rdcarray<ResourceId> VulkanResourceManager::InitialContentResources()
     {
       // A TLAS dereferences its BLAS device addresses. Treat generic or missing
       // build metadata as TLAS so the comparator is consistent for every AS.
-      const bool aBLAS = aData.accelerationStructureInfo &&
-                         aData.accelerationStructureInfo->type ==
-                             VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-      const bool bBLAS = bData.accelerationStructureInfo &&
-                         bData.accelerationStructureInfo->type ==
-                             VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+      const bool aBLAS =
+          aData.accelerationStructureInfo &&
+          aData.accelerationStructureInfo->type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+      const bool bBLAS =
+          bData.accelerationStructureInfo &&
+          bData.accelerationStructureInfo->type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
       if(aBLAS != bBLAS)
         return aBLAS;
 

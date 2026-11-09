@@ -205,9 +205,8 @@ static bool VulkanReplayPatchUniformInputs(const DescSetLayout &layout, const Bi
   return true;
 }
 
-static std::shared_ptr<const VulkanEventNode::ReplayDescriptorSnapshot>
-VulkanReplayPatchSnapshot(const VulkanEventNode::ReplayDescriptorSnapshot &sets,
-                          VulkanReplayBindingEvidenceBudget &budget)
+static std::shared_ptr<const VulkanEventNode::ReplayDescriptorSnapshot> VulkanReplayPatchSnapshot(
+    const VulkanEventNode::ReplayDescriptorSnapshot &sets, VulkanReplayBindingEvidenceBudget &budget)
 {
   if(!budget.complete || sets.empty())
     return {};
@@ -252,7 +251,7 @@ void WrappedVulkan::InvalidateReplayBindingEvidence(const char *reason)
 }
 
 void WrappedVulkan::RecordReplayPatchUniformInputs(VulkanEventNode &action,
-                                                  const VulkanStatePipeline &pipeline)
+                                                   const VulkanStatePipeline &pipeline)
 {
   if(!m_ReplayBindingEvidenceBudget.complete)
     return;
@@ -271,8 +270,7 @@ static void VulkanReplayPatchRecordRead(std::map<ResourceId, uint32_t> &reads, R
   first = first ? RDCMIN(first, submittedEvent) : submittedEvent;
 }
 
-void WrappedVulkan::RecordReplayPatchSubmittedReads(const VulkanEventNode &action,
-                                                    uint32_t event)
+void WrappedVulkan::RecordReplayPatchSubmittedReads(const VulkanEventNode &action, uint32_t event)
 {
   if(!m_ReplayBindingEvidenceBudget.complete)
     return;

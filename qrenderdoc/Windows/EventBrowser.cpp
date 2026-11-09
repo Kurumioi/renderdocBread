@@ -1660,7 +1660,7 @@ public:
     rdcarray<rdcstr> ret;
 
     if(cb)
-      ret = cb(&m_Ctx, filter, params);
+      ret = cb(m_Ctx, filter, params);
 
     QStringList qret;
     for(const rdcstr &s : ret)

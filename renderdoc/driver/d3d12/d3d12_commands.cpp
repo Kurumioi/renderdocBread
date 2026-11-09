@@ -1647,8 +1647,8 @@ RDResult WrappedID3D12CommandQueue::ReplayLog(CaptureState readType, uint32_t st
     else if(allowCheckpoints && IsActiveReplaying(m_State) && !partial && startEventID == 1 &&
             context == D3D12Chunk::Queue_ExecuteCommandLists &&
             m_Cmd.m_RootEventID <= endEventID)
-      m_pDevice->SaveReplayCheckpoint(m_Cmd.m_RootEventID - 1, chunkEndOffset,
-                                      m_Cmd.m_RootEventID, 0);
+      m_pDevice->SaveReplayCheckpoint(m_Cmd.m_RootEventID - 1, chunkEndOffset, m_Cmd.m_RootEventID,
+                                      0);
   }
 
   // swap the structure back now that we've accumulated the frame as well.
@@ -4291,8 +4291,7 @@ void D3D12CommandData::ObserveReplayWriteBindings(BakedCmdListInfo &info,
   StoreReplayTextureRead(info, std::move(textureRead));
 }
 
-static void GatherReplayEventUsage(const D3D12EventNode &node, uint32_t event,
-                                   BakedCmdListInfo &info)
+static void GatherReplayEventUsage(const D3D12EventNode &node, uint32_t event, BakedCmdListInfo &info)
 {
   for(const auto &use : node.resourceUsage)
   {
@@ -4674,8 +4673,7 @@ void D3D12CommandData::ObserveCheckpointChunk(D3D12Chunk chunk, uint64_t chunkEn
     m_BakedCmdListInfo[m_LastCmdListID].checkpointEnd = chunkEndOffset;
   else if(chunk == D3D12Chunk::Queue_ExecuteCommandLists)
   {
-    m_CheckpointBoundaries.push_back(
-        {m_RootEventID - 1, m_RootEventID, 0, chunkEndOffset});
+    m_CheckpointBoundaries.push_back({m_RootEventID - 1, m_RootEventID, 0, chunkEndOffset});
     if(m_pDevice)
       m_pDevice->RecordCheckpointDescriptorBytes(m_CheckpointBoundaries.back().descriptorBytes,
                                                  m_CheckpointBoundaries.back().fullDescriptorBytes);
@@ -8200,6 +8198,8 @@ SDObject *D3D12CommandData::InsertEventNodes(WrappedID3D12GraphicsCommandList *r
       // The reserved execute indirect event nodes might get duplicated or deleted
       // This modifies eventNodes including the current node
       replayList->FinaliseExecuteIndirectEvents(cmdListInfo, i);
+      if(m_pDevice->HasFatalError())
+        return localAnnotations;
     }
 
     D3D12EventNode n = eventNodes[i];

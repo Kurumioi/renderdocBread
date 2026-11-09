@@ -560,7 +560,7 @@ void WrappedVulkan::RecordReplayCheckpointAttachments(VulkanEventNode &action,
 }
 
 void WrappedVulkan::RecordReplayCheckpointSubmittedWrites(const VulkanEventNode &action,
-                                                    uint32_t event)
+                                                          uint32_t event)
 {
   if(!m_CheckpointPhysicalWritesComplete)
     return;

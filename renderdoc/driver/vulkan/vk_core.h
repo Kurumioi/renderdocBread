@@ -1152,8 +1152,7 @@ private:
   uint32_t m_ReplayPatchAnchorEvent = 0;
   bool m_ReplayPatchAnchorAttempted = false;
   uint32_t m_ReplayPatchFirstConsumer = 0;
-  void RecordReplayPatchUniformInputs(VulkanEventNode &action,
-                                      const VulkanStatePipeline &pipeline);
+  void RecordReplayPatchUniformInputs(VulkanEventNode &action, const VulkanStatePipeline &pipeline);
   void RecordReplayDescriptorOffsets(rdcarray<VulkanStatePipeline::DescriptorAndOffsets> &sets,
                                      ResourceId layout, uint32_t firstSet, uint32_t setCount,
                                      uint32_t offsetCount, const uint32_t *offsets);
@@ -1380,10 +1379,7 @@ private:
   void StartFrameCapture(DeviceOwnedWindow devWnd);
   bool EndFrameCapture(DeviceOwnedWindow devWnd);
   bool DiscardFrameCapture(DeviceOwnedWindow devWnd);
-  bool HasFrameCaptureWork() override
-  {
-    return Atomic::CmpExch32(&m_BridgeSubmitSeen, 0, 0) != 0;
-  }
+  bool HasFrameCaptureWork() override { return Atomic::CmpExch32(&m_BridgeSubmitSeen, 0, 0) != 0; }
 
   ResourceId GetIDForUserObject(void *object);
   uint32_t SetObjectAnnotation(void *object, const char *key, RENDERDOC_AnnotationType valueType,

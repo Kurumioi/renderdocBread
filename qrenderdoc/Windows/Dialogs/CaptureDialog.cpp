@@ -31,9 +31,9 @@
 #include "Code/QRDUtils.h"
 #include "Code/qprocessinfo.h"
 #include "Windows/Dialogs/EnvironmentEditor.h"
+#include "Windows/Dialogs/LiveCapture.h"
 #include "Windows/Dialogs/VirtualFileDialog.h"
 #include "Windows/MainWindow.h"
-#include "Windows/Dialogs/LiveCapture.h"
 #include "flowlayout/FlowLayout.h"
 #include "toolwindowmanager/ToolWindowManager.h"
 #include "ui_CaptureDialog.h"
@@ -1313,16 +1313,16 @@ ICaptureConnection *CaptureDialog::Launch()
                          if(ui->queueFrameCap->isChecked())
                            live->QueueCapture((int)ui->queuedFrame->value(),
                                               (int)ui->numFrames->value());
-                          if(m_Ctx.Config().CaptureDialog_ShowMonitorScript)
-                          {
-                            QString scriptPath = ui->monitorScriptPath->text().trimmed();
-                            if(!scriptPath.isEmpty())
-                            {
-                              LiveCapture *capture = qobject_cast<LiveCapture *>(live->Widget());
-                              if(capture)
-                                capture->SetMonitorScriptPath(scriptPath);
-                            }
-                          }
+                         if(m_Ctx.Config().CaptureDialog_ShowMonitorScript)
+                         {
+                           QString scriptPath = ui->monitorScriptPath->text().trimmed();
+                           if(!scriptPath.isEmpty())
+                           {
+                             LiveCapture *capture = qobject_cast<LiveCapture *>(live->Widget());
+                             if(capture)
+                               capture->SetMonitorScriptPath(scriptPath);
+                           }
+                         }
                          ret = live;
                        });
     }

@@ -2491,8 +2491,9 @@ bool RenderDoc::IsVulkanBridgeCaptureReady(IFrameCapturer *primary)
     return false;
   }
 
-  RDCWARN("Ending bridged Vulkan capture without a secondary queue submit after %u presents (%.1f ms)",
-          m_VulkanBridgeEndDeferrals, elapsedMS);
+  RDCWARN(
+      "Ending bridged Vulkan capture without a secondary queue submit after %u presents (%.1f ms)",
+      m_VulkanBridgeEndDeferrals, elapsedMS);
   return true;
 }
 
