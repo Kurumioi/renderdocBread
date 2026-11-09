@@ -656,6 +656,32 @@ class DeepEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.text, "The main Agent returned no text answer.")
         self.assertTrue(any(event["text"] == "I will inspect it." for event in self._log("t-no-final-answer")))
 
+    async def test_compaction_text_does_not_leak_or_replace_main_and_child_answers(self) -> None:
+        async def script(_record: dict[str, Any]) -> list[dict[str, Any]]:
+            def summary(kind, run, *, parents=()):
+                payload = {"chunk" if kind.endswith("stream") else "output": Msg("INTERNAL CONTEXT: source paths and task notes")}
+                return {**ev(kind, "m", run, parents=parents, data=payload),
+                        "metadata": {"lc_source": "summarization"}}
+            return [
+                ev("on_tool_start", "task", "task-1", data={"input": {"description": "Inspect", "subagent_type": "general-purpose"}}),
+                summary("on_chat_model_stream", "child-summary", parents=["task-1"]),
+                summary("on_chat_model_end", "child-summary", parents=["task-1"]),
+                ev("on_chat_model_stream", "m", "child-model", parents=["task-1"], data={"chunk": Msg("Useful child progress")}),
+                ev("on_tool_end", "task", "task-1", data={"output": Msg("Useful finding")}),
+                ev("on_chat_model_stream", "m", "answer", data={"chunk": Msg("Public explanation")}),
+                ev("on_chat_model_end", "m", "answer", data={"output": Msg("Public explanation")}),
+                summary("on_chat_model_stream", "main-summary"),
+                summary("on_chat_model_end", "main-summary"),
+            ]
+
+        engine, _fake = self._engine(script)
+        result = await engine.run(self._request("Explain", task_id="t-summary-private"))
+        self.assertEqual(result.text, "Public explanation")
+        log = json.dumps(self._log("t-summary-private"))
+        self.assertNotIn("INTERNAL CONTEXT", log)
+        self.assertIn("Useful child progress", log)
+        self.assertIn("Public explanation", log)
+
     async def test_provider_output_limit_does_not_report_completed(self) -> None:
         for metadata in (
             {"finish_reason": "length"},

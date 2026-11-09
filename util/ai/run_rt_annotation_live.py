@@ -35,6 +35,8 @@ def main():
     parser.add_argument('--model', required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--timeout', type=int, default=900)
+    parser.add_argument('--request-timeout', type=int, default=0,
+                        help='Override provider timeout in the isolated test profile only')
     parser.add_argument('--spec', type=Path, help='Scenario event/resource/marks/prompts JSON')
     parser.add_argument('--bundled-agent', action='store_true', help='Use the application\'s frozen AgentHost')
     parser.add_argument('--ui-script',type=Path,help='Alternative owned UI acceptance fixture')
@@ -97,7 +99,7 @@ def main():
                        if key.lower() in ('authorization','content-type','accept','openai-organization','openai-project')}
             headers['Accept-Encoding'] = 'identity'
             try:
-                with httpx.Client(timeout=300) as client:
+                with httpx.Client(timeout=httpx.Timeout(120, read=args.request_timeout or 600)) as client:
                     with client.stream(self.command, upstream+self.path, content=body, headers=headers) as response:
                         self.send_response(response.status_code)
                         self.send_header('Content-Type', response.headers.get('content-type','application/json'))
@@ -118,6 +120,10 @@ def main():
     clone.update(base_url='http://127.0.0.1:'+str(relay.server_port), model=args.model,
                  default_model=args.model, models=[args.model])
     clone['options'] = dict(clone.get('options') or {})
+    if args.request_timeout:
+        if not 30 <= args.request_timeout <= 1800:
+            raise ValueError('Request timeout must be 30..1800 seconds')
+        clone['options']['timeout_seconds'] = args.request_timeout
     profiles = root/'roaming/ReplayLab/ai/profiles.json'
     profiles.parent.mkdir(parents=True)
     profiles.write_text(json.dumps({'schema':PROFILE_SCHEMA,'activeProfile':profile.id,'profiles':[clone]}),encoding='utf-8')
@@ -161,6 +167,18 @@ def main():
         plan=manifest['routePlan']
         env['RENDERDOC_ULTRA_SHADER_TOOLS_CONFIG']=str(Path(plan['toolRegistryPath']).resolve(strict=True))
         env['RENDERDOC_ULTRA_SHADER_TOOLCHAINS_CONFIG']=str(Path(plan['routeCatalogPath']).resolve(strict=True))
+        # The GUI's persistent owner has its own installation-scoped registry.
+        # Validate/materialize that scope before spending a real model turn;
+        # forwarding another workspace's environment alone does not stage it.
+        sys.path.insert(0, str(ROOT/'replaylab/mcp_host'))
+        from src.replaylab_tools import configure_environment, TOOLS_ENV, ROUTES_ENV
+        owner_environment=dict(env)
+        owner_environment.pop(TOOLS_ENV,None)
+        owner_environment.pop(ROUTES_ENV,None)
+        discovery=configure_environment(args.app.resolve().parent/'replaylab',owner_environment)
+        if discovery.get('error') or not all(Path(owner_environment[key]).is_file()
+                                             for key in (TOOLS_ENV,ROUTES_ENV)):
+            raise RuntimeError('Owned test application lacks its Shader tool registry: '+str(discovery.get('error')))
     if args.bundled_agent:
         env['REPLAYLAB_AI_CLI']=str(args.app.resolve().parent/'replaylab/replaylab-ai.exe')
     print(json.dumps({'run':str(root),'model':args.model,'app':str(args.app.resolve())}),flush=True)

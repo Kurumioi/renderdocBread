@@ -24,6 +24,7 @@ def test_mark_geometry_erasure_undo_and_immutable_source(tmp_path):
 #include <QApplication>
 #include <QFile>
 #include <QJsonDocument>
+#include "3rdparty/flowlayout/FlowLayout.cpp"
 #include "Windows/AI/AITextureAnnotation.cpp"
 #include "Windows/AI/AIConversationView.h"
 
@@ -139,6 +140,59 @@ int main(int argc, char **argv) {
   result["oneVisibleImageForCompletePair"]=AIHideAnnotationOriginal(clean,{clean,marked}) &&
       !AIHideAnnotationOriginal(marked,{clean,marked});
   result["legacyOrphanIsVisible"]=!AIHideAnnotationOriginal(clean,{clean});
+  // An inherited RT view is independent of canvas size and snapshot resolution. Exercise
+  // logical coordinates at multiple display DPIs, including smaller-than-fit and panned views.
+  AITextureAnnotation inherited(original,"EID 77",{},
+      [](const QImage &,const QImage &,const QJsonObject &){return true;},[](){});
+  inherited.resize(1100,720);inherited.layout()->activate();
+  auto *inheritedCanvas=static_cast<AIAnnotationCanvas *>(inherited.findChild<QWidget *>("aiAnnotationCanvas"));
+  auto globalBounds=[&]() {
+    inheritedCanvas->grab();
+    const auto v=inheritedCanvas->property("annotationImageRect").toList();
+    return QRectF(v[0].toDouble(),v[1].toDouble(),v[2].toDouble(),v[3].toDouble())
+        .translated(inheritedCanvas->mapToGlobal(QPoint()));
+  };
+  bool preserved=true, resized=true, anchored=true, mapped=true;
+  for(double dpr:{1.0,1.5,2.0}) for(double scale:{.2,1.0,3.5}) {
+    // The full RT is 2560x1280; the clean AI image is only 800x400.
+    const QRectF expected(QPointF(inherited.mapToGlobal(QPoint()))+QPointF(-137/dpr,-83/dpr),
+                          QSizeF(2560,1280)*(scale/dpr));
+    inherited.SetImageViewRect(expected);
+    preserved &= globalBounds()==expected;
+    inherited.resize(720,510);inherited.layout()->activate();
+    resized &= globalBounds()==expected;
+    inherited.resize(1100,720);inherited.layout()->activate();
+    resized &= globalBounds()==expected;
+    const QPointF center=inheritedCanvas->rect().center();
+    const QPointF localOrigin=expected.topLeft()-inheritedCanvas->mapToGlobal(QPoint());
+    const QPointF uv((center.x()-localOrigin.x())/expected.width(),
+                     (center.y()-localOrigin.y())/expected.height());
+    QWheelEvent zoomIn(center,center,QPoint(),QPoint(0,120),120,
+                      Qt::Vertical,Qt::NoButton,Qt::NoModifier);
+    QApplication::sendEvent(inheritedCanvas,&zoomIn);
+    const QRectF zoomed=globalBounds();
+    const QPointF screenCenter=center+inheritedCanvas->mapToGlobal(QPoint());
+    anchored &= QLineF(zoomed.topLeft()+QPointF(uv.x()*zoomed.width(),uv.y()*zoomed.height()),screenCenter).length()<1e-8;
+    anchored &= std::abs(zoomed.width()-expected.width()*1.25)<1e-8;
+  }
+  const QRectF drawingRect(QPointF(inheritedCanvas->mapToGlobal(QPoint()))+QPointF(-200,-100),QSizeF(1600,800));
+  inherited.SetImageViewRect(drawingRect);
+  inheritedCanvas->tool=MarkTool::Arrow;
+  for(auto kind:{QEvent::MouseButtonPress,QEvent::MouseMove,QEvent::MouseButtonRelease}) {
+    const QPointF p=kind==QEvent::MouseButtonPress?QPointF(200,100):QPointF(600,300);
+    QMouseEvent e(kind,p,Qt::LeftButton,Qt::LeftButton,Qt::NoModifier);
+    QApplication::sendEvent(inheritedCanvas,&e);
+  }
+  const auto inheritedPoints=inheritedCanvas->strokes().last().toObject()["points"].toArray();
+  mapped=inheritedPoints[0].toArray()==QJsonArray({.25,.25}) &&
+         inheritedPoints[1].toArray()==QJsonArray({.5,.5});
+  result["inheritExactScaleAndPanAcrossDpi"]=preserved;
+  result["toolbarAndCanvasResizeDoNotRefit"]=resized;
+  result["wheelPreservesCursorAnchorBelowAndAboveFit"]=anchored;
+  result["inheritedViewMapsMarksToFullSnapshot"]=mapped;
+  inheritedCanvas->fit();
+  const QSizeF fitSize=QSizeF(original.size()).scaled(QSizeF(inheritedCanvas->size()),Qt::KeepAspectRatio);
+  result["explicitFitStillWorks"]=globalBounds().size()==fitSize;
   QFile out(QString::fromLocal8Bit(argv[1]));out.open(QIODevice::WriteOnly);
   out.write(QJsonDocument(result).toJson());
 }

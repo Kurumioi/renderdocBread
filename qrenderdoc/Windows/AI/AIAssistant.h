@@ -470,6 +470,7 @@ private:
   AIAgentMonitorWindow *m_AgentMonitor = NULL;
 
   QTimer *m_EventTimer = NULL;
+  QTimer *m_ConnectionStatusTimer = NULL;
   QTimer *m_ConversationSaveTimer = NULL;
   QTimer *m_ConversationRenderTimer = NULL;
   QTimer *m_ChatContextFreezeTimer = NULL;

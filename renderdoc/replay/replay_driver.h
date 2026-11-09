@@ -33,9 +33,10 @@ class Matrix4f;
 
 struct MeshComponentHighlight
 {
-  Matrix4f DepthBiasedTransform(const Matrix4f &mvp) const;
+  Matrix4f DepthBiasedTransform(const Matrix4f &mvp, const ICamera *camera) const;
 
   rdcarray<FloatVector> vertices;
+  uint32_t selectedVertices = 0;
   Topology topology = Topology::TriangleList;
 };
 

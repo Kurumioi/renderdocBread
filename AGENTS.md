@@ -11,6 +11,9 @@
 
 ## Release packaging entry point (mandatory)
 
+Build a release package only when the user explicitly authorizes packaging for
+this task. A local Development build or deployment is a separate operation.
+
 For any packaging, portable ZIP, release, or distribution request (including “打包”/“发布”),
 read [CLAUDE.md — Release Build Guide](./CLAUDE.md#release-build-guide),
 [`replaylab/packaging/RELEASE_REQUIREMENTS.md`](./replaylab/packaging/RELEASE_REQUIREMENTS.md),
@@ -30,14 +33,22 @@ and the configured release metadata in the package file's autoUpdate section.
 
 ## Branch and release completion (mandatory)
 
-For implementation tasks involving a working branch, commits, merging or release,
-follow [CLAUDE.md — Branch and release completion](./CLAUDE.md#branch-and-release-completion).
-The standing completion workflow is to validate and push the task branch, merge it
-into the actual GitHub default branch, verify inclusion, and delete that task's
-remote and local branch. This is authorized without another confirmation unless
-the user explicitly requests an unmerged draft or a retained branch. Release tasks
-also follow [the release completion requirements](./replaylab/packaging/RELEASE_REQUIREMENTS.md#8-github-主分支合并与分支清理).
-Preserve unrelated dirty checkouts, other tasks' branches and published tags.
+Keep work under development on its local task branch with changes uncommitted.
+Implement, test and report the reviewable result while retaining the branch.
+Passing checks, completing development, and updating the local Development
+application do not grant approval to submit or release the work.
+
+Wait for the user to confirm the work and explicitly authorize each intended
+operation before committing, pushing, opening a PR, merging, deleting a branch,
+building a release package, tagging, uploading or publishing. Approval for one
+operation covers only that operation unless the user explicitly authorizes a
+bundle of steps. This rule also applies to documentation changes. An explicitly
+requested rollback authorizes the targeted correction only.
+
+Use [CLAUDE.md — Branch and release completion](./CLAUDE.md#branch-and-release-completion)
+and [the release completion requirements](./replaylab/packaging/RELEASE_REQUIREMENTS.md#8-github-主分支合并与分支清理)
+for authorized steps. Preserve unrelated dirty checkouts, other tasks' branches
+and published tags.
 
 ## Product name and compatibility
 

@@ -2403,14 +2403,9 @@ if HAS_QT:
 
                 try:
                     replay = self.ctx.Replay()
-                    try:
-                        # ReplayManager coalesces pending invokes by tag. A shared
-                        # tag silently drops all but the last Shader's lookup and
-                        # strands the removed keys in _usage_pending forever.
-                        replay.AsyncInvoke('replaylab-shader-usage-%s-%s-%s' %
-                                           (key[1], generation, resource), _query)
-                    except TypeError:
-                        replay.AsyncInvoke(_query)
+                    # Use a distinct tag for each lookup so ReplayManager does not coalesce them.
+                    replay.AsyncInvoke(_query, 'replaylab-shader-usage-%s-%s-%s' %
+                                       (key[1], generation, resource))
                 except Exception:
                     self._usage_pending.discard(key)
 
@@ -4205,6 +4200,36 @@ if HAS_QT:
             # An existing but unreadable workspace must not trigger another AI organization.
             return {"accepted": False, "status": "unavailable" if matches else "missing"}
 
+        def _select_source_link(self, workspace_id, request, line, column):
+            if not request.get('symbol') and not request.get('selectLine'):
+                return
+            expected=str(request.get('sourceSha256') or '')
+            if not re.fullmatch(r'[0-9a-f]{64}',expected):
+                return
+            deadline=time.monotonic()+15
+            def select():
+                if (not self._alive or self._shutting_down or
+                        self._capture_binding != self._current_capture_binding()):return
+                identity=self._canonical_workspace_id(workspace_id)
+                document=self._documents.get(identity)
+                if document is None:
+                    if time.monotonic()<deadline:QtCore.QTimer.singleShot(100,select)
+                    return
+                if self._current_workspace_id()!=identity:return
+                source=str((document.get('workspace') or {}).get('sourcePath') or '')
+                if not source:return
+                try:
+                    with open(source,'rb')as stream:raw=stream.read(16*1024*1024+1)
+                    if hashlib.sha256(raw).hexdigest()!=expected:return
+                    text=str(document['editor'].GetText())
+                    saved=raw.decode('utf-8-sig').replace('\r\n','\n').replace('\r','\n')
+                    if text.replace('\r\n','\n').replace('\r','\n')!=saved:return
+                    from .source_link_selection import selection_range
+                    span=selection_range(text,line,column,str(request.get('symbol') or ''),bool(request.get('selectLine')))
+                    if span:document['editor'].SelectRange(*span)
+                except (OSError,UnicodeError,RuntimeError):return
+            QtCore.QTimer.singleShot(0,select)
+
         def navigate_source_link(self, request):
             """Open a chat citation by exact workspace/file identity, never by basename or EID."""
             if (not self._alive or self._shutting_down or
@@ -4265,6 +4290,7 @@ if HAS_QT:
                 workspace_id, quiet=True, select=True, navigation=(line, column))
             if accepted or workspace_id in self._pending_open:
                 self.show()
+                self._select_source_link(workspace_id,request,line,column)
                 return True
             return False
 

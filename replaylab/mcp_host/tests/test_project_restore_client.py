@@ -2030,6 +2030,24 @@ class ReplayLabRestoreHostClientTests(unittest.TestCase):
                 [call[2] for call in transport.calls],
             )
             self.assertFalse(transport.calls[-1][6].is_set())
+
+    def test_inspection_cancellation_waits_for_host_rollback(self):
+        for error, safe in (("Bread project restore was cancelled", True),
+                            ("RestoreRollbackFailed: a Shader could not be restored", False)):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as temporary:
+                transport = _Transport([
+                    (202, _job("queued")), (200, _job("running")),
+                    (202, _job("running")), (200, _job("failed", error=error)),
+                ])
+                client = client_module.ReplayLabRestoreHostClient(
+                    str(self._runtime(temporary)), transport=transport,
+                    health_transport=_HealthTransport(), confirm_replay_rollback=True,
+                    sleep=lambda _: client.cancel_for_inspection(),
+                )
+                with self.assertRaisesRegex(client_module.ReplayLabRestoreClientError, "cancelled"):
+                    client.restore(os.path.abspath("D:/project"), os.path.abspath("D:/capture.rdc"), "9" * 32)
+                self.assertEqual([c[2] for c in transport.calls], ["POST", "GET", "DELETE", "GET"])
+                self.assertEqual(client.replay_inspection_safe, safe)
             self.assertIsNone(transport.calls[-1][7])
 
     def test_delete_failure_does_not_mask_original_timeout(self):

@@ -36,15 +36,12 @@ class LiveAnnotation(object):
         return next(b for b in buttons if b.text() == self.translated('AITextureAnnotation', source))
 
     def drag(self, points):
-        size = self.canvas.size()
-        fitted = QtCore.QSize(self.texture_size[0], self.texture_size[1])
-        fitted.scale(size, QtCore.Qt.KeepAspectRatio)
-        left, top = (size.width()-fitted.width())/2.0, (size.height()-fitted.height())/2.0
+        left, top, width, height = self.canvas.property('annotationImageRect')
         events=[(QtCore.QEvent.MouseButtonPress,points[0])]
         events.extend((QtCore.QEvent.MouseMove,point) for point in points[1:])
         events.append((QtCore.QEvent.MouseButtonRelease,points[-1]))
         for kind, uv in events:
-            point = QtCore.QPointF(left+uv[0]*fitted.width(), top+uv[1]*fitted.height())
+            point = QtCore.QPointF(left+uv[0]*width, top+uv[1]*height)
             event = QtGui.QMouseEvent(kind, point, QtCore.Qt.LeftButton, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier)
             self.app.sendEvent(self.canvas, event)
 
@@ -109,6 +106,10 @@ class LiveAnnotation(object):
                 self.canvas = self.panel.findChild(QtWidgets.QWidget, 'aiAnnotationCanvas')
                 self.keep.extend([self.panel, self.canvas])
                 case = self.spec['cases'][self.index]
+                if case.get('verifyAnnotationResolution'):
+                    native = self.canvas.property('annotationSourceSize')
+                    if (native.width(), native.height()) != tuple(self.texture_size):
+                        raise RuntimeError('Annotation editor did not use native RT pixels')
                 for mark in case['marks']:
                     if mark.get('color'):
                         def choose_color(color=mark['color']):
@@ -226,7 +227,8 @@ class LiveAnnotation(object):
                 case['eventLinks'] = links
                 case['eventLinksVerified'] = bool(links) and all(x['eventId']==x['observedEventId'] for x in links)
                 if (self.spec['cases'][self.index].get('verifyPersistence') or
-                        self.spec['cases'][self.index].get('verifyPairPersistence')):
+                        self.spec['cases'][self.index].get('verifyPairPersistence') or
+                        self.spec['cases'][self.index].get('verifyAnnotationResolution')):
                     stores=list((self.root/'config/ReplayLab/conversations').glob('*.json'))
                     if len(stores)!=1:raise RuntimeError('Expected one owned conversation store')
                     wrapper=json.loads(stores[0].read_text(encoding='utf-8'))
@@ -238,16 +240,28 @@ class LiveAnnotation(object):
                     if len(matches)!=1 or len(matches[0].get('attachments',[]))!=expected_count:
                         raise RuntimeError('Large inline image and annotation pair were omitted')
                     attachments=matches[0]['attachments']
-                    if sum(a['originalBytes'] for a in attachments)<2*1024*1024:
+                    if (self.spec['cases'][self.index].get('verifyPersistence') or
+                            self.spec['cases'][self.index].get('verifyPairPersistence')) and (
+                            sum(a['originalBytes'] for a in attachments)<2*1024*1024):
                         raise RuntimeError('Persistence regression did not exercise large data')
                     metadata=[{k:a.get(k) for k in ('id','mediaType','originalBytes','context')}
                               for a in attachments]
                     (self.root/'persisted-attachment-metadata.json').write_text(
                         json.dumps(metadata,ensure_ascii=False,indent=2),encoding='utf-8')
                     for attachment in attachments:
-                        role=attachment.get('context',{}).get('annotation',{}).get('imageRole')
+                        annotation=attachment.get('context',{}).get('annotation',{})
+                        role=annotation.get('imageRole')
                         if role in ('original','annotated'):
-                            (self.root/(role+'-sent.png')).write_bytes(base64.b64decode(attachment['content']))
+                            data=base64.b64decode(attachment['content'])
+                            (self.root/(role+'-sent.png')).write_bytes(data)
+                            if self.spec['cases'][self.index].get('verifyAnnotationResolution'):
+                                image=QtGui.QImage.fromData(data)
+                                native=(annotation['textureWidth'],annotation['textureHeight'])
+                                encoded=(annotation['imageWidth'],annotation['imageHeight'])
+                                if (native != tuple(self.texture_size) or
+                                        encoded != (image.width(),image.height()) or
+                                        max(encoded) != min(1600,max(native)) or min(encoded)<1):
+                                    raise RuntimeError('RT attachment dimensions violate the transport contract')
                     case['largeAttachmentsPersisted']={'count':expected_count,'payloadBytes':len(payload)}
                 if self.spec['cases'][self.index].get('verifyHistoryEdit'):
                     references = []

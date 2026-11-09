@@ -186,7 +186,8 @@ def test_conversation_scroll_uses_persistent_follow_tail_state() -> None:
     assert "ViewportAnchor m_ViewportAnchor" in header
     assert '"Jump to latest message"' in source
     assert "&QAbstractSlider::actionTriggered" in constructor
-    assert "&QScrollBar::valueChanged" not in constructor
+    value_changed = [line for line in constructor.splitlines() if "&QScrollBar::valueChanged" in line]
+    assert all("updateVisualReplies();" in line and "detachFromTail" not in line for line in value_changed)
     assert "detachFromTail();" in constructor
     assert "m_UserInteractionGeneration" in header
     assert "wheel->pixelDelta().y()" in source
@@ -273,16 +274,16 @@ def test_live_conversation_appends_without_refreshing_the_document_or_selection(
     assert "m_ElapsedTimer" in header
     assert "render(" not in elapsed_tick
     assert "setHtml(" not in elapsed_tick
-    # Qt anchors mark only their first character. Track and replace the exact
-    # translated duration label (digits plus unit), otherwise every tick leaves
-    # the previous unit behind and renders e.g. ``9 秒秒``.
+    # Qt anchors mark only their first character. Cover the whole translated
+    # duration label while painting the timer without changing the document.
     assert "target.text = anchor.value().second;" in elapsed_rebuild
     assert "target.length = target.text.size();" in elapsed_rebuild
     assert "span.selectedText() != target.text" in elapsed_rebuild
     assert "fragment.length()" not in elapsed_rebuild
     assert "edit.setPosition(position + entry.length" in elapsed_tick
-    assert "entry.length = text.size();" in elapsed_tick
-    assert "entry.text = text;" in elapsed_tick
+    assert "overlay.length = entry.length;" in elapsed_tick
+    assert "setElapsedOverlays(overlays)" in elapsed_tick
+    assert "insertText(" not in elapsed_tick
     assert "canKeepTranscriptDocument(m_Messages, messages)" in setter
     assert "if(keepDocument && !flushSelectionRender)" in setter
     keep_document = setter[setter.index("if(keepDocument && !flushSelectionRender)") :]
@@ -789,7 +790,7 @@ def test_conversations_own_model_affinity_and_run_in_independent_process_lanes()
     assert 'm_TaskConversationIds.value(taskId)' in event_poll
 
 
-def test_development_prefers_live_agenthost_over_a_stale_deployed_bundle() -> None:
+def test_development_prefers_its_deployed_agenthost_with_source_fallback() -> None:
     source = _source("AIAssistant.cpp")
     finder = _section(
         source,
@@ -799,9 +800,8 @@ def test_development_prefers_live_agenthost_over_a_stale_deployed_bundle() -> No
     development = _section(finder, "#if !defined(RELEASE)", "#endif")
 
     assert "../../replaylab/.venv/Scripts/replaylab-ai.exe" in development
-    assert development.index(".venv/Scripts/replaylab-ai.exe") < finder.index(
-        'lit("replaylab/replaylab-ai.exe")'
-    )
+    assert (finder.index('environmentValue("REPLAYLAB_AI_CLI")') <
+            finder.index('replaylab-runtime-manifest.json') < finder.index(development))
 
 
 def test_agenthost_response_locale_follows_ui_language_and_resolves_system_setting() -> None:

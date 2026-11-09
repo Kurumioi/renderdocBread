@@ -67,6 +67,9 @@ _MAX_PLAN_STEPS = 32
 _MAX_PLAN_STEP_CHARS = 512
 _MAX_STRUCTURED_DETAIL_CHARS = 4096
 _CAPACITY_RETRY_DELAYS = (2.0, 5.0)
+_ACCOUNT_READ_RETRY_DELAYS = (0.5, 1.0)
+_ACCOUNT_READ_REQUEST_TIMEOUT = 30.0
+_ACCOUNT_READ_TOTAL_TIMEOUT = 60.0
 _CAPACITY_RECOVERY_PROMPT = (
     "The previous turn stopped because the selected model was temporarily at capacity. "
     "Continue the unfinished user task in this same thread from its current state. "
@@ -1358,11 +1361,59 @@ class CodexAppServerConnector:
 
         async with self._run_lock:
             await self._initialize()
-            return await self._transport.request(
-                "account/read",
-                {"refreshToken": bool(refresh_token)},
-                timeout=min(self.timeout, 30.0),
-            )
+            return await self._read_account_state(refresh_token=refresh_token)
+
+    async def _read_account_state(
+        self, *, refresh_token: bool = False, on_timeline: TimelineCallback | None = None,
+    ) -> dict[str, Any]:
+        """Retry only transient, read-only auth metadata discovery before inference.
+
+        A routing lookup timeout says nothing about whether the login is valid. Do not
+        delete credentials, force refresh, change provider settings or restart a model
+        turn. Keep the same process, native thread and task-scoped MCP configuration.
+        """
+        deadline = asyncio.get_running_loop().time() + min(self.timeout, _ACCOUNT_READ_TOTAL_TIMEOUT)
+        retried = False
+        for attempt in range(len(_ACCOUNT_READ_RETRY_DELAYS) + 1):
+            remaining = deadline - asyncio.get_running_loop().time()
+            try:
+                result = await self._transport.request(
+                    "account/read", {"refreshToken": bool(refresh_token)},
+                    timeout=max(.001, min(remaining, _ACCOUNT_READ_REQUEST_TIMEOUT)),
+                )
+            except ConnectorError as exc:
+                routing_timeout = (
+                    isinstance(exc, _AppServerRequestError) and exc.method == "account/read"
+                    and exc.code == -32603
+                    and "workspace routing discovery timed out" in exc.server_message.casefold()
+                )
+                rpc_timeout = isinstance(exc.__cause__, (TimeoutError, asyncio.TimeoutError))
+                if not (routing_timeout or rpc_timeout) or refresh_token:
+                    raise
+                remaining = deadline - asyncio.get_running_loop().time()
+                if attempt == len(_ACCOUNT_READ_RETRY_DELAYS) or remaining <= _ACCOUNT_READ_RETRY_DELAYS[attempt]:
+                    raise ProviderRequestError(
+                        "Codex account/workspace discovery timed out after bounded connection retries. "
+                        "The saved login and conversation were retained; retry when the provider is reachable.",
+                        error_code="provider-timeout", retryable=True,
+                    ) from exc
+                delay = _ACCOUNT_READ_RETRY_DELAYS[attempt]
+                retried = True
+                await _emit_timeline(on_timeline, {
+                    "activityId": "codex-account-read", "activityKind": "providerRetry",
+                    "activityTarget": "account/read", "status": "running", "lifecycle": "updated",
+                    "activityTitleId": "task.provider.retry-session",
+                    "activityTitleArgs": [delay, attempt + 1, len(_ACCOUNT_READ_RETRY_DELAYS)],
+                })
+                await asyncio.sleep(delay)
+                continue
+            if retried:
+                await _emit_timeline(on_timeline, {
+                    "activityId": "codex-account-read", "activityKind": "providerRetry",
+                    "activityTarget": "account/read", "status": "completed", "lifecycle": "completed",
+                    "activityTitleId": "task.provider.session-ready", "activityTitleArgs": [],
+                })
+            return result
 
     async def list_models(self, *, include_hidden: bool = False) -> list[dict[str, Any]]:
         """Return the bounded, paginated app-server model picker catalog."""
@@ -1603,11 +1654,7 @@ class CodexAppServerConnector:
         async with self._run_lock:
             try:
                 await self._initialize()
-                account_state = await self._transport.request(
-                    "account/read",
-                    {"refreshToken": False},
-                    timeout=min(self.timeout, 30.0),
-                )
+                account_state = await self._read_account_state(on_timeline=on_timeline)
                 if account_state.get("account") is None:
                     raise AuthenticationError(
                         "This RenderDoc Codex profile is not signed in. Open Settings > AI, "

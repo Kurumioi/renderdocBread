@@ -128,6 +128,19 @@ def test_v5_keeps_v4_binary_and_v3_text_compatibility() -> None:
     assert parse_conversation_prompt(json.dumps(binary)).request.attachments[0].decoded_bytes() == png
 
 
+def test_first_request_projects_only_its_own_conversation():
+    request = {"role": "user", "content": "How is this effect made?"}
+    first = {"schema": CONVERSATION_SCHEMA, "request": request}
+    continued = dict(first, messages=[{"role": "assistant", "content": "An earlier answer in this chat."}])
+    fresh = json.loads(prepare_provider_conversation_input(json.dumps(first), provider_name="test").text)
+    followup = json.loads(prepare_provider_conversation_input(json.dumps(continued), provider_name="test").text)
+    assert "first request in a new chat" in fresh["conversationBoundary"]
+    assert fresh["conversation"]["messages"] == []
+    assert fresh["conversation"]["request"]["content"] == request["content"]
+    assert "conversationBoundary" not in followup
+    assert followup["conversation"]["messages"][0]["content"] == "An earlier answer in this chat."
+
+
 def test_provider_projection_never_places_binary_base64_in_control_text() -> None:
     current_png = b"\x89PNG\r\n\x1a\ncurrent-image-secret-42"
     current_file = b"opaque-file-secret-73\x00\xff"

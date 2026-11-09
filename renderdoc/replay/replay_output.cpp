@@ -272,12 +272,20 @@ void ReplayOutput::SetMeshDisplay(const MeshDisplay &o)
 extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_SetMeshComponentHighlight(
     IReplayOutput *output, const FloatVector *vertices, uint32_t count, Topology topology)
 {
-  if(output)
-    static_cast<ReplayOutput *>(output)->SetMeshComponentHighlight(vertices, count, topology);
+  RENDERDOC_SetMeshComponentOverlay(output, vertices, count, topology, count);
 }
 
-void ReplayOutput::SetMeshComponentHighlight(const FloatVector *vertices, uint32_t count,
-                                             Topology topology)
+extern "C" RENDERDOC_API void RENDERDOC_CC
+RENDERDOC_SetMeshComponentOverlay(IReplayOutput *output, const FloatVector *vertices,
+                                  uint32_t count, Topology topology, uint32_t selectedVertices)
+{
+  if(output)
+    static_cast<ReplayOutput *>(output)->SetMeshComponentOverlay(vertices, count, topology,
+                                                                 selectedVertices);
+}
+
+void ReplayOutput::SetMeshComponentOverlay(const FloatVector *vertices, uint32_t count,
+                                           Topology topology, uint32_t selectedVertices)
 {
   CHECK_REPLAY_THREAD();
 
@@ -285,12 +293,13 @@ void ReplayOutput::SetMeshComponentHighlight(const FloatVector *vertices, uint32
                           : topology == Topology::LineList     ? 2U
                           : topology == Topology::TriangleList ? 3U
                                                                : 0U;
-  count = RDCMIN(count, MaxMeshComponentHighlightVertices);
   if(vertices && stride && count >= stride)
     m_ComponentHighlight.vertices.assign(vertices, count - count % stride);
   else
     m_ComponentHighlight.vertices.clear();
   m_ComponentHighlight.topology = topology;
+  m_ComponentHighlight.selectedVertices =
+      uint32_t(RDCMIN(size_t(selectedVertices), m_ComponentHighlight.vertices.size()));
   m_MainOutput.dirty = true;
 }
 

@@ -32,7 +32,7 @@
 class AIConversationStore
 {
 public:
-  static const qint64 MaximumPayloadBytes = 4 * 1024 * 1024;
+  static constexpr int MaximumPayloadBytes = 64 * 1024 * 1024;
 
   // A missing backing file is a successful load with an empty payload. Empty capture paths and
   // malformed/corrupt files fail and populate error when it is supplied.

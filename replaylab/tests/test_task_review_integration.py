@@ -26,6 +26,119 @@ def assessment(verdict="complete"):
 
 
 @pytest.mark.asyncio
+async def test_native_visual_review_continues_with_real_inventory_without_replaying_work(tmp_path,monkeypatch):
+    task_id='native-visual-presentation'
+    store=TaskReportStore(task_id,tmp_path/'events');prompts=[]
+    class Session:
+        def __init__(self,*args,**kwargs):pass
+        async def __aenter__(self):return self
+        async def __aexit__(self,*args):pass
+        async def close(self):pass
+        async def prompt(self,text,**kwargs):
+            prompts.append(text)
+            if len(prompts)==1:
+                store.record_task_review(**assessment())
+                store.register_reply_visual('a'*64,presentation=dict(cards=[dict(type='diagram',title='Flow',nodes=[
+                    dict(id='calculation',imageCount=0,codeBlockCount=1,hasDetails=True)])]))
+                return PromptResult('First answer',[],'end_turn',0)
+            assert 'visual_review' in text and 'imageCount' in text
+            store.record_task_review(**assessment(),visual_review='Reviewed the diagram and key code against the question.')
+            return PromptResult('Reviewed visual explanation',[],'end_turn',0)
+    monkeypatch.setattr('replaylab_agent.native_engine.build_native_mcp_route',lambda *args,**kwargs:None)
+    monkeypatch.setattr(ProviderContext,'agent_argv',lambda self:['fake-agent'])
+    engine=NativeAgentEngine(catalog=_catalog(tmp_path),config=OrchestratorConfig(event_root=tmp_path/'events',
+        workspace_base=tmp_path/'turns',log_root=tmp_path/'logs'),acp_session_factory=Session)
+    result=await engine.run(RunRequest(prompt='Explain this result.',task_id=task_id,
+        profile=Profile(id='native',preset='claude-code-acp',options={'allow_unsandboxed_agent':True})))
+    assert result.terminal_status=='completed' and result.text=='Reviewed visual explanation'
+    assert len(prompts)==2
+
+
+@pytest.mark.asyncio
+async def test_api_accepts_current_visual_assessment_without_mandatory_extra_views(tmp_path,monkeypatch):
+    begin=TaskReportStore.begin_task_review
+    def begin_with_publication(self,*args,**kwargs):
+        result=begin(self,*args,**kwargs)
+        self.register_reply_visual('a'*64,presentation=dict(cards=[dict(type='image',title='One requested image',nodes=[])]))
+        return result
+    monkeypatch.setattr(TaskReportStore,'begin_task_review',begin_with_publication)
+    model=ToolCallingFakeModel(responses=[_message('record_task_review',dict(assessment(),
+        visual_review='The requested image and caption are sufficient; no geometry or code is relevant.'),'review'),
+        AIMessage(content='Reviewed image answer')])
+    engine=DeepAgentsEngine(catalog=_catalog(tmp_path),config=OrchestratorConfig(event_root=tmp_path/'events',
+        workspace_base=tmp_path/'turns',log_root=tmp_path/'logs'),deepagents_module=deepagents,model_factory=lambda *args:model)
+    result=await engine.run(RunRequest(prompt='Show that image.',task_id='api-visual',
+        profile=Profile(id='offline',preset='openai',model='offline',api_key_env='UNUSED')))
+    assert result.terminal_status=='completed'and result.text=='Reviewed image answer'
+    state=TaskReportStore('api-visual',tmp_path/'events').task_review_state()
+    assert state['fresh']and state['review']['visualReview']['visualId']=='a'*64
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('transport', ['api', 'native'])
+async def test_transports_forward_the_full_layered_visual_review(tmp_path, monkeypatch, transport):
+    from src.task_completion_review import VISUAL_CHECKS
+
+    begin = TaskReportStore.begin_task_review
+
+    def begin_with_layered_publication(self, fingerprint, **_):
+        result = begin(self, fingerprint, marked_render_target=True)
+        self.register_reply_visual('a'*64, dict(cards=[dict(type='diagram')], shaderCodeGaps=[],
+            markedEffect=dict(needsFinalReplay=[], needsDiagram=False, missingLayerViews=[],
+                              missingFinalLayerComparisons=[], missingInputTextures=[],
+                              relatedEvents=[21, 22], combinedBaselineMismatch=False)))
+        return result
+
+    monkeypatch.setattr(TaskReportStore, 'begin_task_review', begin_with_layered_publication)
+    checks = {key: f'Reviewed {key} evidence' for key in VISUAL_CHECKS}
+    answer = dict(overview='Two layers create the effect in this capture.',
+                  steps=[dict(text='The first layer defines the shape.',events=[21]),
+                         dict(text='The second adds a soft veil.',events=[22])],
+                  combined='Both blend over the same background.')
+    review = dict(assessment(), visual_review='Checked the complete layered answer',
+                  visual_checks=checks, reviewed_answer=answer)
+    status = 'The final review is complete.'
+    task_id = transport + '-layered'
+    config = OrchestratorConfig(event_root=tmp_path/'events', workspace_base=tmp_path/'turns',
+                               log_root=tmp_path/'logs')
+    store = TaskReportStore(task_id, config.event_root)
+    if transport == 'api':
+        model = ToolCallingFakeModel(responses=[_message('record_task_review', review, 'review'),
+                                                AIMessage(content=status)])
+        engine = DeepAgentsEngine(catalog=_catalog(tmp_path), config=config,
+                                  deepagents_module=deepagents, model_factory=lambda *args: model)
+        profile = Profile(id='offline', preset='openai', model='offline', api_key_env='UNUSED')
+    else:
+        class Session:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            async def close(self):
+                pass
+
+            async def prompt(self, text, **kwargs):
+                store.record_task_review(**review)
+                return PromptResult(status, [], 'end_turn', 0)
+
+        monkeypatch.setattr('replaylab_agent.native_engine.build_native_mcp_route', lambda *args, **kwargs: None)
+        monkeypatch.setattr(ProviderContext, 'agent_argv', lambda self: ['fake-agent'])
+        engine = NativeAgentEngine(catalog=_catalog(tmp_path), config=config, acp_session_factory=Session)
+        profile = Profile(id='native', preset='claude-code-acp', options={'allow_unsandboxed_agent': True})
+    result = await engine.run(RunRequest(prompt='How is this effect made?', task_id=task_id, profile=profile))
+    assert result.terminal_status == 'completed', result.error
+    assert result.text.startswith(answer['overview']) and '2. The second' in result.text
+    assert 'final review is complete' not in result.text
+    state = store.task_review_state()
+    assert state['fresh'] and state['review']['visualReview']['checks'] == checks
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("missing_first", [False, True])
 async def test_plain_api_answer_uses_local_review_without_host_or_extra_work(tmp_path, missing_first):
     script = ([AIMessage(content="Initial answer")] if missing_first else []) + [
@@ -60,7 +173,7 @@ async def test_api_operation_after_review_requires_fresh_review_without_repeatin
     assert result.terminal_status == "completed", result.error
     retained = list((tmp_path / "turns").glob("*/agent-workspace/note.txt"))
     assert len(retained) == 1 and retained[0].read_text(encoding="utf-8") == "ONE WRITE"
-    assert "Local task outputs are retained" in result.text and "Shader draft" not in result.text
+    assert "Local task outputs are retained" not in result.text and "Shader draft" not in result.text
     final = model.seen_messages[-1]
     assert sum(isinstance(item, ToolMessage) and item.tool_call_id == "write-once" for item in final) == 1
     assert any(isinstance(item, HumanMessage) and "completion self-review" in str(item.content) for item in final)
@@ -97,7 +210,7 @@ async def test_native_completed_report_survives_cleanup_and_has_output_location(
         profile=Profile(id="native", preset="claude-code-acp", options={"allow_unsandboxed_agent": True})))
     assert result.terminal_status == "completed", result.error
     assert len(paths) == 1 and paths[0].read_text(encoding="utf-8") == "Completed report"
-    assert str(paths[0]) in result.text and "Local task outputs are retained" in result.text
+    assert str(paths[0]) in result.text and "Local task outputs are retained" not in result.text
     assert "Shader draft" not in result.text
 
 

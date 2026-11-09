@@ -148,6 +148,10 @@ bool PersistentConfig::Deserialize(const rdcstr &filename)
 
     applyValues(values);
 
+    // Profiles written before the preview FOV setting stored the old near-plane default.
+    if(!values.contains(QStringLiteral("MeshViewer_CameraFov")) && MeshViewer_CameraNear == 0.1f)
+      MeshViewer_CameraNear = 0.0001f;
+
     return true;
   }
 

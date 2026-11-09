@@ -53,6 +53,7 @@ LONG_TOOLS = frozenset({
     "publish_visual_reply",
     "get_cbuffer_parameter_link",
     "get_mesh_uv_link",
+    "capture_mesh_uv_evidence",
     "inspect_vertex_effect_scope",
 })
 
@@ -70,6 +71,7 @@ REPLAY_TOUCH_TOOLS = frozenset({
     "publish_visual_reply",
     "get_cbuffer_parameter_link",
     "get_mesh_uv_link",
+    "capture_mesh_uv_evidence",
     "inspect_vertex_effect_scope",
     "get_texture_fingerprints",
     "get_bound_textures",

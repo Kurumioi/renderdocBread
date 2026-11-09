@@ -1,7 +1,9 @@
 #include "AIVisualReply.h"
+#include "Windows/TexturePreviewChannels.h"
 #include "AICodeFormatting.h"
 
 #include <QBuffer>
+#include <QButtonGroup>
 #include <QCheckBox>
 #include <QColorDialog>
 #include <QComboBox>
@@ -14,6 +16,7 @@
 #include <QFileInfo>
 #include <QGridLayout>
 #include <QHBoxLayout>
+#include <QHelpEvent>
 #include <QImageReader>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -22,20 +25,27 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
+#include <QPainterPathStroker>
 #include <QPointer>
 #include <QPushButton>
 #include <QRegularExpression>
+#include <QScrollBar>
 #include <QSet>
 #include <QSlider>
+#include <QSplitter>
 #include <QStackedWidget>
 #include <QStandardPaths>
 #include <QTextBrowser>
+#include <QTextDocument>
+#include <QTextLayout>
 #include <QTextOption>
 #include <QToolButton>
+#include <QToolTip>
 #include <QUrlQuery>
 #include <QVBoxLayout>
 #include <QVector3D>
 #include <QWheelEvent>
+#include <QWidgetAction>
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -69,7 +79,7 @@ QByteArray blob(const QJsonObject &asset, const QString &suffix)
                       8 * 1024 * 1024);
 }
 
-QImage imageAsset(const QJsonObject &asset)
+QImage imageAsset(const QJsonObject &asset, bool preserveAlpha = false)
 {
   const QByteArray bytes = blob(asset, QLatin1String(".png"));
   QImage image;
@@ -83,8 +93,13 @@ QImage imageAsset(const QJsonObject &asset)
   if(size.width() <= 0 || size.height() <= 0 || size.width() > 8192 || size.height() > 8192 ||
      qint64(size.width()) * size.height() > 16000000)
     return image;
-  reader.setScaledSize(size.scaled(QSize(1600, 1600), Qt::KeepAspectRatio).boundedTo(size));
-  return reader.read().convertToFormat(QImage::Format_RGB32);
+  const QSize preview = size.scaled(QSize(1600, 1600), Qt::KeepAspectRatio).boundedTo(size);
+  if(!preserveAlpha)
+    reader.setScaledSize(preview);
+  image = reader.read().convertToFormat(preserveAlpha ? QImage::Format_ARGB32 : QImage::Format_RGB32);
+  if(preserveAlpha && !image.isNull() && image.size() != preview)
+    image = image.scaled(preview, Qt::IgnoreAspectRatio, Qt::FastTransformation);
+  return image;
 }
 
 QPointF uvPoint(const QJsonValue &value, const QRectF &area)
@@ -96,10 +111,59 @@ QPointF uvPoint(const QJsonValue &value, const QRectF &area)
                  area.top() + qBound(0.0, point[1].toDouble(), 1.0) * area.height());
 }
 
+QString presentationTitle(QString text)
+{
+  const QStringList statuses = {
+      QCoreApplication::translate("AIVisualReply", "Restored"),
+      QCoreApplication::translate("AIVisualReply", "Reused existing reconstructed source")};
+  for(const QString &status : statuses)
+    text.remove(QRegularExpression(QStringLiteral("\\s*[\\x{ff08}(]\\s*%1\\s*[\\x{ff09})]")
+                                       .arg(QRegularExpression::escape(status))));
+  return text.trimmed();
+}
+
+QJsonValue visibleContent(const QJsonValue &value)
+{
+  if(value.isObject())
+  {
+    QJsonObject object = value.toObject();
+    // A corrected jump target updates a presentation; it does not create a
+    // second copy of the same pictures and explanation in one message.
+    object.remove(QLatin1String("url"));
+    for(auto it = object.begin(); it != object.end(); ++it)
+      it.value() = visibleContent(it.value());
+    return object;
+  }
+  if(value.isArray())
+  {
+    QJsonArray array;
+    for(const QJsonValue &item : value.toArray())
+      array.append(visibleContent(item));
+    return array;
+  }
+  return value;
+}
+
+void imageText(QPainter &p, const QRectF &area, const QString &text, const QColor &color,
+               Qt::Alignment alignment = Qt::AlignLeft | Qt::AlignTop)
+{
+  p.save();
+  QFont font = p.font();
+  font.setPointSizeF(qMax(12.0, font.pointSizeF() + 2.0));
+  font.setBold(true);
+  p.setFont(font);
+  p.setPen(QColor(0, 0, 0, 210));
+  for(const QPointF &offset : {QPointF(-1, 0), QPointF(1, 0), QPointF(0, -1), QPointF(0, 1)})
+    p.drawText(area.translated(offset), alignment | Qt::TextWordWrap, text);
+  p.setPen(color);
+  p.drawText(area, alignment | Qt::TextWordWrap, text);
+  p.restore();
+}
+
 void marks(QPainter &p, const QJsonArray &annotations, const QRectF &area, bool flip = false)
 {
   p.save();
-  p.setClipRect(area);
+  p.setClipRect(area, Qt::IntersectClip);
   p.setRenderHint(QPainter::Antialiasing);
   auto mapPoint = [&](const QJsonValue &value) {
     QPointF point = uvPoint(value, area);
@@ -146,36 +210,243 @@ void marks(QPainter &p, const QJsonArray &annotations, const QRectF &area, bool 
     const QString text = mark.value(QLatin1String("text")).toString().left(160);
     if(!text.isEmpty())
     {
-      QRectF label =
-          p.boundingRect(QRectF(a + QPointF(4, 4), QSizeF(qMin(240.0, area.width() - 8), 60)),
-                         Qt::TextWordWrap, text)
-              .adjusted(-3, -2, 3, 2);
+      QFont font = p.font();
+      font.setPointSizeF(qMax(12.0, font.pointSizeF() + 2.0));
+      font.setBold(true);
+      const QFontMetrics metrics(font);
+      QRectF label = metrics
+                         .boundingRect(QRect(0, 0, int(qMin(320.0, area.width() - 8)), 90),
+                                       Qt::TextWordWrap, text)
+                         .adjusted(-3, -2, 3, 2);
+      label.moveTopLeft(a + QPointF(4, 4));
       label.moveLeft(
           qBound(area.left(), label.left(), qMax(area.left(), area.right() - label.width())));
       label.moveTop(qBound(area.top(), label.top(), qMax(area.top(), area.bottom() - label.height())));
-      p.fillRect(label, QColor(0, 0, 0, 190));
-      p.setPen(color);
-      p.drawText(label.adjusted(3, 2, -3, -2), Qt::TextWordWrap, text);
+      imageText(p, label.adjusted(3, 2, -3, -2), text, color);
     }
   }
   p.restore();
 }
 
+QUrl visualResourceLink(QUrl url, uint32_t eid)
+{
+  if(eid && url.scheme() == QLatin1String("rdoc") &&
+     (url.host() == QLatin1String("resource") || url.host() == QLatin1String("texture")))
+  {
+    QUrlQuery query(url);
+    if(!query.hasQueryItem(QLatin1String("eid")))
+      query.addQueryItem(QLatin1String("eid"), QString::number(eid));
+    url.setQuery(query);
+  }
+  return url;
+}
+
+const QRegularExpression &explanationLinkPattern()
+{
+  static const QRegularExpression pattern(
+      QStringLiteral("\\[([^\\]\\n]+)\\]\\((rdoc://[^\\s<>()]+)\\)"));
+  return pattern;
+}
+
+QString explanationHtml(const QString &text, uint32_t eid = 0)
+{
+  auto matches = explanationLinkPattern().globalMatch(text);
+  QString html;
+  int position = 0;
+  while(matches.hasNext())
+  {
+    const auto match = matches.next();
+    html += text.mid(position, match.capturedStart() - position).toHtmlEscaped();
+    const QUrl target = visualResourceLink(QUrl(match.captured(2)), eid);
+    const QStringList hosts = {
+        QLatin1String("event"),   QLatin1String("eid"),     QLatin1String("resource"),
+        QLatin1String("texture"), QLatin1String("buffer"),  QLatin1String("shader"),
+        QLatin1String("mesh"),    QLatin1String("cbuffer"), QLatin1String("uv")};
+    if(target.scheme() == QLatin1String("rdoc") && hosts.contains(target.host()))
+      html += QLatin1String("<a href=\"") + target.toString(QUrl::FullyEncoded).toHtmlEscaped() +
+              QLatin1String("\">") + match.captured(1).toHtmlEscaped() + QLatin1String("</a>");
+    else
+      html += match.captured(1).toHtmlEscaped();
+    position = match.capturedEnd();
+  }
+  html += text.mid(position).toHtmlEscaped();
+  return html.replace(QLatin1Char('\n'), QLatin1String("<br/>"));
+}
+
+QString codeHtml(const QJsonObject &code, const QPalette &palette)
+{
+  const bool example = code.value(QLatin1String("example")).toBool();
+  QString html = QLatin1String(
+      "<table width=\"100%\" cellpadding=\"3\" style=\"font-family:Consolas,monospace;\">");
+  const QStringList lines =
+      code.value(QLatin1String("text")).toString().left(16000).split(QLatin1Char('\n'));
+  bool blockComment = false;
+  const QJsonArray lineNumbers = code.value(QLatin1String("lineNumbers")).toArray();
+  const QJsonArray mappings = code.value(QLatin1String("mappings")).toArray();
+  const QJsonArray exactLines = code.value(QLatin1String("exactSourceLines")).toArray();
+  for(int i = 0; i < qMin(120, lines.size()); ++i)
+  {
+    QUrl url(code.value(QLatin1String("url")).toString());
+    QUrlQuery query(url);
+    const int startLine = code.value(QLatin1String("startLine")).toInt(1);
+    int actual = i < lineNumbers.size() ? lineNumbers[i].toInt()
+                 : example              ? startLine
+                                        : startLine + i;
+    if(actual <= 0 && example)
+    {
+      // Older examples recorded token targets without a row target. Recover
+      // only a single agreed location; never guess across different sources.
+      QSet<int> sources;
+      for(const auto &entry : mappings)
+      {
+        const auto mapping = entry.toObject();
+        if(mapping.value(QLatin1String("displayLine")).toInt() == i + 1 &&
+           mapping.value(QLatin1String("sourceLine")).toInt() > 0)
+          sources.insert(mapping.value(QLatin1String("sourceLine")).toInt());
+      }
+      if(sources.size() == 1)
+        actual = *sources.constBegin();
+    }
+    const QString number = actual > 0 ? QString::number(actual) : QLatin1String("...");
+    query.removeAllQueryItems(QLatin1String("line"));
+    query.addQueryItem(QLatin1String("line"), QString::number(qMax(1, actual)));
+    query.addQueryItem(QLatin1String("selectLine"), QLatin1String("1"));
+    url.setQuery(query);
+    const QString href = actual > 0 ? url.toString(QUrl::FullyEncoded).toHtmlEscaped() : QString();
+    QHash<QString, QString> symbols;
+    for(const auto &mappingValue : mappings)
+    {
+      const auto mapping = mappingValue.toObject();
+      if(mapping.value(QLatin1String("displayLine")).toInt() != i + 1 ||
+         mapping.value(QLatin1String("symbol")).toString().isEmpty())
+        continue;
+      QUrl jump(code.value(QLatin1String("url")).toString());
+      QUrlQuery target(jump);
+      target.removeAllQueryItems(QLatin1String("line"));
+      target.removeAllQueryItems(QLatin1String("column"));
+      target.addQueryItem(QLatin1String("line"),
+                          QString::number(mapping.value(QLatin1String("sourceLine")).toInt()));
+      target.addQueryItem(QLatin1String("column"),
+                          QString::number(mapping.value(QLatin1String("column")).toInt(1)));
+      target.addQueryItem(QLatin1String("symbol"),
+                          mapping.value(QLatin1String("sourceSymbol")).toString());
+      jump.setQuery(target);
+      symbols.insert(mapping.value(QLatin1String("symbol")).toString(),
+                     jump.toString(QUrl::FullyEncoded).toHtmlEscaped());
+    }
+    auto linked = [](const QString &text, const QString &target) {
+      return target.isEmpty() ? text
+                              : QLatin1String("<a style=\"text-decoration:none;\" href=\"") +
+                                    target + QLatin1String("\">") + text + QLatin1String("</a>");
+    };
+    const QString rendered = AICodeFormatting::highlightedSourceLine(
+        lines[i], code.value(QLatin1String("language")).toString(), blockComment, palette);
+    const QRegularExpression token(QStringLiteral("<span\\b[^>]*>([^<]*)</span>"));
+    auto matches = token.globalMatch(rendered);
+    int position = 0;
+    QString row;
+    while(matches.hasNext())
+    {
+      const auto match = matches.next();
+      row += linked(rendered.mid(position, match.capturedStart() - position), href);
+      const QString word = match.captured(1);
+      QString target = symbols.value(word, href);
+      if((!example || (i < exactLines.size() && exactLines[i].toBool())) && actual > 0 &&
+         !symbols.contains(word) &&
+         (match.captured().contains(QLatin1String("source-variable")) ||
+          match.captured().contains(QLatin1String("source-function"))))
+      {
+        QUrl jump = url;
+        QUrlQuery location(jump);
+        location.removeAllQueryItems(QLatin1String("column"));
+        location.removeAllQueryItems(QLatin1String("selectLine"));
+        location.addQueryItem(QLatin1String("column"), QString::number(lines[i].indexOf(word) + 1));
+        location.addQueryItem(QLatin1String("symbol"), word);
+        jump.setQuery(location);
+        target = jump.toString(QUrl::FullyEncoded).toHtmlEscaped();
+      }
+      row += linked(match.captured(), target);
+      position = match.capturedEnd();
+    }
+    row += linked(rendered.mid(position), href);
+    html += QLatin1String("<tr><td width=\"40\">") + linked(number, href) +
+            QLatin1String("</td><td style=\"white-space:pre;\">") + row +
+            QLatin1String("</td></tr>");
+  }
+  return html + QLatin1String("</table>");
+}
+
+QString calculationHtml(QString calculation, const QPalette &palette)
+{
+  // Older explanations used mathematical punctuation in code. A middle dot
+  // denotes multiplication there. Member access already uses an ASCII period.
+  calculation.replace(QChar(0x00b7), QLatin1String(" * "));
+  calculation.replace(QChar(0x00d7), QLatin1String(" * "));
+  calculation.replace(QChar(0x2212), QLatin1Char('-'));
+  // Compact wrapped statements from older explanations while preserving statement boundaries.
+  static const QRegularExpression continuationStart(QStringLiteral(R"(^[+*%&|?:,)]|^[-/]\s)"));
+  static const QRegularExpression continuationEnd(QStringLiteral(R"([,(+*/%&|?:=-]$)"));
+  static const QRegularExpression codeStatement(
+      QStringLiteral(R"(^[A-Za-z_][\x20-\x7e]*[A-Za-z0-9_)\]]$)"));
+  QStringList statements;
+  for(const QString &line : calculation.split(QLatin1Char('\n')))
+  {
+    const QString part = line.trimmed();
+    if(!part.isEmpty() && !part.startsWith(QLatin1String("//")) && !statements.isEmpty() &&
+       !statements.last().contains(QLatin1String("//")) &&
+       (continuationStart.match(part).hasMatch() ||
+        continuationEnd.match(statements.last()).hasMatch()))
+      statements.last() += QLatin1Char(' ') + part;
+    else
+      statements.push_back(part);
+  }
+  QString html = QLatin1String("<pre style=\"font-family:Consolas,monospace;\">");
+  bool blockComment = false;
+  for(int i = 0; i < statements.size(); ++i)
+  {
+    if(i)
+      html += QLatin1String("<br/>");
+    QString statement = statements[i];
+    if(!blockComment && !statement.contains(QLatin1String("//")) &&
+       !statement.contains(QLatin1String("/*")) &&
+       (statement.contains(QLatin1Char('=')) || statement.contains(QLatin1Char('('))) &&
+       codeStatement.match(statement).hasMatch())
+      statement += QLatin1Char(';');
+    html += AICodeFormatting::highlightedSourceLine(statement, QLatin1String("hlsl"), blockComment,
+                                                    palette);
+  }
+  return html + QLatin1String("</pre>");
+}
+
 class VisualCanvas : public QWidget
 {
 public:
+  static constexpr double DiagramNodeWidth = 310.0;
+  static constexpr int DifferenceMode = 4;
+  struct DiagramChannels
+  {
+    unsigned mask = 7;
+    qint64 sourceKey = 0;
+    QImage display;
+  };
   QJsonObject card;
   QImage first, second;
-  QVector<QImage> nodeImages;
+  QImage difference;
+  bool identicalPair = false;
+  QVector<QImage> nodeImages, nodeSecondImages;
+  QVector<DiagramChannels> nodeChannels;
   int mode = 2;
   double ratio = .5, zoom = 1;
   QRectF focus;
   QPointF pan, last;
   bool dragging = false;
   bool flipY = false;
+  int selectedNode = -1, selectedEdge = -1;
   std::function<void(int)> ratioChanged;
+  std::function<void(int)> modeChanged;
   std::function<void(uint32_t)> nodeClicked;
   std::function<void(const QUrl &)> linkClicked;
+  std::function<void(int, int)> diagramSelected;
   VisualCanvas(const QJsonObject &description, QWidget *parent) : QWidget(parent), card(description)
   {
     // i18n-ignore: stable native canvas identifier.
@@ -193,10 +464,107 @@ public:
     };
     orientLegacyReference(first, card.value(QLatin1String("image")).toObject());
     orientLegacyReference(second, card.value(QLatin1String("secondImage")).toObject());
+    if(card.value(QLatin1String("type")).toString() == QLatin1String("compare") &&
+       !second.isNull() && first == second)
+    {
+      identicalPair = true;
+      second = QImage();
+      mode = 0;
+    }
+    setProperty("visualCompareMode", mode);
     const QJsonArray nodes = card.value(QLatin1String("nodes")).toArray();
     for(int i = 0; i < qMin(12, nodes.size()); ++i)
-      nodeImages.push_back(imageAsset(nodes[i].toObject().value(QLatin1String("image")).toObject()));
+    {
+      const QJsonObject node = nodes[i].toObject();
+      nodeImages.push_back(imageAsset(node.value(QLatin1String("image")).toObject(), true));
+      nodeSecondImages.push_back(
+          imageAsset(node.value(QLatin1String("secondImage")).toObject(), true));
+    }
+    nodeChannels.resize(nodeImages.size() * 2);
     setProperty("visualWipeRatio", ratio);
+  }
+  bool hasAlignedPair() const
+  {
+    return !first.isNull() && !second.isNull() && first.size() == second.size();
+  }
+  void applyComparisonMode(int preferred)
+  {
+    mode = preferred;
+    if(second.isNull())
+      mode = 0;
+    else if((mode == 2 || mode == DifferenceMode) && !hasAlignedPair())
+      mode = 3;
+    setProperty("visualCompareMode", mode);
+    if(modeChanged)
+      modeChanged(mode);
+    update();
+  }
+  const QImage &differenceImage()
+  {
+    if(!difference.isNull() || !hasAlignedPair())
+      return difference;
+
+    const QImage a = first.convertToFormat(QImage::Format_RGB32);
+    const QImage b = second.convertToFormat(QImage::Format_RGB32);
+    difference = QImage(a.size(), QImage::Format_Grayscale8);
+    if(difference.isNull())
+      return difference;
+    // Fixed square-root response makes small changes visible across different pairs.
+    uchar intensity[256];
+    for(int i = 0; i < 256; ++i)
+      intensity[i] = uchar(qRound(255.0 * std::sqrt(i / 255.0)));
+    for(int y = 0; y < a.height(); ++y)
+    {
+      const QRgb *left = reinterpret_cast<const QRgb *>(a.constScanLine(y));
+      const QRgb *right = reinterpret_cast<const QRgb *>(b.constScanLine(y));
+      uchar *output = difference.scanLine(y);
+      for(int x = 0; x < a.width(); ++x)
+      {
+        const int delta =
+            std::max({qAbs(qRed(left[x]) - qRed(right[x])), qAbs(qGreen(left[x]) - qGreen(right[x])),
+                      qAbs(qBlue(left[x]) - qBlue(right[x]))});
+        output[x] = intensity[delta];
+      }
+    }
+    return difference;
+  }
+  void comparisonLabels(QPainter &p)
+  {
+    if(card.value(QLatin1String("type")).toString() != QLatin1String("compare"))
+      return;
+    if(identicalPair)
+    {
+      imageText(p, QRectF(rect()).adjusted(8, 8, -8, -8),
+                QCoreApplication::translate("AIVisualReply", "No visible difference"), Qt::white);
+      return;
+    }
+    QString before = presentationTitle(card.value(QLatin1String("beforeLabel")).toString());
+    QString after = presentationTitle(card.value(QLatin1String("afterLabel")).toString());
+    if(before.isEmpty())
+      before = QCoreApplication::translate("AIVisualReply", "Original");
+    if(after.isEmpty())
+      after = QCoreApplication::translate("AIVisualReply", "Modified");
+    const QString a = QCoreApplication::translate("AIVisualReply", "A: %1").arg(before);
+    const QString b = QCoreApplication::translate("AIVisualReply", "B: %1").arg(after);
+    auto label = [&](const QString &text, const QRectF &bounds, bool right) {
+      if(bounds.width() < 48)
+        return;
+      p.save();
+      p.setClipRect(bounds);
+      imageText(p, bounds.adjusted(8, 8, -8, -8), text, Qt::white,
+                (right ? Qt::AlignRight : Qt::AlignLeft) | Qt::AlignTop);
+      p.restore();
+    };
+    if(second.isNull() || mode == 0)
+      label(a, rect(), false);
+    else if(mode == 1)
+      label(b, rect(), false);
+    else
+    {
+      const qreal split = mode == 3 ? width() * .5 : width() * ratio;
+      label(a, QRectF(0, 0, split, height()), false);
+      label(b, QRectF(split, 0, width() - split, height()), true);
+    }
   }
   QRectF area(const QRectF &bounds, const QImage &image) const
   {
@@ -220,7 +588,9 @@ public:
       return;
     const QRectF fitted = area(bounds, image);
     p.save();
-    p.setClipRect(bounds);
+    // Preserve the enclosing wipe/viewport clip. Replacing it lets A overwrite
+    // the entire B image even though both source assets are different.
+    p.setClipRect(bounds, Qt::IntersectClip);
     if(flipY)
     {
       p.save();
@@ -233,6 +603,150 @@ public:
       p.drawImage(fitted, image);
     marks(p, ink, fitted, flipY);
     p.restore();
+  }
+  double diagramTextHeight(const QString &text, double width) const
+  {
+    if(text.isEmpty())
+      return 0;
+    QTextLayout layout(text, font());
+    QTextOption option(Qt::AlignHCenter);
+    option.setWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
+    layout.setTextOption(option);
+    layout.beginLayout();
+    double height = 0;
+    while(true)
+    {
+      QTextLine line = layout.createLine();
+      if(!line.isValid())
+        break;
+      line.setLineWidth(qMax(1.0, width));
+      height += line.height();
+    }
+    layout.endLayout();
+    return height;
+  }
+  void diagramText(QPainter &p, const QRectF &area, const QString &text) const
+  {
+    QTextOption option(Qt::AlignHCenter | Qt::AlignTop);
+    option.setWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
+    p.drawText(area, text, option);
+  }
+  QString diagramImageLabel(int index, int side, bool paired) const
+  {
+    const auto node = card.value(QLatin1String("nodes")).toArray()[index].toObject();
+    QString label =
+        node.value(side ? QLatin1String("secondImageLabel") : QLatin1String("imageLabel")).toString();
+    // i18n-ignore: compact preview dimension identifiers.
+    if(label.isEmpty() && paired)
+      label = side ? QLatin1String("3D") : QLatin1String("2D");
+    return label;
+  }
+  double diagramLabelsHeight(int index, double width) const
+  {
+    const bool paired = !nodeImages[index].isNull() && !nodeSecondImages[index].isNull();
+    double height = 0;
+    for(int side = 0; side < 2; ++side)
+      if(!(side ? nodeSecondImages[index] : nodeImages[index]).isNull())
+        height = qMax(height, diagramTextHeight(diagramImageLabel(index, side, paired),
+                                                paired ? (width - 6) * .5 : width));
+    return height > 0 ? height + 3 : 0;
+  }
+  double diagramMediaHeight(int index, double width) const
+  {
+    const QImage &field = nodeImages[index], &projection = nodeSecondImages[index];
+    if(field.isNull() && projection.isNull())
+      return 0;
+    const bool paired = !field.isNull() && !projection.isNull();
+    const double imageWidth = paired ? (width - 6) * .5 : width;
+    double height = 0;
+    for(const QImage *image : {&field, &projection})
+      if(!image->isNull())
+        height = qMax(height, qMin(180.0, imageWidth * image->height() / image->width()));
+    return qMax(22.0, height) + diagramLabelsHeight(index, width) + 8;
+  }
+  QRectF diagramImageBounds(int index, int side, const QRectF &box) const
+  {
+    const QRectF content = box.adjusted(6, 5, -6, -5);
+    const auto node = card.value(QLatin1String("nodes")).toArray()[index].toObject();
+    const bool paired = !nodeImages[index].isNull() && !nodeSecondImages[index].isNull();
+    const double width = paired ? (content.width() - 6) * .5 : content.width();
+    const double titleHeight =
+        diagramTextHeight(node.value(QLatin1String("text")).toString(), content.width());
+    const double labelHeight = diagramLabelsHeight(index, content.width());
+    return QRectF(content.left() + (paired ? side * (width + 6) : 0),
+                  content.top() + titleHeight + 2 + labelHeight, width,
+                  diagramMediaHeight(index, content.width()) - labelHeight - 8);
+  }
+  QRectF diagramChannelRect(const QRectF &bounds) const
+  {
+    return QRectF(bounds.right() - 47, bounds.bottom() - 21, 44, 18);
+  }
+  int diagramChannelAt(int index, const QPointF &position) const
+  {
+    const QRectF box = diagramBoxes()[index];
+    const QPointF point = diagramTransform().inverted().map(position);
+    for(int side = 0; side < 2; ++side)
+      if(!(side ? nodeSecondImages[index] : nodeImages[index]).isNull() &&
+         diagramChannelRect(diagramImageBounds(index, side, box)).contains(point))
+        return side;
+    return -1;
+  }
+  QString channelName(unsigned mask) const
+  {
+    QString name;
+    for(int i = 0; i < 4; ++i)
+      if(mask & (1U << i))
+        name += QLatin1Char("RGBA"[i]);
+    return name.isEmpty() ? QString(QChar(0x2014)) : name;
+  }
+  const QImage &diagramChannelImage(int index, int side)
+  {
+    const QImage &source = side ? nodeSecondImages[index] : nodeImages[index];
+    DiagramChannels &channels = nodeChannels[index * 2 + side];
+    if(channels.sourceKey != source.cacheKey())
+    {
+      channels.display = TexturePreviewChannels(source, channels.mask);
+      channels.sourceKey = source.cacheKey();
+    }
+    return channels.display;
+  }
+  void showDiagramChannels(int index, int side, const QPoint &globalPosition)
+  {
+    const int imageIndex = index * 2 + side;
+    QMenu *menu = new QMenu(this);
+    menu->setObjectName(
+        QLatin1String("aiDiagramChannelMenu"));    // i18n-ignore: native UI identifier.
+    QWidgetAction *action = new QWidgetAction(menu);
+    QWidget *options = new QWidget(menu);
+    QVBoxLayout *layout = new QVBoxLayout(options);
+    layout->setContentsMargins(8, 5, 8, 5);
+    QVector<QCheckBox *> checks;
+    for(unsigned mask : {15U, 1U, 2U, 4U, 8U})
+    {
+      QCheckBox *check = new QCheckBox(channelName(mask), options);
+      check->setChecked((nodeChannels[imageIndex].mask & mask) == mask);
+      checks.push_back(check);
+      layout->addWidget(check);
+    }
+    for(int i = 0; i < checks.size(); ++i)
+    {
+      connect(checks[i], &QCheckBox::clicked, menu, [this, imageIndex, checks, i](bool checked) {
+        DiagramChannels &channels = nodeChannels[imageIndex];
+        const unsigned bits = i == 0 ? 15U : 1U << (i - 1);
+        channels.mask = checked ? channels.mask | bits : channels.mask & ~bits;
+        channels.sourceKey = 0;
+        for(int j = 0; j < checks.size(); ++j)
+        {
+          const unsigned mask = j == 0 ? 15U : 1U << (j - 1);
+          checks[j]->setChecked((channels.mask & mask) == mask);
+        }
+        update();
+      });
+    }
+    action->setDefaultWidget(options);
+    menu->addAction(action);
+    connect(menu, &QMenu::aboutToHide, menu, &QObject::deleteLater);
+    menu->popup(globalPosition);
   }
   QVector<QRectF> diagramBoxes() const
   {
@@ -274,29 +788,167 @@ public:
       for(int i = 0; i < column.size(); ++i)
         column[i] = i % qMin(3, column.size());
     const int columns = *std::max_element(column.begin(), column.end()) + 1;
-    const double columnWidth = qMax(142.0, width() / double(columns));
-    QVector<int> counts(columns), row(columns);
-    for(int x : column)
-      ++counts[x];
-    QVector<QRectF> boxes;
-    for(int x : column)
+    const double nodeWidth = DiagramNodeWidth, columnWidth = nodeWidth + 42.0;
+    QVector<double> heights(nodes.size()), columnHeights(columns), y(columns);
+    for(int i = 0; i < nodes.size(); ++i)
     {
-      const double rowHeight = qMax(118.0, height() / double(counts[x]));
-      boxes.push_back(
-          QRectF(x * columnWidth + 18, row[x]++ * rowHeight + 8, columnWidth - 36, rowHeight - 16));
+      const QJsonObject node = nodes[i].toObject();
+      const QString note = node.value(QLatin1String("description")).toString().simplified();
+      const double noteHeight = diagramTextHeight(note, nodeWidth - 12);
+      heights[i] = 12 +
+                   diagramTextHeight(node.value(QLatin1String("text")).toString(), nodeWidth - 12) +
+                   noteHeight + diagramMediaHeight(i, nodeWidth - 12);
+      columnHeights[column[i]] += heights[i] + 20;
+    }
+    const double sceneHeight = *std::max_element(columnHeights.begin(), columnHeights.end()) - 20;
+    for(int c = 0; c < columns; ++c)
+      y[c] = (sceneHeight - (columnHeights[c] - 20)) * .5;
+    QVector<QRectF> boxes;
+    for(int i = 0; i < column.size(); ++i)
+    {
+      const int c = column[i];
+      boxes.push_back(QRectF(c * columnWidth, y[c], nodeWidth, heights[i]));
+      y[c] += heights[i] + 20;
     }
     return boxes;
+  }
+  QTransform diagramTransform() const
+  {
+    QRectF bounds;
+    for(const QRectF &box : diagramBoxes())
+      bounds |= box;
+    const double fit = qMin(1.5, qMin((width() - 20) / qMax(1.0, bounds.width()),
+                                      (height() - 20) / qMax(1.0, bounds.height())));
+    QTransform transform;
+    transform.translate(width() * .5 + pan.x(), height() * .5 + pan.y());
+    transform.scale(fit * zoom, fit * zoom);
+    transform.translate(-bounds.center().x(), -bounds.center().y());
+    return transform;
   }
   int diagramNodeAt(const QPointF &position) const
   {
     const QVector<QRectF> boxes = diagramBoxes();
-    const QPointF point = (position - pan) / zoom;
+    const QPointF point = diagramTransform().inverted().map(position);
     for(int i = 0; i < boxes.size(); ++i)
       if(boxes[i].contains(point))
         return i;
     return -1;
   }
+  QPainterPath diagramWire(int index) const
+  {
+    const auto nodes = card.value(QLatin1String("nodes")).toArray();
+    const auto edges = card.value(QLatin1String("edges")).toArray();
+    if(index < 0 || index >= edges.size())
+      return {};
+    const auto edge = edges[index].toArray();
+    if(edge.size() != 2)
+      return {};
+    int from = -1, to = -1;
+    for(int i = 0; i < nodes.size(); ++i)
+    {
+      const QString id = nodes[i].toObject().value(QLatin1String("id")).toString();
+      if(id == edge[0].toString())
+        from = i;
+      if(id == edge[1].toString())
+        to = i;
+    }
+    const auto boxes = diagramBoxes();
+    if(from < 0 || to < 0 || from >= boxes.size() || to >= boxes.size())
+      return {};
+    const auto a = boxes[from], b = boxes[to];
+    const QPointF delta = b.center() - a.center();
+    if(delta.manhattanLength() < 1)
+      return {};
+    auto border = [](const QRectF &box, const QPointF &direction) {
+      const double factor = qMin(box.width() * .5 / qMax(.001, std::abs(direction.x())),
+                                 box.height() * .5 / qMax(.001, std::abs(direction.y())));
+      return box.center() + direction * factor;
+    };
+    QPainterPath wire;
+    if(a.right() < b.left())
+    {
+      const QPointF start(a.right(), a.center().y()), end(b.left(), b.center().y());
+      const double bend = (start.x() + end.x()) * .5;
+      wire.moveTo(start);
+      wire.cubicTo(QPointF(bend, start.y()), QPointF(bend, end.y()), end);
+    }
+    else
+    {
+      wire.moveTo(border(a, delta));
+      wire.lineTo(border(b, -delta));
+    }
+    return wire;
+  }
+  int diagramEdgeAt(const QPointF &position) const
+  {
+    const auto transform = diagramTransform();
+    double nearestDistanceSquared = 7.0 * 7.0;
+    int nearest = -1;
+    for(int i = 0; i < qMin(24, card.value(QLatin1String("edges")).toArray().size()); ++i)
+    {
+      // Several wires converge within the hit tolerance. Pick the closest
+      // visible curve rather than whichever edge was serialized first.
+      for(const auto &polygon : transform.map(diagramWire(i)).toSubpathPolygons())
+      {
+        for(int j = 1; j < polygon.size(); ++j)
+        {
+          const QPointF a = polygon[j - 1], delta = polygon[j] - a;
+          const double lengthSquared = QPointF::dotProduct(delta, delta);
+          const double t =
+              lengthSquared > 0
+                  ? qBound(0.0, QPointF::dotProduct(position - a, delta) / lengthSquared, 1.0)
+                  : 0.0;
+          const QPointF distance = position - (a + delta * t);
+          const double squared = QPointF::dotProduct(distance, distance);
+          if(squared < nearestDistanceSquared)
+          {
+            nearestDistanceSquared = squared;
+            nearest = i;
+          }
+        }
+      }
+    }
+    return nearest;
+  }
 protected:
+  bool event(QEvent *event) override
+  {
+    if(event->type() == QEvent::ToolTip &&
+       card.value(QLatin1String("type")).toString() == QLatin1String("diagram"))
+    {
+      QHelpEvent *help = static_cast<QHelpEvent *>(event);
+      const int index = diagramNodeAt(help->pos());
+      if(index >= 0)
+      {
+        if(diagramChannelAt(index, help->pos()) >= 0)
+        {
+          QToolTip::showText(
+              help->globalPos(),
+              QCoreApplication::translate(
+                  "AIVisualReply",
+                  "Choose display channels. A single channel is shown in grayscale."),
+              this);
+          return true;
+        }
+        const QJsonObject node = card.value(QLatin1String("nodes")).toArray()[index].toObject();
+        QStringList details;
+        // i18n-ignore: JSON protocol field names, not UI labels.
+        for(const char *key : {"text", "description"})
+        {
+          const QString text = node.value(QLatin1String(key)).toString().trimmed();
+          if(!text.isEmpty())
+            details.push_back(text);
+        }
+        setToolTip(details.join(QLatin1Char('\n')));
+        QToolTip::showText(help->globalPos(), toolTip(), this);
+        return true;
+      }
+      setToolTip(QString());
+      QToolTip::hideText();
+      return true;
+    }
+    return QWidget::event(event);
+  }
   void contextMenuEvent(QContextMenuEvent *event) override
   {
     if(card.value(QLatin1String("type")).toString() != QLatin1String("diagram"))
@@ -316,7 +968,9 @@ protected:
     for(const QJsonValue &value : node.value(QLatin1String("links")).toArray())
     {
       const QJsonObject link = value.toObject();
-      const QUrl url(link.value(QLatin1String("url")).toString());
+      const QUrl url =
+          visualResourceLink(QUrl(link.value(QLatin1String("url")).toString()),
+                             eid ? eid : uint32_t(card.value(QLatin1String("eventId")).toDouble()));
       if(url.scheme() == QLatin1String("rdoc"))
         connect(menu.addAction(link.value(QLatin1String("label")).toString()), &QAction::triggered,
                 this, [this, url]() {
@@ -337,8 +991,7 @@ protected:
     {
       if(nodes.isEmpty() || nodes.size() > 12)
         return;
-      p.translate(pan);
-      p.scale(zoom, zoom);
+      p.setTransform(diagramTransform());
       const QVector<QRectF> boxes = diagramBoxes();
       QHash<QString, int> ids;
       for(int i = 0; i < nodes.size(); ++i)
@@ -380,54 +1033,68 @@ protected:
           wire.moveTo(start);
           wire.lineTo(end);
         }
-        p.setPen(QPen(palette().color(QPalette::Highlight), 2));
+        p.setPen(QPen(palette().color(QPalette::Highlight), edgeIndex == selectedEdge ? 4 : 2));
         p.drawPath(wire);
         for(double side : {-.5, .5})
           p.drawLine(end, end - QPointF(std::cos(angle + side), std::sin(angle + side)) * 8);
-        const QJsonArray labels = card.value(QLatin1String("edgeLabels")).toArray();
-        if(edgeIndex < labels.size() && !labels[edgeIndex].toString().isEmpty())
-        {
-          const QPointF center = (start + end) * .5;
-          QRectF label(center.x() - 11, center.y() - 25, 22, 22);
-          p.fillRect(label, palette().brush(QPalette::Dark));
-          p.drawText(label, Qt::AlignCenter, QString::number(edgeIndex + 1));
-        }
       }
       for(int i = 0; i < nodes.size(); ++i)
       {
         p.setBrush(palette().brush(QPalette::Base));
-        p.setPen(palette().color(QPalette::Mid));
+        p.setPen(QPen(palette().color(i == selectedNode ? QPalette::Highlight : QPalette::Mid),
+                      i == selectedNode ? 3 : 1));
         p.drawRoundedRect(boxes[i], 6, 6);
         p.setPen(palette().color(QPalette::Text));
         p.save();
         p.setClipRect(boxes[i].adjusted(4, 3, -4, -3));
         const QJsonObject node = nodes[i].toObject();
         QRectF content = boxes[i].adjusted(6, 5, -6, -5);
-        const int line = p.fontMetrics().height() + 3;
-        p.drawText(QRectF(content.left(), content.top(), content.width(), line), Qt::AlignCenter,
-                   p.fontMetrics().elidedText(node.value(QLatin1String("text")).toString(),
-                                              Qt::ElideRight, int(content.width())));
-        content.setTop(content.top() + line + 2);
-        if(i < nodeImages.size() && !nodeImages[i].isNull())
+        const QString title = node.value(QLatin1String("text")).toString();
+        const double titleHeight = diagramTextHeight(title, content.width());
+        diagramText(p, QRectF(content.topLeft(), QSizeF(content.width(), titleHeight)), title);
+        content.setTop(content.top() + titleHeight + 2);
+        if(i < nodeImages.size() && (!nodeImages[i].isNull() || !nodeSecondImages[i].isNull()))
         {
-          const double imageHeight = qBound(24.0, content.height() - 2 * line, 180.0);
-          const QRectF bounds(content.left(), content.top(), content.width(), imageHeight);
-          const QSizeF size = QSizeF(nodeImages[i].size()).scaled(bounds.size(), Qt::KeepAspectRatio);
-          p.drawImage(QRectF(bounds.center() - QPointF(size.width() / 2, size.height() / 2), size),
-                      nodeImages[i]);
-          content.setTop(content.top() + imageHeight + 4);
+          const bool paired = !nodeImages[i].isNull() && !nodeSecondImages[i].isNull();
+          const double mediaHeight = diagramMediaHeight(i, content.width());
+          const double labelHeight = diagramLabelsHeight(i, content.width());
+          for(int side = 0; side < 2; ++side)
+          {
+            if((side ? nodeSecondImages[i] : nodeImages[i]).isNull())
+              continue;
+            const QImage &image = diagramChannelImage(i, side);
+            const QRectF bounds = diagramImageBounds(i, side, boxes[i]);
+            const QSizeF size = QSizeF(image.size()).scaled(bounds.size(), Qt::KeepAspectRatio);
+            const QRectF picture(bounds.center() - QPointF(size.width() / 2, size.height() / 2),
+                                 size);
+            diagramText(p, QRectF(bounds.left(), content.top(), bounds.width(), labelHeight),
+                        diagramImageLabel(i, side, paired));
+            p.drawImage(picture, flipY ? image.mirrored(false, true) : image);
+            marks(p,
+                  node.value(side ? QLatin1String("secondAnnotations") : QLatin1String("annotations"))
+                      .toArray(),
+                  picture, flipY);
+            p.save();
+            const QRectF channels = diagramChannelRect(bounds);
+            p.setBrush(palette().brush(QPalette::Button));
+            p.setPen(palette().color(QPalette::Mid));
+            p.drawRoundedRect(channels, 3, 3);
+            p.setPen(palette().color(QPalette::ButtonText));
+            p.drawText(channels, Qt::AlignCenter, channelName(nodeChannels[i * 2 + side].mask));
+            p.restore();
+          }
+          content.setTop(content.top() + mediaHeight);
         }
-        const QStringList notes = {node.value(QLatin1String("calculation")).toString(),
-                                   node.value(QLatin1String("description")).toString()};
-        QTextOption noteFormat(Qt::AlignCenter);
-        noteFormat.setWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
-        p.drawText(content, notes.join(QLatin1Char('\n')).trimmed(), noteFormat);
+        const QString note = node.value(QLatin1String("description")).toString().simplified();
+        const double noteHeight = diagramTextHeight(note, content.width());
+        diagramText(p, QRectF(content.topLeft(), QSizeF(content.width(), noteHeight)), note);
         p.restore();
       }
       return;
     }
     if(first.isNull() ||
-       (card.value(QLatin1String("type")).toString() == QLatin1String("compare") && second.isNull()))
+       (card.value(QLatin1String("type")).toString() == QLatin1String("compare") &&
+        second.isNull() && !identicalPair))
     {
       p.setPen(palette().color(QPalette::Text));
       p.drawText(
@@ -435,8 +1102,31 @@ protected:
           QCoreApplication::translate("AIVisualReply", "Image data is unavailable or changed."));
       return;
     }
-    const QJsonArray ink = card.value(QLatin1String("annotations")).toArray();
-    const QJsonArray ink2 = card.value(QLatin1String("secondAnnotations")).toArray();
+    QJsonArray ink = card.value(QLatin1String("annotations")).toArray();
+    QJsonArray ink2 = card.value(QLatin1String("secondAnnotations")).toArray();
+    if(card.value(QLatin1String("type")).toString() == QLatin1String("compare"))
+    {
+      // A single supplied region mark describes both matched A/B views.
+      // Explicit per-image marks still take precedence when their locations differ.
+      if(ink.isEmpty())
+        ink = ink2;
+      if(ink2.isEmpty())
+        ink2 = ink;
+    }
+    if(card.value(QLatin1String("type")).toString() == QLatin1String("mesh-uv"))
+    {
+      draw(p, first, ink, QRectF(0, 0, width() / 2.0, height()));
+      draw(p, second, ink2, QRectF(width() / 2.0, 0, width() / 2.0, height()));
+      imageText(p, QRectF(8, 8, width() / 2.0 - 16, 40), QLatin1String("3D"), Qt::white);
+      imageText(p, QRectF(width() / 2.0 + 8, 8, width() / 2.0 - 16, 40), QLatin1String("UV"),
+                Qt::white);
+      return;
+    }
+    if(mode == DifferenceMode)
+    {
+      draw(p, differenceImage(), {}, rect());
+      return;
+    }
     if(second.isNull())
       draw(p, first, ink, rect());
     else if(mode == 0)
@@ -458,6 +1148,7 @@ protected:
       p.setPen(QPen(Qt::white, 2));
       p.drawLine(QPointF(width() * ratio, 0), QPointF(width() * ratio, height()));
     }
+    comparisonLabels(p);
   }
   void mousePressEvent(QMouseEvent *e) override
   {
@@ -500,31 +1191,65 @@ protected:
     if(dragging && card.value(QLatin1String("type")).toString() == QLatin1String("diagram") &&
        (e->localPos() - property("visualDiagramPress").toPointF()).manhattanLength() < 4)
     {
-      const QJsonArray nodes = card.value(QLatin1String("nodes")).toArray();
       const int i = diagramNodeAt(e->localPos());
-      if(i >= 0)
+      selectedNode = i;
+      selectedEdge = i < 0 ? diagramEdgeAt(e->localPos()) : -1;
+      setProperty("visualSelectedNode", selectedNode);
+      setProperty("visualSelectedEdge", selectedEdge);
+      if(diagramSelected)
+        diagramSelected(selectedNode, selectedEdge);
+      update();
+      if(i >= 0 && e->button() == Qt::LeftButton)
       {
-        const QJsonObject node = nodes[i].toObject();
-        const uint32_t eid = uint32_t(node.value(QLatin1String("eventId")).toDouble());
-        if(eid && nodeClicked)
-          nodeClicked(eid);
-        else if(linkClicked && !node.value(QLatin1String("links")).toArray().isEmpty())
-          linkClicked(QUrl(node.value(QLatin1String("links"))
-                               .toArray()
-                               .first()
-                               .toObject()
-                               .value(QLatin1String("url"))
-                               .toString()));
+        const int side = diagramChannelAt(i, e->localPos());
+        if(side >= 0)
+          showDiagramChannels(i, side, e->globalPos());
       }
     }
     dragging = false;
   }
+  void mouseDoubleClickEvent(QMouseEvent *e) override
+  {
+    if(card.value(QLatin1String("type")).toString() != QLatin1String("diagram"))
+      return;
+    const int i = diagramNodeAt(e->localPos());
+    if(i < 0)
+      return;
+    const auto node = card.value(QLatin1String("nodes")).toArray()[i].toObject();
+    const uint32_t eid = uint32_t(node.value(QLatin1String("eventId")).toDouble());
+    if(eid && nodeClicked)
+      nodeClicked(eid);
+    else if(linkClicked && !node.value(QLatin1String("links")).toArray().isEmpty())
+      linkClicked(visualResourceLink(QUrl(node.value(QLatin1String("links"))
+                                              .toArray()[0]
+                                              .toObject()
+                                              .value(QLatin1String("url"))
+                                              .toString()),
+                                     uint32_t(card.value(QLatin1String("eventId")).toDouble())));
+  }
   void wheelEvent(QWheelEvent *e) override
   {
-    const bool diagram = card.value(QLatin1String("type")).toString() == QLatin1String("diagram");
-    zoom = qBound(diagram ? .4 : 1.0, zoom * std::pow(1.2, e->angleDelta().y() / 120.0), 8.0);
-    if(zoom == 1)
-      pan = {};
+    const QString kind = card.value(QLatin1String("type")).toString();
+    const double nextZoom = qBound(kind == QLatin1String("diagram") ? .4 : 1.0,
+                                   zoom * std::pow(1.2, e->angleDelta().y() / 120.0), 8.0);
+    const QRectF bounds(rect());
+    QPointF center = bounds.center();
+#if QT_VERSION >= QT_VERSION_CHECK(5, 14, 0)
+    const QPointF cursor = e->position();
+#else
+    const QPointF cursor = e->posF();
+#endif
+    QPointF anchor = center;
+    if(bounds.contains(cursor))
+    {
+      anchor = cursor;
+      if(kind == QLatin1String("mesh-uv") ||
+         (kind == QLatin1String("compare") && mode == 3 && !second.isNull()))
+        center.setX(width() * (cursor.x() < center.x() ? .25 : .75));
+    }
+    // Pan and the viewport center are the unscaled part of the drawing transform.
+    pan += (anchor - center - pan) * (1.0 - nextZoom / zoom);
+    zoom = nextZoom;
     update();
     e->accept();
   }
@@ -901,6 +1626,40 @@ QString AIVisualReply::storageRoot()
   return QDir::cleanPath(root + QLatin1String("/ReplayLab/ai-visuals"));
 }
 
+QImage AIVisualReply::verifiedImage(const QJsonObject &asset)
+{
+  return imageAsset(asset, true);
+}
+
+QStringList AIVisualReply::visibleIdentities(const QJsonArray &references)
+{
+  QStringList identities;
+  QSet<QByteArray> seen;
+  for(int i = references.size() - 1; i >= qMax(0, references.size() - 8); --i)
+  {
+    const QString identity = references[i].toObject().value(QLatin1String("id")).toString();
+    if(!validIdentity(identity))
+      continue;
+    const QByteArray raw = readVerified(
+        storageRoot() + QLatin1Char('/') + identity + QLatin1String(".json"), identity, 256 * 1024);
+    const QJsonObject manifest = QJsonDocument::fromJson(raw).object();
+    if(manifest.value(QLatin1String("schema")).toString() != QLatin1String("bread-ai-visual/v1"))
+      continue;
+    QByteArray key = identity.toLatin1();
+    if(manifest.value(QLatin1String("schema")).toString() == QLatin1String("bread-ai-visual/v1"))
+      key = QCryptographicHash::hash(
+          QJsonDocument(visibleContent(manifest).toObject()).toJson(QJsonDocument::Compact),
+          QCryptographicHash::Sha256);
+    if(seen.contains(key))
+      continue;
+    seen.insert(key);
+    identities.prepend(identity);
+  }
+  // A publication revises this answer's one viewer. Historical immutable assets
+  // remain available; the final bundle contains all of its focused cards.
+  return identities.isEmpty() ? identities : QStringList{identities.last()};
+}
+
 QJsonObject AIVisualReply::navigationTarget(const QString &identity)
 {
   if(!validIdentity(identity))
@@ -908,11 +1667,55 @@ QJsonObject AIVisualReply::navigationTarget(const QString &identity)
   const QJsonObject result =
       QJsonDocument::fromJson(readVerified(storageRoot() + QLatin1String("/targets/") + identity +
                                                QLatin1String(".json"),
-                                           identity, 256 * 1024))
+                                           identity, 8 * 1024 * 1024))
           .object();
   return result.value(QLatin1String("schema")).toString() == QLatin1String("bread-ai-navigation/v1")
              ? result
              : QJsonObject();
+}
+
+QUrl AIVisualReply::resolveLegacyTextureLink(const QUrl &url, const QString &identity,
+                                             QJsonObject &capture)
+{
+  if(!validIdentity(identity))
+    return {};
+  const QJsonObject manifest =
+      QJsonDocument::fromJson(
+          readVerified(storageRoot() + QLatin1Char('/') + identity + QLatin1String(".json"),
+                       identity, 256 * 1024))
+          .object();
+  QSet<uint32_t> events;
+  auto collect = [&](const QJsonObject &item, uint32_t fallbackEid) {
+    const uint32_t ownEid = uint32_t(item.value(QLatin1String("eventId")).toDouble());
+    const uint32_t eid = ownEid ? ownEid : fallbackEid;
+    auto add = [&](const QUrl &target) {
+      if(target.scheme() != QLatin1String("rdoc") || target.path() != url.path() ||
+         (target.host() != QLatin1String("texture") && target.host() != QLatin1String("resource")))
+        return;
+      const uint32_t targetEid =
+          QUrlQuery(visualResourceLink(target, eid)).queryItemValue(QLatin1String("eid")).toUInt();
+      if(targetEid)
+        events.insert(targetEid);
+    };
+    for(const QJsonValue &link : item.value(QLatin1String("links")).toArray())
+      add(QUrl(link.toObject().value(QLatin1String("url")).toString()));
+    auto matches =
+        explanationLinkPattern().globalMatch(item.value(QLatin1String("details")).toString());
+    while(matches.hasNext())
+      add(QUrl(matches.next().captured(2)));
+  };
+  for(const QJsonValue &value : manifest.value(QLatin1String("cards")).toArray())
+  {
+    const QJsonObject card = value.toObject();
+    collect(card, 0);
+    const uint32_t eid = uint32_t(card.value(QLatin1String("eventId")).toDouble());
+    for(const QJsonValue &node : card.value(QLatin1String("nodes")).toArray())
+      collect(node.toObject(), eid);
+  }
+  if(events.size() != 1)
+    return {};
+  capture = manifest.value(QLatin1String("capture")).toObject();
+  return visualResourceLink(url, *events.constBegin());
 }
 
 int AIVisualReply::inlineHeight(const QString &identity)
@@ -925,14 +1728,17 @@ int AIVisualReply::inlineHeight(const QString &identity)
                        identity, 256 * 1024))
           .object();
   int height = 300;
+  bool stageCode = false;
   for(const QJsonValue &value : manifest.value(QLatin1String("cards")).toArray())
   {
     const QString kind = value.toObject().value(QLatin1String("type")).toString();
     height = qMax(height, kind == QLatin1String("mesh")   ? 500
                           : kind == QLatin1String("code") ? 320
                                                           : 400);
+    for(const auto &node : value.toObject().value(QLatin1String("nodes")).toArray())
+      stageCode |= !node.toObject().value(QLatin1String("codeBlocks")).toArray().isEmpty();
   }
-  return manifest.value(QLatin1String("cards")).toArray().size() == 1 &&
+  return !stageCode && manifest.value(QLatin1String("cards")).toArray().size() == 1 &&
                  manifest.value(QLatin1String("cards"))
                          .toArray()[0]
                          .toObject()
@@ -957,7 +1763,7 @@ AIVisualReply::AIVisualReply(const QString &identity, Navigate navigate, QWidget
                          identity, 256 * 1024)
           : QByteArray();
   const QJsonObject manifest = QJsonDocument::fromJson(manifestBytes).object();
-  const QJsonArray cards = manifest.value(QLatin1String("cards")).toArray();
+  QJsonArray cards = manifest.value(QLatin1String("cards")).toArray();
   if(manifest.value(QLatin1String("schema")).toString() != QLatin1String("bread-ai-visual/v1") ||
      cards.isEmpty() || cards.size() > 6)
   {
@@ -965,14 +1771,69 @@ AIVisualReply::AIVisualReply(const QString &identity, Navigate navigate, QWidget
         tr("Visual explanation unavailable. Its saved data is missing or changed."), this));
     return;
   }
+  // Group comparisons first, preserving the order within each group and the saved bundle.
+  QJsonArray orderedCards;
+  for(bool compare : {true, false})
+    for(const QJsonValue &value : cards)
+      if((value.toObject().value(QLatin1String("type")).toString() == QLatin1String("compare")) ==
+         compare)
+        orderedCards.append(value);
+  cards = orderedCards;
+
+  // Stage source follows the visual cards. The detail pane links to the corresponding code page.
+  QJsonArray stagePages;
+  const int visualCount = cards.size();
+  for(int i = 0; i < visualCount; ++i)
+  {
+    auto card = cards[i].toObject();
+    if(card.value(QLatin1String("type")).toString() != QLatin1String("diagram"))
+      continue;
+    auto nodes = card.value(QLatin1String("nodes")).toArray();
+    for(int j = 0; j < nodes.size(); ++j)
+    {
+      auto node = nodes[j].toObject();
+      const auto blocks = node.value(QLatin1String("codeBlocks")).toArray();
+      if(blocks.isEmpty())
+        continue;
+      node[QLatin1String("codePage")] = visualCount + stagePages.size();
+      nodes[j] = node;
+      stagePages.append(QJsonObject{
+          {QLatin1String("type"), QLatin1String("code")},
+          {QLatin1String("title"), tr("Code: %1").arg(node.value(QLatin1String("text")).toString())},
+          {QLatin1String("codeBlocks"), blocks},
+          {QLatin1String("eventId"), node.value(QLatin1String("eventId"))},
+          {QLatin1String("links"), node.value(QLatin1String("links"))}});
+    }
+    card[QLatin1String("nodes")] = nodes;
+    cards[i] = card;
+  }
+  for(const auto &page : stagePages)
+    cards.append(page);
   const QJsonObject capture = manifest.value(QLatin1String("capture")).toObject();
   QHBoxLayout *header = new QHBoxLayout();
   QComboBox *selector = new QComboBox(this);
   selector->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
   selector->setMinimumWidth(80);
   for(const QJsonValue &value : cards)
-    selector->addItem(value.toObject().value(QLatin1String("title")).toString().left(160));
+    selector->addItem(
+        presentationTitle(value.toObject().value(QLatin1String("title")).toString()).left(160));
   header->addWidget(selector, 1);
+  QSlider *pages = new QSlider(Qt::Horizontal, this);
+  pages->setObjectName(QLatin1String("aiVisualPageSlider"));    // i18n-ignore: automation identifier.
+  pages->setRange(0, cards.size() - 1);
+  pages->setSingleStep(1);
+  pages->setPageStep(1);
+  pages->setTickPosition(QSlider::TicksBelow);
+  pages->setTickInterval(1);
+  pages->setMinimumWidth(44);
+  pages->setMaximumWidth(100);
+  pages->setEnabled(cards.size() > 1);
+  pages->setAccessibleName(tr("Explanation page"));
+  pages->setToolTip(tr("Drag to switch explanations"));
+  header->addWidget(pages);
+  connect(pages, &QSlider::valueChanged, selector, &QComboBox::setCurrentIndex);
+  connect(selector, static_cast<void (QComboBox::*)(int)>(&QComboBox::currentIndexChanged), pages,
+          &QSlider::setValue);
   QPushButton *expand = new QPushButton(tr("Expand"), this);
   header->addWidget(expand);
   layout->addLayout(header);
@@ -983,6 +1844,7 @@ AIVisualReply::AIVisualReply(const QString &identity, Navigate navigate, QWidget
     dialog->resize(1000, 760);
     QVBoxLayout *body = new QVBoxLayout(dialog);
     AIVisualReply *reply = new AIVisualReply(identity, navigate, dialog);
+    reply->setComparisonMode(m_ComparisonMode);
     if(QComboBox *combo = reply->findChild<QComboBox *>())
       combo->setCurrentIndex(selector->currentIndex());
     body->addWidget(reply);
@@ -1000,7 +1862,7 @@ AIVisualReply::AIVisualReply(const QString &identity, Navigate navigate, QWidget
     const QString kind = card.value(QLatin1String("type")).toString();
     if(kind != QLatin1String("image") && kind != QLatin1String("compare") &&
        kind != QLatin1String("mesh") && kind != QLatin1String("diagram") &&
-       kind != QLatin1String("code"))
+       kind != QLatin1String("code") && kind != QLatin1String("mesh-uv"))
     {
       body->addWidget(new QLabel(tr("This visual card is invalid."), page));
       stack->addWidget(page);
@@ -1011,51 +1873,32 @@ AIVisualReply::AIVisualReply(const QString &identity, Navigate navigate, QWidget
     caption->setWordWrap(true);
     caption->setMaximumHeight(44);
     caption->setToolTip(caption->text());
-    if(!caption->text().isEmpty())
+    if(!caption->text().isEmpty() && kind != QLatin1String("compare") && kind != QLatin1String("code"))
       body->addWidget(caption);
+    else
+      caption->hide();
     if(kind == QLatin1String("code"))
     {
-      const QJsonObject code = card.value(QLatin1String("code")).toObject();
-      const bool example = code.value(QLatin1String("example")).toBool();
-      QLabel *hint = new QLabel(
-          example ? tr("Example code. Click to locate the corresponding Shader calculation.")
-                  : tr("Saved %1 source; click a line to open Shader Workspace")
-                        .arg(code.value(QLatin1String("language")).toString()),
-          page);
+      QLabel *hint = new QLabel(tr("Click code to open the Shader calculation."), page);
       hint->setWordWrap(true);
       body->addWidget(hint);
       QTextBrowser *source = new QTextBrowser(page);
       source->setObjectName(QLatin1String("aiVisualCode"));
       source->setOpenLinks(false);
       source->setOpenExternalLinks(false);
-      QString html = QLatin1String(
-          "<table width=\"100%\" cellpadding=\"3\" style=\"font-family:Consolas,monospace;\">");
-      const QStringList lines =
-          code.value(QLatin1String("text")).toString().left(16000).split(QLatin1Char('\n'));
-      bool blockComment = false;
-      for(int i = 0; i < qMin(120, lines.size()); ++i)
+      auto blocks = card.value(QLatin1String("codeBlocks")).toArray();
+      if(blocks.isEmpty())
+        blocks.append(card.value(QLatin1String("code")));
+      QString html;
+      for(const auto &blockValue : blocks)
       {
-        QUrl url(code.value(QLatin1String("url")).toString());
-        QUrlQuery query(url);
-        const int startLine = code.value(QLatin1String("startLine")).toInt(1);
-        const QString number = QString::number(example ? i + 1 : startLine + i);
-        query.removeAllQueryItems(QLatin1String("line"));
-        query.addQueryItem(QLatin1String("line"),
-                           QString::number(example ? startLine : startLine + i));
-        url.setQuery(query);
-        const QString href = url.toString(QUrl::FullyEncoded).toHtmlEscaped();
-        html += QLatin1String("<tr><td width=\"40\"><a href=\"") + href + QLatin1String("\">") +
-                number +
-                QLatin1String(
-                    "</a></td><td style=\"white-space:pre;\"><a style=\"text-decoration:none;\" "
-                    "href=\"") +
-                href + QLatin1String("\">") +
-                AICodeFormatting::highlightedSourceLine(
-                    lines[i], code.value(QLatin1String("language")).toString(), blockComment,
-                    source->palette()) +
-                QLatin1String("</a></td></tr>");
+        const auto code = blockValue.toObject();
+        const QString title = code.value(QLatin1String("title")).toString();
+        if(!title.isEmpty())
+          html += QLatin1String("<h4>") + title.toHtmlEscaped() + QLatin1String("</h4>");
+        html += codeHtml(code, source->palette());
       }
-      source->setHtml(html + QLatin1String("</table>"));
+      source->setHtml(html);
       body->addWidget(source, 1);
       connect(source, &QTextBrowser::anchorClicked, page, [navigate, capture](const QUrl &url) {
         if(navigate)
@@ -1068,9 +1911,8 @@ AIVisualReply::AIVisualReply(const QString &identity, Navigate navigate, QWidget
                                   .toObject()
                                   .value(QLatin1String("type"))
                                   .toString(QLatin1String("none")) != QLatin1String("none");
-      QLabel *badge = new QLabel(effectDemo ? tr("Algorithm demonstration; replay unchanged")
-                                            : tr("Material illustration; replay unchanged"),
-                                 page);
+      QLabel *badge =
+          new QLabel(effectDemo ? tr("Algorithm illustration") : tr("Material preview"), page);
       badge->setWordWrap(true);
       body->addWidget(badge);
       const QJsonObject info = card.value(QLatin1String("geometryInfo")).toObject();
@@ -1271,7 +2113,17 @@ AIVisualReply::AIVisualReply(const QString &identity, Navigate navigate, QWidget
     else
     {
       VisualCanvas *view = new VisualCanvas(card, page);
-      body->addWidget(view, 1);
+      QSplitter *flowPanels = NULL;
+      if(kind == QLatin1String("diagram"))
+      {
+        flowPanels = new QSplitter(Qt::Vertical, page);
+        flowPanels->setObjectName(QLatin1String("aiVisualFlowPanels"));
+        flowPanels->setChildrenCollapsible(false);
+        flowPanels->addWidget(view);
+        body->addWidget(flowPanels, 1);
+      }
+      else
+        body->addWidget(view, 1);
       view->nodeClicked = [navigate, capture](uint32_t eid) {
         if(eid && navigate)
           navigate(QUrl(QLatin1String("rdoc://event/") + QString::number(eid)), capture);
@@ -1281,12 +2133,15 @@ AIVisualReply::AIVisualReply(const QString &identity, Navigate navigate, QWidget
           navigate(url, capture);
       };
       view->setToolTip(tr("Wheel to zoom; drag to move the image or comparison divider."));
-      if(kind == QLatin1String("image") || kind == QLatin1String("compare"))
+      QToolButton *flip = nullptr;
+      if(kind == QLatin1String("image") || kind == QLatin1String("compare") ||
+         kind == QLatin1String("mesh-uv"))
       {
-        QToolButton *flip = new QToolButton(page);
+        flip = new QToolButton(page);
         flip->setText(tr("Flip Y"));
         flip->setCheckable(true);
-        body->addWidget(flip, 0, Qt::AlignRight);
+        if(kind != QLatin1String("compare"))
+          body->addWidget(flip, 0, Qt::AlignRight);
         connect(flip, &QToolButton::toggled, view, [view](bool on) {
           view->flipY = on;
           view->pan = {};
@@ -1296,35 +2151,50 @@ AIVisualReply::AIVisualReply(const QString &identity, Navigate navigate, QWidget
       if(kind == QLatin1String("compare"))
       {
         QHBoxLayout *controls = new QHBoxLayout();
-        const QString names[] = {tr("Before"), tr("After"), tr("Wipe"), tr("Side by side")};
-        for(int i = 0; i < 4; i++)
+        QButtonGroup *modes = new QButtonGroup(page);
+        modes->setExclusive(true);
+        const QString names[] = {tr("Before / After"), tr("Wipe"), tr("Side by side"),
+                                 tr("Difference")};
+        for(int i : {0, 2, 3, VisualCanvas::DifferenceMode})
         {
           QToolButton *button = new QToolButton(page);
-          button->setText(names[i]);
+          button->setText(names[i == 0 ? 0 : i - 1]);
+          button->setCheckable(true);
+          modes->addButton(button, i);
           controls->addWidget(button);
-          if(i == 2 && view->first.size() != view->second.size())
+          if(i == 0)
+          {
+            button->setObjectName(QLatin1String("aiVisualToggleAB"));
+            button->setToolTip(tr("Click to switch between the two images"));
+          }
+          if(i == VisualCanvas::DifferenceMode)
+          {
+            button->setObjectName(
+                QLatin1String("aiVisualDifference"));    // i18n-ignore: test identifier.
+            button->setToolTip(tr(
+                "Compare matching pixels. Black means no change; brighter pixels changed more."));
+          }
+          if(view->second.isNull() ||
+             ((i == 2 || i == VisualCanvas::DifferenceMode) && !view->hasAlignedPair()))
             button->setEnabled(false);
-          connect(button, &QToolButton::clicked, view, [view, i]() {
-            view->mode = i;
-            view->setProperty("visualCompareMode", i);
-            view->update();
-          });
+          connect(button, &QToolButton::clicked, view,
+                  [this, view, i]() { setComparisonMode(i == 0 ? (view->mode == 0 ? 1 : 0) : i); });
         }
         QSlider *divider = new QSlider(Qt::Horizontal, page);
         divider->setRange(0, 100);
         divider->setValue(50);
+        divider->setEnabled(view->hasAlignedPair());
         controls->addWidget(divider, 1);
         // i18n-ignore: stable object identifier for native UI checks.
         divider->setObjectName(QLatin1String("aiVisualDivider"));
         view->ratioChanged = [divider](int n) { divider->setValue(n); };
-        connect(divider, &QSlider::valueChanged, view, [view](int n) {
+        view->modeChanged = [modes](int i) { modes->button(i < 2 ? 0 : i)->setChecked(true); };
+        connect(divider, &QSlider::valueChanged, view, [this, view](int n) {
           view->ratio = n / 100.0;
           view->setProperty("visualWipeRatio", view->ratio);
-          view->update();
+          setComparisonMode(2);
         });
-        if(view->first.size() != view->second.size())
-          view->mode = 3;
-        body->addLayout(controls);
+        view->applyComparisonMode(m_ComparisonMode);
         const QJsonObject experiment = card.value(QLatin1String("experiment")).toObject();
         const QJsonArray roi = experiment.value(QLatin1String("roi")).toArray();
         if(experiment.value(QLatin1String("verified")).toBool() && roi.size() == 4)
@@ -1354,69 +2224,116 @@ AIVisualReply::AIVisualReply(const QString &identity, Navigate navigate, QWidget
             focus->setChecked(true);
           }
         }
-        QLabel *labels = new QLabel(experiment.value(QLatin1String("verified")).toBool()
-                                        ? tr("Controlled A/B/A experiment; replay restored")
-                                        : tr("Stage/reference comparison; an isolated effect "
-                                             "toggle requires separate evidence."),
-                                    page);
-        labels->setWordWrap(true);
-        body->addWidget(labels);
-        const QString firstHash =
-            card.value(QLatin1String("image")).toObject().value(QLatin1String("sha256")).toString();
-        if(!firstHash.isEmpty() && firstHash == card.value(QLatin1String("secondImage"))
-                                                    .toObject()
-                                                    .value(QLatin1String("sha256"))
-                                                    .toString())
-          body->addWidget(new QLabel(tr("The two saved previews have identical pixels."), page));
-        QString before = card.value(QLatin1String("beforeLabel")).toString(),
-                after = card.value(QLatin1String("afterLabel")).toString();
-        if(experiment.value(QLatin1String("verified")).toBool())
-        {
-          if(before.isEmpty())
-            before = tr("Baseline calculation");
-          if(after.isEmpty())
-            after = tr("Experimental calculation");
-        }
-        if(!before.isEmpty() || !after.isEmpty())
-        {
-          QLabel *description = new QLabel(tr("A: %1    B: %2").arg(before, after), page);
-          description->setTextFormat(Qt::PlainText);
-          description->setWordWrap(true);
-          description->setMaximumHeight(44);
-          description->setToolTip(description->text());
-          body->addWidget(description);
-        }
+        controls->addWidget(flip);
+        body->addLayout(controls);
       }
-      else if(kind == QLatin1String("image"))
+      else if(kind == QLatin1String("diagram"))
       {
-        QLabel *badge = new QLabel(
-            card.value(QLatin1String("image")).toObject().value(QLatin1String("provenance")).toString() ==
-                    QLatin1String("captured")
-                ? tr("Captured RT")
-                : tr("Reference image"),
-            page);
-        body->addWidget(badge);
-      }
-      else
-      {
-        body->addWidget(new QLabel(
-            tr("Click a node to navigate; right-click for Shader and parameter links."), page));
-        QStringList explanations;
-        const QJsonArray labels = card.value(QLatin1String("edgeLabels")).toArray();
-        for(int i = 0; i < labels.size(); i++)
-          if(!labels[i].toString().isEmpty())
-            // i18n-ignore: numeric diagram edge identifiers precede complete model-authored text.
-            explanations.push_back(QString::number(i + 1) + QLatin1String(". ") +
-                                   labels[i].toString());
-        if(!explanations.isEmpty())
-        {
-          QTextBrowser *notes = new QTextBrowser(page);
-          notes->setPlainText(explanations.join(QLatin1Char('\n')));
-          // i18n-ignore: stable native identifier for the diagram's edge legend.
-          notes->setObjectName(QLatin1String("aiVisualFlowNotes"));
-          notes->setMaximumHeight(qMin(100, explanations.size() * 22 + 8));
-          body->addWidget(notes);
-        }
+        QWidget *detailPanel = new QWidget(flowPanels);
+        QVBoxLayout *detailLayout = new QVBoxLayout(detailPanel);
+        detailLayout->setContentsMargins(0, 0, 0, 0);
+        detailLayout->addWidget(new QLabel(tr("Select a stage or connection for its calculation; "
+                                              "double-click a stage to navigate."),
+                                           detailPanel));
+        QTextBrowser *notes = new QTextBrowser(detailPanel);
+        // i18n-ignore: stable native identifier for the selected calculation panel.
+        notes->setObjectName(QLatin1String("aiVisualFlowNotes"));
+        notes->setOpenLinks(false);
+        notes->setOpenExternalLinks(false);
+        notes->setMinimumHeight(90);
+        notes->setPlainText(tr("Select a stage or connection to see how it is calculated."));
+        detailLayout->addWidget(notes, 1);
+        QToolButton *stageSource = new QToolButton(detailPanel);
+        stageSource->setObjectName(QLatin1String("aiVisualStageSource"));
+        stageSource->setText(tr("View stage code"));
+        stageSource->hide();
+        detailLayout->addWidget(stageSource, 0, Qt::AlignRight);
+        connect(stageSource, &QToolButton::clicked, selector, [selector, stageSource]() {
+          selector->setCurrentIndex(stageSource->property("sourcePage").toInt());
+        });
+        flowPanels->addWidget(detailPanel);
+        flowPanels->setStretchFactor(0, 3);
+        flowPanels->setStretchFactor(1, 2);
+        flowPanels->setSizes({300, 200});
+        connect(notes, &QTextBrowser::anchorClicked, page, [navigate, capture](const QUrl &url) {
+          if(navigate && url.scheme() == QLatin1String("rdoc"))
+            navigate(url, capture);
+        });
+        view->diagramSelected = [notes, card, stageSource](int index, int edge) {
+          const auto nodes = card.value(QLatin1String("nodes")).toArray();
+          QString title, details, calculation;
+          QJsonArray links;
+          int sourcePage = -1;
+          uint32_t eid = uint32_t(card.value(QLatin1String("eventId")).toDouble());
+          if(index >= 0 && index < nodes.size())
+          {
+            const auto node = nodes[index].toObject();
+            title = node.value(QLatin1String("text")).toString();
+            details = node.value(QLatin1String("details")).toString();
+            if(details.isEmpty())
+              details = node.value(QLatin1String("description")).toString();
+            calculation = node.value(QLatin1String("calculation")).toString();
+            links = node.value(QLatin1String("links")).toArray();
+            sourcePage = node.value(QLatin1String("codePage")).toInt(-1);
+            const uint32_t nodeEid = uint32_t(node.value(QLatin1String("eventId")).toDouble());
+            if(nodeEid)
+            {
+              eid = nodeEid;
+              links.append(QJsonObject{
+                  {QLatin1String("label"), tr("EID %1").arg(eid)},
+                  {QLatin1String("url"), QLatin1String("rdoc://event/") + QString::number(eid)}});
+            }
+          }
+          else if(edge >= 0 && edge < card.value(QLatin1String("edges")).toArray().size())
+          {
+            const auto labels = card.value(QLatin1String("edgeLabels")).toArray();
+            const auto descriptions = card.value(QLatin1String("edgeDetails")).toArray();
+            if(edge < labels.size())
+              title = labels[edge].toString();
+            if(edge < descriptions.size())
+              details = descriptions[edge].toString();
+            const auto ends = card.value(QLatin1String("edges")).toArray()[edge].toArray();
+            if(ends.size() == 2)
+              for(const auto &value : nodes)
+                if(value.toObject().value(QLatin1String("id")) == ends[1])
+                {
+                  const auto node = value.toObject();
+                  const uint32_t nodeEid = uint32_t(node.value(QLatin1String("eventId")).toDouble());
+                  if(nodeEid)
+                    eid = nodeEid;
+                  if(details.isEmpty())
+                    details = node.value(QLatin1String("details")).toString();
+                  calculation = node.value(QLatin1String("calculation")).toString();
+                  links = node.value(QLatin1String("links")).toArray();
+                  sourcePage = node.value(QLatin1String("codePage")).toInt(-1);
+                }
+          }
+          QString html = QLatin1String("<b>") + title.toHtmlEscaped() + QLatin1String("</b>");
+          if(!details.isEmpty())
+            html += QLatin1String("<p>") + explanationHtml(details, eid) + QLatin1String("</p>");
+          if(!calculation.isEmpty())
+            html += calculationHtml(calculation, notes->palette());
+          QSet<QString> seenLinks;
+          for(const auto &value : links)
+          {
+            const auto link = value.toObject();
+            const QUrl url =
+                visualResourceLink(QUrl(link.value(QLatin1String("url")).toString()), eid);
+            const QString identity = url.toString(QUrl::FullyEncoded);
+            if(url.scheme() == QLatin1String("rdoc") && !seenLinks.contains(identity))
+            {
+              seenLinks.insert(identity);
+              html += QLatin1String(" <a href=\"") + identity.toHtmlEscaped() +
+                      QLatin1String("\">") +
+                      link.value(QLatin1String("label")).toString().toHtmlEscaped() +
+                      QLatin1String("</a>");
+            }
+          }
+          stageSource->setProperty("sourcePage", sourcePage);
+          stageSource->setVisible(sourcePage >= 0);
+          notes->setHtml(html);
+          notes->verticalScrollBar()->setValue(0);
+        };
       }
     }
     QGridLayout *links = new QGridLayout();
@@ -1451,11 +2368,23 @@ AIVisualReply::AIVisualReply(const QString &identity, Navigate navigate, QWidget
     {
       const QJsonObject link = extraLinks[linkIndex].toObject();
       addLink(link.value(QLatin1String("label")).toString().left(160),
-              QUrl(link.value(QLatin1String("url")).toString()));
+              visualResourceLink(QUrl(link.value(QLatin1String("url")).toString()),
+                                 uint32_t(card.value(QLatin1String("eventId")).toDouble())));
     }
     body->addLayout(links);
     stack->addWidget(page);
   }
   connect(selector, static_cast<void (QComboBox::*)(int)>(&QComboBox::currentIndexChanged), stack,
           &QStackedWidget::setCurrentIndex);
+}
+
+void AIVisualReply::setComparisonMode(int mode)
+{
+  m_ComparisonMode = mode;
+  for(QWidget *widget : findChildren<QWidget *>(QLatin1String("aiVisualImageCanvas")))
+  {
+    VisualCanvas *view = static_cast<VisualCanvas *>(widget);
+    if(view->card.value(QLatin1String("type")).toString() == QLatin1String("compare"))
+      view->applyComparisonMode(mode);
+  }
 }

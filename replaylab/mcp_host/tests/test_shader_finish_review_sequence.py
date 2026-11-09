@@ -85,6 +85,50 @@ def test_complete_source_review_allows_final_validation_without_prior_compile(dr
     assert work.manager.validate_publication_gate(str(work.root))["finalSourceSha256"] == hashlib.sha256(proposal.read_bytes()).hexdigest()
 
 
+def test_visual_code_requires_current_reviewed_shader(draft, monkeypatch, tmp_path):
+    from src import visual_replies
+
+    work, opened = draft
+    monkeypatch.setattr(visual_replies, "root_path", lambda: tmp_path / "visuals")
+    monkeypatch.setattr(server, "get_current_renderdoc_context",
+                        lambda: json.dumps({"capture": {"captureSessionId": "capture-test"}}))
+    report = mock.Mock()
+    monkeypatch.setattr(server, "current_task_report_store", lambda: report)
+    report.enabled = False
+    report.register_reply_visual.return_value = True
+
+    def publish_code():
+        digest = hashlib.sha256(work.service.source_path.read_bytes()).hexdigest()
+        block = dict(workspacePath=str(work.root), expectedSourceSha256=digest, startLine=1, endLine=2)
+        cards = [
+            server.VisualReplyCard(type="code", title="Key calculation", **block),
+            server.VisualReplyCard(type="diagram", title="Flow", nodes=[
+                {"id": "calculation", "text": "Calculation", "codeBlocks": [block]},
+            ]),
+        ]
+        return json.loads(server.publish_visual_reply("Shader explanation", cards))
+
+    assert "Organize and validate this Shader" in publish_code()["error"]
+    report.register_reply_visual.assert_not_called()
+    proposal = Path(opened["proposalSourcePath"])
+    proposal.write_bytes(b"// Reviewed calculation\n" + work.original)
+    assess(work, opened)
+    final = json.loads(server.finish_shader_workspace_organization(
+        str(work.root), opened["organizationId"], validate_for_apply=True, source_review_policy="strict",
+    ))
+    assert final["wholeSourceValidated"], final
+    published = publish_code()
+    assert published.get("publishedToChat"), published
+    manifest = json.loads(Path(published["path"]).read_text(encoding="utf-8"))
+    finalized_sha = work.manager.validate_publication_gate(str(work.root))["finalSourceSha256"]
+    for excerpt in (manifest["cards"][0]["code"], manifest["cards"][1]["nodes"][0]["codeBlocks"][0]):
+        assert "Reviewed calculation" in excerpt["text"]
+        assert excerpt["sha256"] == finalized_sha
+    work.service.source_path.write_bytes(b"// Later unvalidated change\n" + proposal.read_bytes())
+    assert "Organize and validate this Shader" in publish_code()["error"]
+    assert report.register_reply_visual.call_count == 1
+
+
 @pytest.mark.parametrize("flag", ["validate_for_apply", "apply_shared_resource", "start_live_edit"])
 def test_checkpoint_rejects_physical_effect_flags(draft, flag):
     work, opened = draft

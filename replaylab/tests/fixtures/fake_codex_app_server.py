@@ -16,6 +16,7 @@ post_login_account_reads = 0
 mcp_status_reads = 0
 thread_config = {}
 turn_count = 0
+account_reads = 0
 trace_path = Path(sys.argv[2]) if len(sys.argv) > 2 else None
 
 
@@ -120,6 +121,17 @@ for line in sys.stdin:
             continue
         send({"id": request_id, "result": {"userAgent": "fake"}})
     elif method == "account/read":
+        account_reads += 1
+        if mode.startswith('account-read-'):
+            fail = mode != 'account-read-routing-once' or account_reads == 1
+            if fail:
+                code, text = {
+                    'account-read-auth': (-32001, 'Unauthorized: sign in again'),
+                    'account-read-invalid': (-32602, 'invalid account/read params'),
+                    'account-read-internal': (-32603, 'unrelated internal failure'),
+                }.get(mode, (-32603, 'workspace routing discovery timed out'))
+                send({'id': request_id, 'error': {'code': code, 'message': text}})
+                continue
         if mode in {"login-race", "login-update-first"}:
             if login_completed:
                 post_login_account_reads += 1

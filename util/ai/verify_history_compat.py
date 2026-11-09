@@ -69,10 +69,29 @@ int main(int argc, char **argv) {
  QFile corrupt(current);require(corrupt.open(QIODevice::WriteOnly),"write corrupt fixture");corrupt.write("invalid");corrupt.close();
  require(!AIConversationStore::Load(capture,&second,&error)&&!error.isEmpty(),"corrupt primary is never overwritten");
  require(bytes(current)=="invalid","corrupt original preserved");
+ const QString largeCapture=QDir(local).filePath("large-history.rdc");
+ const auto attachmentRow=[](const char *id, QChar byte) {
+   QJsonObject message=row(id,"image attached");
+   message["attachments"]=QJsonArray{QJsonObject{{"content",QString(3 * 1024 * 1024, byte)}}};
+   return message;
+ };
+ const QJsonObject largeOlder=attachmentRow("older",QLatin1Char('A'));
+ const QJsonObject largeNewer=attachmentRow("newer",QLatin1Char('B'));
+ root=QDir(roaming).filePath("q_render_soco_doc");
+ require(AIConversationStore::Save(largeCapture,payload(QJsonArray{largeOlder}),&error),"large legacy save");
+ const QString largeLegacy=AIConversationStore::StoragePathForCapture(largeCapture);
+ const QByteArray originalLargeLegacy=bytes(largeLegacy);
+ root=QDir(local).filePath("RenderDocBread/ui");
+ require(AIConversationStore::Save(largeCapture,payload(QJsonArray{largeNewer}),&error),"large active save");
+ require(AIConversationStore::Load(largeCapture,&second,&error)&&error.isEmpty(),"merge beyond 4 MiB");
+ const auto combined=QJsonDocument::fromJson(second).object()["conversations"].toArray()[0].toObject()["messages"].toArray();
+ require(combined==QJsonArray{largeOlder,largeNewer}&&second.size()>6*1024*1024,"preserve both attachment contents");
+ require(bytes(largeLegacy)==originalLargeLegacy,"preserve large legacy original");
+ require(AIConversationStore::Load(largeCapture,&restored,&error)&&restored==second,"reopen enlarged archive");
  QProcess child;ConfigureBackgroundProcess(&child);child.start(app.applicationFilePath(),QStringList{"--child"});
  require(child.waitForFinished(5000),"background process finished");
  require(child.exitCode()==0&&child.readAllStandardOutput()=="hidden","actual child has no console");
- printf("{\"ok\":true,\"checks\":[\"legacy-restore\",\"old-and-new-preserved\",\"idempotent-load\",\"same-thread-merge\",\"concurrent-thread-preservation\",\"stale-deletion-preservation\",\"isolated-profile\",\"capture-separation\",\"corrupt-preservation\",\"hidden-native-child\"]}");
+ printf("{\"ok\":true,\"checks\":[\"legacy-restore\",\"old-and-new-preserved\",\"idempotent-load\",\"same-thread-merge\",\"concurrent-thread-preservation\",\"stale-deletion-preservation\",\"isolated-profile\",\"capture-separation\",\"corrupt-preservation\",\"large-archive-and-legacy-attachments\",\"hidden-native-child\"]}");
  return 0;
 }
 '''

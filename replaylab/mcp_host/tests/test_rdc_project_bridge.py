@@ -150,16 +150,10 @@ class _Replay:
     def BlockInvoke(self, callback):
         callback(self.controller)
 
-    def AsyncInvoke(self, *args):
-        if len(args) == 1:
-            tag = ""
-            callback = args[0]
-        elif len(args) == 2:
-            tag, callback = args
-        else:
-            raise TypeError("AsyncInvoke expects callback or tag, callback")
+    def AsyncInvoke(self, method, tag=""):
+        assert callable(method) and isinstance(tag, str)
         self.async_tags.append(tag)
-        self._async_queue.append(callback)
+        self._async_queue.append(method)
         if self._draining_async:
             return
         self._draining_async = True

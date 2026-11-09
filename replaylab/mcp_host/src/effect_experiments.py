@@ -93,8 +93,30 @@ def model_previews(result):
     return previews
 
 
-def run(server,workspace_path,expected_source_sha256,edits,observation_event_id,
-        attachment_index=0,roi=None,flip_y=False,label='',related_edits=None):
+def baseline_control_scope(control,region):
+    effect=control.get('effectObservation')or{}
+    if not effect.get('conclusive'):return ''
+    if control.get('accepted'):return 'full-output'
+    metrics=effect.get('metrics')or[]
+    # Local attribution may use its explicitly requested region. Keep the full
+    # output's rejected metrics in the receipt, retain the same tolerances and
+    # require the full repeat-stability check. This never validates other pixels.
+    if region!=[0.,0.,1.,1.] and metrics and all(m.get('accepted')for m in metrics):
+        return 'requested-region'
+    return ''
+
+
+def run(server,workspace_path,expected_source_sha256,edits,observation_event_id=0,
+        attachment_index=0,roi=None,flip_y=False,label='',related_edits=None,display_transfer='auto',
+        observation_scope='auto'):
+    if display_transfer not in ('auto','identity','linear-to-srgb'):raise ValueError('Unknown effect display transfer')
+    if observation_scope not in ('auto', 'appearance', 'stage'):
+        raise ValueError('Unknown effect observation scope')
+    final_output = (observation_scope == 'appearance'
+                    or (observation_scope == 'auto' and observation_event_id == 0))
+    if (type(observation_event_id) is not int or observation_event_id < 0
+            or (not final_output and not observation_event_id) or not 0 <= attachment_index <= 63):
+        raise ValueError('A stage observation requires a positive event and a bounded RTV index')
     service=server._shader_workspace_service()
     from .shader_workspace.errors import ManifestValidationError
     root=service._workspace_root(workspace_path)
@@ -126,9 +148,30 @@ def run(server,workspace_path,expected_source_sha256,edits,observation_event_id,
     region=roi if roi is not None else [0.,0.,1.,1.]
     if (len(region)!=4 or any(isinstance(v,bool) or not isinstance(v,(int,float)) or not math.isfinite(v)or not 0<=v<=1 for v in region)
             or region[0]>=region[2]or region[1]>=region[3]):raise ValueError('ROI must be normalized [left,top,right,bottom]')
-    if not isinstance(observation_event_id,int)or observation_event_id<=0 or not 0<=attachment_index<=63:
-        raise ValueError('A positive output event and a bounded RTV index are required')
     anchor=server._shader_organization_anchor_event(status)
+    presentation = {}
+    if final_output:
+        capture_id = status['capture']['captureId']
+        resolution = server.ipc.call('resolve_shader_effect_presentation', dict(
+            expected_capture_id=capture_id, expected_capture_session_id=session,
+            source_event_id=anchor, observation_event_id=observation_event_id))
+        if (resolution.get('captureId') != capture_id or resolution.get('captureSessionId') != session
+                or resolution.get('sourceEventId') != anchor):
+            raise ValueError('Final output resolution does not match the Shader capture and source event')
+        target = resolution.get('target')
+        if target is None:
+            count = resolution['candidateCount']
+            return dict(ok=False, phase='presentation-selection', applied=False,
+                        candidates=resolution['candidates'], candidateCount=count,
+                        reason=('Resolve the matching Present and pass its exact event ID'
+                                if count > 1 else 'No captured Present with a destination was found after the Shader event'))
+        presentation = dict(requestedEventId=observation_event_id, eventId=target['eventId'],
+                            resourceId=target['resourceId'],
+                            retargeted=bool(observation_event_id and observation_event_id != target['eventId']))
+        observation_event_id, attachment_index = target['eventId'], 0
+        # The captured output decides display transfer; a stale override can double-encode
+        # even when the requested EID already names the correct Present.
+        display_transfer = 'auto'
     companions = []
     scope = None
     if status['stage'] == 'vertex':
@@ -184,7 +227,7 @@ def run(server,workspace_path,expected_source_sha256,edits,observation_event_id,
     trial=service.compile_diagnostic_candidate(workspace_path,changed,expected_source_sha256,'effect trial: '+label[:160])
     if not trial.get('compiled'):return dict(ok=False,phase='trial-compile',trial=trial,applied=False)
     options=dict(eventId=observation_event_id,attachmentIndex=attachment_index,roi=region,flipY=flip_y,
-                 blackPoint=0.,whitePoint=1.)
+                 blackPoint=0.,whitePoint=1.,displayTransfer=display_transfer)
     def compare(compiled,baseline,artifact_dir=None):
         related = []
         for peer in companions:
@@ -205,9 +248,23 @@ def run(server,workspace_path,expected_source_sha256,edits,observation_event_id,
         result=server.ipc.call('compare_shader_organization_candidates',params,timeout=300.)
         if (result.get('captureSessionId')!=session or result.get('eventId')!=anchor or result.get('replayRestored')is not True):
             raise ValueError('Effect observation did not confirm target identity and replay restoration')
+        if presentation:
+            evidence = result.get('effectObservation') or {}
+            outputs = [metric.get('output', {}) for metric in evidence.get('metrics', [])]
+            if (evidence.get('eventId') != observation_event_id or len(outputs) != 1
+                    or outputs[0].get('capturedPresent') is not True
+                    or str(outputs[0].get('resourceId')) != presentation['resourceId']):
+                raise ValueError('Replay output did not match the resolved captured Present')
+            if artifact_dir and evidence.get('images'):
+                before, after = evidence['images']
+                if (any(image.get('capturedPresent') is not True or image.get('eventId') != observation_event_id
+                        or image.get('resourceId') != presentation['resourceId'] for image in (before, after))
+                        or before.get('displayTransfer') != after.get('displayTransfer')):
+                    raise ValueError('Exported images did not match the resolved captured Present and display mapping')
         return result
     control=compare(canonical,canonical['baseline'])
-    if not control.get('accepted')or not(control.get('effectObservation')or{}).get('conclusive'):
+    control_scope=baseline_control_scope(control,region)
+    if not control_scope:
         return dict(ok=False,phase='baseline-control',control=control,applied=False,sourcePreserved=True,
                     observationEventId=observation_event_id,attachmentIndex=attachment_index,
                     reason='Unchanged source does not yet reproduce a stable captured output; causal attribution is unavailable')
@@ -224,23 +281,29 @@ def run(server,workspace_path,expected_source_sha256,edits,observation_event_id,
     if hashlib.sha256(source_path.read_bytes()).hexdigest()!=expected_source_sha256:raise ValueError('Canonical source changed during experiment')
     if any(hashlib.sha256(peer['source'].read_bytes()).hexdigest() != peer['sourceHash'] for peer in companions):
         raise ValueError('Related saved source changed during the experiment')
-    replacement_scope = 'related-shader-resources' if effect.get('coordinatedShaderCount', 1) > 1 else 'shared-shader-resource'
+    replacement_scope = effect.get('replacementScope') or (
+        'related-shader-resources' if effect.get('coordinatedShaderCount', 1) > 1 else 'shared-shader-resource')
     receipt=dict(schema='bread-shader-effect-experiment/v1',verified=conclusive,captureSessionId=session,
         captureId=status['capture']['captureId'],sourceEventId=anchor,observationEventId=observation_event_id,
         workspacePath=workspace_path,sourceSha256=expected_source_sha256,label=label[:200],roi=region,
         stage=status['stage'],
-        sourceEdits=edits,images=images,baselineControl=control,observation=observation,outcome=outcome,
+        sourceEdits=edits,images=images,baselineControl=control,baselineControlScope=control_scope,
+        observation=observation,outcome=outcome,
         replacementScope=replacement_scope,geometryScope=scope,sourcePreserved=True,replayRestored=True,applied=False,
         toolchainRefreshed=refreshed,
-        display=dict(blackPoint=0.,whitePoint=1.,flipY=flip_y,channels='rgb'))
+        display=dict(blackPoint=0.,whitePoint=1.,flipY=flip_y,channels='rgb',transfer=display_transfer),
+        **({'presentationSelection': presentation} if presentation else {}))
     data=_json(receipt);digest=hashlib.sha256(data).hexdigest();path=folder/(digest+'.json');_write(path,data)
     return dict(ok=conclusive,phase='completed',outcome=outcome,receiptPath=str(path),receiptSha256=digest,
         stage=status['stage'],
         images=images,roi=region,roiMetrics=metrics,baselineControlPassed=True,replayRestored=True,applied=False,
-        sourcePreserved=True,replacementScope=replacement_scope,geometryScope=scope,observationEventId=observation_event_id)
+        sourcePreserved=True,replacementScope=replacement_scope,geometryScope=scope,observationEventId=observation_event_id,
+        displayTransfer=effect['images'][0].get('displayTransfer',display_transfer),
+        presentationTarget=effect['images'][0].get('presentationTarget',False),baselineControlScope=control_scope,
+        **({'presentationSelection': presentation} if presentation else {}))
 
 
-def verified_comparison(path:Path,capture:dict,before:dict,after:dict)->dict:
+def _verified_effect_receipt(path: Path, capture: dict) -> dict:
     raw=path.read_bytes()
     if len(raw)>512*1024 or not re.fullmatch(r'[0-9a-f]{64}',path.stem) or hashlib.sha256(raw).hexdigest()!=path.stem:
         raise ValueError('Effect receipt is not an immutable content-addressed observation')
@@ -248,12 +311,53 @@ def verified_comparison(path:Path,capture:dict,before:dict,after:dict)->dict:
     if (receipt.get('schema')!='bread-shader-effect-experiment/v1' or receipt.get('verified')is not True
             or receipt.get('captureSessionId')!=capture.get('captureSessionId') or not receipt.get('replayRestored')
             or not receipt.get('sourcePreserved')):raise ValueError('Effect receipt is not conclusive for this capture')
+    return receipt
+
+
+def verified_comparison(path:Path,capture:dict,before:dict,after:dict)->dict:
+    receipt = _verified_effect_receipt(path, capture)
     images=receipt.get('images',[])
     if before.get('presentationFlipApplied') or after.get('presentationFlipApplied'):
         raise ValueError('Use the experiment pair in its recorded orientation and the viewer Flip Y control')
     if len(images)!=2 or [before.get('sourceSha256'),after.get('sourceSha256')]!=[i.get('sha256')for i in images]:
         raise ValueError('Comparison images do not match the exact controlled experiment')
+    return _effect_facts(path, receipt)
+
+
+def _effect_facts(path: Path, receipt: dict) -> dict:
+    observation = receipt['observation']['effectObservation']
+    native_images = observation.get('images') or []
+    basis = None
+    if len(native_images) == 2 and all(image.get('presentationTarget') is True for image in native_images):
+        first, second = native_images
+        event_id = receipt['observationEventId']
+        if (first['eventId'] != event_id or second['eventId'] != event_id
+                or first['resourceId'] != second['resourceId']
+                or first['displayTransfer'] != second['displayTransfer']):
+            raise ValueError('Final output changed its display basis during the comparison')
+        display = receipt['display']
+        basis = dict(eventId=event_id, resourceId=first['resourceId'], transfer=first['displayTransfer'],
+                     blackPoint=display['blackPoint'], whitePoint=display['whitePoint'], flipY=display['flipY'])
+    captured_present = bool(basis) and all(image.get('capturedPresent') is True for image in native_images)
     return dict(verified=True,receiptSha256=path.stem,outcome=receipt['outcome'],roi=receipt['roi'],
                 stage=receipt.get('stage','fragment'),
+                sourceEventId=receipt.get('sourceEventId'),workspacePath=receipt.get('workspacePath'),
                 observationEventId=receipt['observationEventId'],replacementScope=receipt['replacementScope'],
-                metrics=receipt['observation']['effectObservation']['metrics'])
+                metrics=observation['metrics'], capturedPresent=captured_present,
+                **({'presentationBasis': basis} if basis else {}))
+
+
+def verify_layer_exclusion(path: Path, capture: dict, event_id: int, reference: dict) -> str:
+    receipt = _verified_effect_receipt(path, capture)
+    facts = _effect_facts(path, receipt)
+    roi = facts['roi']
+    marked = reference['roi']
+    if (facts['sourceEventId'] != event_id or not facts['capturedPresent'] or
+            facts['presentationBasis'] != reference.get('presentationBasis') or
+            not (roi[0] <= marked[0] and roi[1] <= marked[1] and roi[2] >= marked[2] and roi[3] >= marked[3]) or
+            facts['outcome'] != 'no-observed-change' or not facts['metrics'] or
+            not all(row.get('byteExact') is True for row in facts['metrics'])):
+        raise ValueError(f'EID {event_id} cannot be excluded. Disable that layer and verify no change in the '
+                         'marked region on the same final output. A different Shader or extra inputs alone '
+                         'do not exclude a neighbouring draw.')
+    return path.stem

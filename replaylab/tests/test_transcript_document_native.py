@@ -32,6 +32,7 @@ def test_transcript_styles_documents_and_live_updates(tmp_path):
 #include <QJsonObject>
 #include <QTextBrowser>
 #include <QTextDocument>
+#include <QTextList>
 #include <QPointer>
 #include <QTimer>
 #include <QDebug>
@@ -44,7 +45,7 @@ bool hasImage(QTextDocument *doc) {
   return !doc->resource(QTextDocument::ImageResource, QUrl("replaylab-attachment://image")).value<QImage>().isNull();
 }
 int main(int argc, char **argv) {
-  QApplication app(argc,argv); Resources::Initialise();
+  QApplication app(argc,argv); QApplication::setCursorFlashTime(0); Resources::Initialise();
   QJsonObject result;
   const QString styled = QStringLiteral("<html><head><style>"
      "p{color:#111111;}.second{color:#222222;}.first{color:#333333;}"
@@ -80,6 +81,44 @@ int main(int argc, char **argv) {
       "```hlsl source=rdoc://shader/example?line=73\nfloat one;\nfloat two;\n```"));
   result["markdownTable"]=table.toPlainText().contains("a|b") && !table.toPlainText().contains("|---|");
   result["exampleLinksToCalculation"]=QUrlQuery(QUrl(table.find("two").charFormat().anchorHref())).queryItemValue("line")=="73";
+  QTextDocument numbered;
+  numbered.setHtml(safeMarkdown("1. **First**\n   Explanation one.\n   [source](rdoc://shader/id?line=8)\n\n"
+     "2. **Second**\n   Explanation two.\n\n3. **Third**\n   Explanation three.\n\nOutside."));
+  const auto firstItem=numbered.find("First").block(),secondItem=numbered.find("Second").block(),thirdItem=numbered.find("Third").block();
+  result["multilineListsKeepNumbersAndLinks"]=firstItem.textList()&&firstItem.textList()==secondItem.textList()&&
+    secondItem.textList()==thirdItem.textList()&&firstItem.textList()->itemNumber(firstItem)==0&&
+    secondItem.textList()->itemNumber(secondItem)==1&&thirdItem.textList()->itemNumber(thirdItem)==2&&
+    numbered.find("source").charFormat().anchorHref()=="rdoc://shader/id?line=8"&&!numbered.find("Outside").block().textList();
+
+  AIConversationView numberedView;numberedView.setAttribute(Qt::WA_DontShowOnScreen);numberedView.resize(550,900);
+  AIChatMessage numberedAnswer;numberedAnswer.id="numbers";numberedAnswer.role="assistant";
+  numberedAnswer.text="1. **Rain texture** supplies slopes. [code](rdoc://shader/id?line=8)\n\n"
+    "2. **Drops** use those slopes. [RT](rdoc://event/77)\n\n3. **Lighting** combines them.";
+  numberedView.setMessages({numberedAnswer});numberedView.show();spin(25);
+  auto *numberedBrowser=numberedView.findChild<QTextBrowser*>();
+  const auto actualFirst=numberedBrowser->document()->find("Rain texture").block();
+  const auto actualSecond=numberedBrowser->document()->find("Drops").block();
+  const auto actualThird=numberedBrowser->document()->find("Lighting").block();
+  result["productionListsKeepSequentialNumbers"]=actualFirst.textList()&&actualFirst.textList()==actualSecond.textList()&&
+    actualSecond.textList()==actualThird.textList()&&actualFirst.textList()->itemNumber(actualFirst)==0&&
+    actualSecond.textList()->itemNumber(actualSecond)==1&&actualThird.textList()->itemNumber(actualThird)==2;
+  numberedAnswer.text="1. Texture supplies slopes.\n\n[code](rdoc://shader/id?line=8)\n\n"
+    "1. Drops use those slopes.\n\n[RT](rdoc://event/77)\n\n1. Lighting combines them.";
+  numberedView.setMessages({numberedAnswer});spin(25);
+  const auto linkedFirst=numberedBrowser->document()->find("Texture supplies").block();
+  const auto linkedSecond=numberedBrowser->document()->find("Drops use").block();
+  const auto linkedThird=numberedBrowser->document()->find("Lighting combines").block();
+  result["separateCitationLinesStayInlineAndNumbered"]=linkedFirst.textList()&&linkedFirst.textList()==linkedSecond.textList()&&
+    linkedSecond.textList()==linkedThird.textList()&&linkedThird.textList()->itemNumber(linkedThird)==2&&
+    numberedBrowser->document()->find("code").block()==linkedFirst&&numberedBrowser->document()->find("RT").block()==linkedSecond;
+  numberedAnswer.text="1. First stage.\n\n2. Second stage.\n   ```hlsl\n   float phase = frac(time);\n   ```\n   Continue calculation.\n\n3. Third stage.";
+  numberedView.setMessages({numberedAnswer});spin(25);
+  const auto withCodeFirst=numberedBrowser->document()->find("First stage").block();
+  const auto withCodeSecond=numberedBrowser->document()->find("Second stage").block();
+  const auto withCodeThird=numberedBrowser->document()->find("Third stage").block();
+  result["codeInsideListKeepsSequentialNumbers"]=withCodeFirst.textList()&&withCodeFirst.textList()==withCodeSecond.textList()&&
+    withCodeSecond.textList()==withCodeThird.textList()&&withCodeThird.textList()->itemNumber(withCodeThird)==2;
+  numberedView.close();
 
   AIConversationView view;view.setAttribute(Qt::WA_DontShowOnScreen);view.resize(550,900);view.show();
   auto browser=view.findChild<QTextBrowser*>();
@@ -120,9 +159,11 @@ int main(int argc, char **argv) {
   result["liveInPlace"]=browser->document()==selectedDocument &&
       browser->toPlainText().contains("Streaming prefix and new suffix") &&
       browser->textCursor().selectedText()=="Selected text";
-  QString elapsedBefore=browser->toPlainText();spin(1100);
+  QString elapsedBefore=browser->toPlainText();const int elapsedRevision=browser->document()->revision();
+  const QImage elapsedImage=browser->viewport()->grab().toImage();spin(1100);
   result["elapsedInPlace"]=browser->document()==selectedDocument &&
-      browser->textCursor().selectedText()=="Selected text" && browser->toPlainText()!=elapsedBefore;
+      browser->textCursor().selectedText()=="Selected text" && browser->toPlainText()==elapsedBefore &&
+      browser->document()->revision()==elapsedRevision && browser->viewport()->grab().toImage()!=elapsedImage;
   messages[0].activity[0].detail="changed while selected";view.setMessages(messages);
   result["selectionDefers"]=browser->document()==selectedDocument;
   QPointer<QTextDocument> previous=browser->document();selected.clearSelection();browser->setTextCursor(selected);spin(30);
@@ -211,10 +252,11 @@ int main(int argc, char **argv) {
                                text=True, timeout=90, creationflags=subprocess.CREATE_NO_WINDOW)
     assert report.exists(), (completed.returncode, completed.stdout, completed.stderr)
     evidence = json.loads(report.read_text(encoding="utf-8"))
-    for key in ("cascade", "escapedAttributes", "noSelectors", "safeText", "imageResource",
+    for key in ("codeInsideListKeepsSequentialNumbers", "separateCitationLinesStayInlineAndNumbered", "productionListsKeepSequentialNumbers", "cascade", "escapedAttributes", "noSelectors", "safeText", "imageResource",
                 "liveInPlace", "elapsedInPlace", "selectionDefers", "replaceOwnsDocument", "oneOwnedDocument",
                 "codeHighlight", "blockCommentHighlight", "mathFunctionHighlight", "exponentLiteralHighlight",
                 "shaderSourceLink", "shaderWorkspaceLink", "shaderIncludeLink", "rejectExecutableLinks",
+                "multilineListsKeepNumbersAndLinks",
                 "artifactLink", "scrollAnchor", "selectedHistoryHeld", "submittedFollowupVisible",
                 "submittedFollowupAtTail", "followupStreamingVisible", "backgroundDoesNotStealScroll",
                 "unselectedFollowupAtTail"):

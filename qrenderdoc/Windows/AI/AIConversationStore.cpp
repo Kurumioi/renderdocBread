@@ -333,7 +333,7 @@ bool AIConversationStore::Save(const QString &capturePath, const QByteArray &pay
   if(payload.size() > MaximumPayloadBytes)
   {
     // i18n-ignore: Save failure is written only to the internal diagnostic log.
-    setError(error, QStringLiteral("Conversation history exceeds the 4 MiB limit."));
+    setError(error, QStringLiteral("Conversation history exceeds the storage limit."));
     return false;
   }
 

@@ -173,6 +173,21 @@ class EventTextureEvidenceBridgeTests(unittest.TestCase):
             bridge.METHODS["save_texture"],
         )
 
+    def test_diagram_export_retains_alpha_and_rgb_under_transparency(self):
+        bridge, controller = self._fixture()
+        bridge.rd.AlphaMapping.Preserve = "preserve"
+        seen = []
+        bridge._reduce_saved_image = lambda path, crop, maximum, **options: seen.append(options)
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary) / ("eid-41-" + "b" * 32)
+            folder.mkdir()
+            result = bridge._capture_event_texture_evidence(
+                self._params(folder, channel="rgba", preserve_alpha=True, max_dimension=128))
+        self.assertEqual(controller.saved[0][0].alpha, "preserve")
+        self.assertEqual(result["artifact"]["display"]["alphaMode"], "preserved")
+        self.assertTrue(seen[0]["preserve_channels"])
+        self.assertFalse(seen[0]["opaque_rgb"])
+
     def test_orientation_is_optional_boolean_and_part_of_export_receipt(self):
         for orientation in (None, False, True):
             bridge, controller = self._fixture()

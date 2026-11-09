@@ -44,6 +44,7 @@ from .response_language import configured_interface_locale, infer_response_langu
 from .agent_diagnostics import configure_logging, get_logger, log_exception, public_error
 from .agent_contracts import OrchestratorConfig, RunRequest, RunResult
 from .agent_progress import ProgressReporter
+from .connectors.openai_compatibility import PROVIDER_RETRY_ATTEMPT
 from .agent_prompts import (
     deep_child_system_prompt,
     deep_main_system_prompt,
@@ -740,7 +741,8 @@ class _DeepRun:
             event_root,
             conversation_id=request.conversation_id or envelope.conversation_id,
         )
-        self.receipt_store.begin_task_review(work_identity({"prompt": request.prompt, "intent": request.intent}))
+        self.receipt_store.begin_task_review(work_identity({"prompt": request.prompt, "intent": request.intent}),
+            marked_render_target=any(item.context and item.context.annotation for item in envelope.request.attachments))
         self._activity_tracker = TaskActivityTracker(self.receipt_store)
 
     def tools_used(self) -> set[str]:
@@ -1207,7 +1209,7 @@ class _DeepRun:
         return "RT annotation grounding for this request:\n" + RT_ANNOTATION_GUIDANCE + "\n\n"
 
     def _filesystem_backend(self) -> Any:
-        from deepagents.backends import FilesystemBackend
+        from .filesystem_backend import Utf8FilesystemBackend
 
         if self._workspace_root is None:
             envelope = parse_conversation_prompt(self.request.prompt)
@@ -1237,7 +1239,7 @@ class _DeepRun:
         # The framework inherits this backend for declarative children. It has
         # file operations only, with virtual paths confined to the owned root;
         # no LocalShellBackend or user project roots are admitted here.
-        return FilesystemBackend(root_dir=self._workspace_root, virtual_mode=True)
+        return Utf8FilesystemBackend(root_dir=self._workspace_root, virtual_mode=True)
 
     def _workspace_guidance(self) -> str:
         guidance = (
@@ -1415,6 +1417,9 @@ class _DeepRun:
             status = "needs-user-input"
         else:
             text = (self._final_text or "".join(self._main_text)).strip()
+            reviewed_explanation = self._review_decision.reviewed_explanation() if not self._main_output_limited else ''
+            if reviewed_explanation:
+                text = reviewed_explanation
             if not text:
                 text = "主 Agent 没有返回文本答案。" if language == "zh_CN" else "The main Agent returned no text answer."
                 status = "partial"
@@ -1434,7 +1439,7 @@ class _DeepRun:
             elif self._review_decision.action == "partial":
                 status = "partial"
                 text = self._review_decision.incomplete_text(language, text)
-            elif self._review_decision.action == "accept":
+            elif self._review_decision.action == "accept" and not reviewed_explanation:
                 note = self._review_decision.unchanged_note(language)
                 if note:
                     text += "\n\n" + note
@@ -1532,7 +1537,20 @@ class _DeepRun:
         name = str(event.get("name") or "")
         run_id = str(event.get("run_id") or "")
         data = event.get("data") or {}
+        if kind in {"on_chat_model_stream", "on_chat_model_end"} and _internal_model_event(event):
+            # astream_events also contains the middleware's compaction calls.
+            # They are provider activity, but never public progress or an answer.
+            self._provider_output_seen = True
+            return
         child = self._child_for(event)
+
+        if kind == "on_chat_model_start" and (event.get("metadata") or {}).get(PROVIDER_RETRY_ATTEMPT):
+            if child is None and not _internal_model_event(event):
+                self._main_text.clear()
+                self._final_text = ""
+                self._main_output_limited = False
+                self.reporter.discard_main_message()
+            return
 
         if kind == "on_tool_start":
             if child is None:
@@ -1706,6 +1724,21 @@ class _DeepRun:
 
 
 # ------------------------------------------------------------------ helpers
+def _internal_model_event(event: Mapping[str, Any]) -> bool:
+    metadata = event.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return False
+    if metadata.get("lc_source") == "summarization":
+        return True
+    if not metadata.get("lc_internal_call"):
+        return False
+    try:
+        from langchain.agents.middleware.internal_call_transformer import internal_call_metadata
+    except ImportError:
+        return False
+    return all(metadata.get(key) == value for key, value in internal_call_metadata().items())
+
+
 def _create_prompt_key(create: Any) -> str:
     try:
         parameters = inspect.signature(create).parameters
