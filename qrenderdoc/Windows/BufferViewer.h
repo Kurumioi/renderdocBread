@@ -25,7 +25,9 @@
 #pragma once
 
 #include <QFrame>
+#include <QMatrix4x4>
 #include <QMutex>
+#include <atomic>
 #include <memory>
 #include "Code/Interface/QRDInterface.h"
 #include "Code/QRDUtils.h"
@@ -57,9 +59,13 @@ class CameraWrapper;
 class ArcballWrapper;
 class FlycamWrapper;
 class MeshUVView;
+class MeshUVTextureView;
+class QRubberBand;
+class QStackedWidget;
 class QComboBox;
 class QSplitter;
 struct MeshUVData;
+struct MeshUVHighlight;
 struct BufferData;
 struct PopulateBufferData;
 struct CalcBoundingBoxData;
@@ -215,14 +221,30 @@ private:
   QSplitter *m_MeshSplit = NULL;
   QWidget *m_UVPanel = NULL;
   MeshUVView *m_UVCanvas = NULL;
-  MeshUVView *m_UVModel = NULL;
+  MeshUVTextureView *m_UVTextureView = NULL;
+  QWidget *m_UVTextureContainer = NULL;
+  QStackedWidget *m_MeshStack = NULL;
+  QToolButton *m_UVBox = NULL;
+  QRubberBand *m_UVMeshBox = NULL;
+  QPoint m_UVMeshPress;
+  bool m_UVMeshSelecting = false;
+  bool m_UVMeshDragged = false;
+  bool m_UVGeometryRunning = false;
+  bool m_UVHighlightPartial = false;
+  std::shared_ptr<const MeshUVHighlight> m_UVHighlight;
+  QVector<QVector4D> m_UVTexturedSelection;
+  unsigned int m_UVSelectionPrimitive = 0;
   QComboBox *m_UVChannels = NULL;
   QComboBox *m_UVTextures = NULL;
   QComboBox *m_CameraPreset = NULL;
   QToolButton *m_UVToggle = NULL;
   QLabel *m_UVStatus = NULL;
   uint32_t m_UVEvent = 0;
-  uint32_t m_UVTextureSerial = 0;
+  uint32_t m_UVGeometrySerial = 0;
+  std::atomic<uint32_t> m_UVTextureSerial{0};
+  uint32_t m_UVTextureEvent = 0;
+  Descriptor m_UVTextureBinding;
+  IReplayOutput *m_UVThumbnailOutput = NULL;
   bool m_UVLinkPending = false;
   QString m_UVLinkChannel;
   QString m_UVManualChannel;
@@ -440,8 +462,12 @@ private:
   int UVTextureMode() const;
   void UpdateMeshUV();
   void UpdateMeshUVGeometry();
+  void StartMeshUVGeometry();
   void UpdateMeshUVTexture();
   void UpdateMeshUVPreview();
+  void UpdateMeshUVSelection();
+  QMatrix4x4 MeshPreviewTransform() const;
+  void QueueMeshPreview();
   void SetupRawView();
 
   void SetMeshFilter(MeshFilter filter, uint32_t taskGroup = ~0U, uint32_t meshGroup = ~0U);

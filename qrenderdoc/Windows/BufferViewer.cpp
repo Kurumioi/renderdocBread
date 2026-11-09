@@ -38,7 +38,6 @@
 #include <QFileInfo>
 #include <QFileSystemWatcher>
 #include <QFontDatabase>
-#include <QImageReader>
 #include <QItemSelection>
 #include <QKeyEvent>
 #include <QLabel>
@@ -50,6 +49,7 @@
 #include <QPointer>
 #include <QPushButton>
 #include <QRegularExpression>
+#include <QRubberBand>
 #include <QScrollBar>
 #include <QSet>
 #include <QShortcut>
@@ -57,7 +57,6 @@
 #include <QSlider>
 #include <QSplitter>
 #include <QStackedWidget>
-#include <QTemporaryDir>
 #include <QTimer>
 #include <QToolButton>
 #include <QToolTip>
@@ -1732,6 +1731,32 @@ static QString interpretVariant(const QVariant &v, const ShaderConstant &el,
   return ret;
 }
 
+static uint32_t MeshIndex(const BufferConfiguration &config, uint32_t row)
+{
+  if(!config.indices || !config.indices->hasData())
+    return row;
+  const uint32_t index = CalcIndex(config.indices, row, config.baseVertex, config.primRestart);
+  return config.primRestart && index == config.primRestart ? ~0U : index;
+}
+
+static QVariantList MeshValues(const BufferConfiguration &config, uint32_t index, int column)
+{
+  if(column < 0 || column >= config.columns.count() || index == ~0U)
+    return {};
+  const ShaderConstant &element = config.columns[column];
+  const BufferElementProperties &prop = config.props[column];
+  if(prop.perprimitive || prop.buffer >= config.buffers.size())
+    return {};
+  if(prop.perinstance)
+    index = config.curInstance / qMax(1, prop.instancerate);
+  const BufferData *buffer = config.buffers[prop.buffer];
+  const uint64_t offset = uint64_t(buffer->stride) * index + element.byteOffset;
+  if(offset >= buffer->size())
+    return {};
+  const byte *start = buffer->data() + offset;
+  return GetVariants(prop.format, element, start, buffer->end());
+}
+
 class BufferItemModel : public QAbstractItemModel
 {
 public:
@@ -2271,32 +2296,11 @@ public:
 
   const BufferConfiguration &getConfig() { return config; }
 
-  uint32_t meshIndex(uint32_t row) const
-  {
-    if(!config.indices || !config.indices->hasData())
-      return row;
-    const uint32_t index = CalcIndex(config.indices, row, config.baseVertex, config.primRestart);
-    return config.primRestart && index == config.primRestart ? ~0U : index;
-  }
+  uint32_t meshIndex(uint32_t row) const { return MeshIndex(config, row); }
 
   QVariantList meshValues(uint32_t row, int column) const
   {
-    if(column < 0 || column >= config.columns.count())
-      return {};
-    const ShaderConstant &element = config.columns[column];
-    const BufferElementProperties &prop = config.props[column];
-    if(prop.perprimitive || prop.buffer >= config.buffers.size())
-      return {};
-    const uint32_t index =
-        prop.perinstance ? config.curInstance / qMax(1, prop.instancerate) : meshIndex(row);
-    if(index == ~0U)
-      return {};
-    const BufferData *buffer = config.buffers[prop.buffer];
-    const uint64_t offset = uint64_t(buffer->stride) * index + element.byteOffset;
-    if(offset >= buffer->size())
-      return {};
-    const byte *start = buffer->data() + offset;
-    return GetVariants(prop.format, element, start, buffer->end());
+    return MeshValues(config, meshIndex(row), column);
   }
 
 private:
@@ -3577,7 +3581,7 @@ BufferViewer::BufferViewer(ICaptureContext &ctx, bool meshview, QWidget *parent)
   ui->axisMappingCombo->setCurrentIndex(0);
 
   // wireframe only available on solid shaded options
-  ui->wireframeRender->setEnabled(false);
+  ui->wireframeRender->setEnabled(m_MeshView);
 
   ui->setFormat->setVisible(false);
 
@@ -4623,19 +4627,111 @@ void BufferViewer::UI_SubmitCBufferLiveValues()
   });
 }
 
+namespace
+{
+enum class UVTool
+{
+  Point,
+  Edge,
+  Face,
+  Box,
+  All,
+  Linked,
+  Clear,
+  Focus,
+  Flip
+};
+
+QIcon UVToolIcon(UVTool tool, const QPalette &palette)
+{
+  QPixmap image(40, 40);
+  image.setDevicePixelRatio(2);
+  image.fill(Qt::transparent);
+  QPainter painter(&image);
+  painter.setRenderHint(QPainter::Antialiasing);
+  const QColor color = palette.color(QPalette::ButtonText);
+  painter.setPen(QPen(color, 1.4, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+  const QPointF a(4, 15), b(10, 4), c(16, 15);
+  switch(tool)
+  {
+    case UVTool::Point:
+    case UVTool::Edge:
+    case UVTool::Face:
+    {
+      QPolygonF triangle;
+      triangle << a << b << c;
+      if(tool == UVTool::Face)
+        painter.setBrush(color);
+      painter.drawPolygon(triangle);
+      if(tool == UVTool::Point)
+      {
+        painter.setBrush(color);
+        painter.drawEllipse(b, 2, 2);
+      }
+      else if(tool == UVTool::Edge)
+      {
+        painter.setPen(QPen(color, 3, Qt::SolidLine, Qt::RoundCap));
+        painter.drawLine(a, c);
+      }
+      break;
+    }
+    case UVTool::Box:
+      painter.setPen(QPen(color, 1.4, Qt::DashLine));
+      painter.drawRect(QRectF(3, 3, 14, 14));
+      break;
+    case UVTool::All:
+      painter.drawRect(QRectF(3, 3, 14, 14));
+      painter.setBrush(color);
+      painter.drawRect(QRectF(6, 6, 8, 8));
+      break;
+    case UVTool::Linked:
+      painter.drawEllipse(QRectF(3, 7, 8, 6));
+      painter.drawEllipse(QRectF(9, 7, 8, 6));
+      break;
+    case UVTool::Clear:
+      painter.drawLine(QPointF(5, 5), QPointF(15, 15));
+      painter.drawLine(QPointF(15, 5), QPointF(5, 15));
+      break;
+    case UVTool::Focus:
+      painter.drawEllipse(QPointF(10, 10), 5, 5);
+      painter.drawLine(QPointF(10, 2), QPointF(10, 6));
+      painter.drawLine(QPointF(10, 14), QPointF(10, 18));
+      painter.drawLine(QPointF(2, 10), QPointF(6, 10));
+      painter.drawLine(QPointF(14, 10), QPointF(18, 10));
+      break;
+    case UVTool::Flip:
+      painter.drawLine(QPointF(4, 10), QPointF(16, 10));
+      painter.drawLine(QPointF(10, 3), QPointF(10, 17));
+      painter.drawLine(QPointF(7, 6), QPointF(10, 3));
+      painter.drawLine(QPointF(13, 6), QPointF(10, 3));
+      painter.drawLine(QPointF(7, 14), QPointF(10, 17));
+      painter.drawLine(QPointF(13, 14), QPointF(10, 17));
+      break;
+  }
+  painter.end();
+  return QIcon(image);
+}
+}
+
+struct MeshUVHighlight
+{
+  rdcarray<FloatVector> positions;
+  Topology topology = Topology::TriangleList;
+};
+
 void BufferViewer::SetupMeshUV()
 {
   m_UVData = std::make_shared<MeshUVData>();
   m_MeshSplit = new QSplitter(Qt::Horizontal, ui->renderContainer);
-  QStackedWidget *modelStack = new QStackedWidget(m_MeshSplit);
+  m_MeshSplit->setObjectName(QStringLiteral("meshUVSplitter"));
+  m_MeshSplit->setOpaqueResize(false);
+  m_MeshSplit->setChildrenCollapsible(false);
+  m_MeshStack = new QStackedWidget(m_MeshSplit);
   ui->renderContainerGridLayout->removeWidget(ui->render);
-  modelStack->addWidget(ui->render);
-  m_UVModel = new MeshUVView(m_UVData, false, modelStack);
-  m_UVModel->setObjectName(QStringLiteral("meshUVModel"));
-  m_UVModel->cameraPreset = [this]() { return m_Ctx.Config().MeshViewer_CameraNavigation; };
-  modelStack->addWidget(m_UVModel);
-  m_MeshSplit->addWidget(modelStack);
+  m_MeshStack->addWidget(ui->render);
+  m_MeshSplit->addWidget(m_MeshStack);
 
+  m_UVMeshBox = new QRubberBand(QRubberBand::Rectangle, m_MeshStack);
   m_UVPanel = new QWidget(m_MeshSplit);
   QVBoxLayout *panel = new QVBoxLayout(m_UVPanel);
   panel->setContentsMargins(4, 0, 0, 0);
@@ -4650,45 +4746,62 @@ void BufferViewer::SetupMeshUV()
   m_UVTextures->setToolTip(tr("Texture bound as an input at this EID"));
   m_UVTextures->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
   panel->addWidget(m_UVTextures);
-  m_UVCanvas = new MeshUVView(m_UVData, true, m_UVPanel);
-  m_UVCanvas->setObjectName(QStringLiteral("meshUVCanvas"));
-  panel->addWidget(m_UVCanvas, 1);
 
-  QHBoxLayout *selection = new QHBoxLayout;
+  QHBoxLayout *workspace = new QHBoxLayout;
+  QVBoxLayout *selection = new QVBoxLayout;
+  selection->setSpacing(1);
+  workspace->addLayout(selection);
+  m_UVCanvas = new MeshUVView(m_UVData, m_UVPanel);
+  m_UVCanvas->setObjectName(QStringLiteral("meshUVCanvas"));
+  workspace->addWidget(m_UVCanvas, 1);
+  panel->addLayout(workspace, 1);
+
+  auto tool = [this, selection](UVTool icon, const QString &tip, const char *id) {
+    QToolButton *button = new QToolButton(m_UVPanel);
+    button->setIcon(UVToolIcon(icon, button->palette()));
+    button->setIconSize(QSize(20, 20));
+    button->setToolTip(tip);
+    button->setAccessibleName(tip);
+    button->setObjectName(QLatin1String(id));
+    selection->addWidget(button);
+    return button;
+  };
   QButtonGroup *modes = new QButtonGroup(m_UVPanel);
-  const QString names[] = {tr("Point"), tr("Edge"), tr("Face")};
+  const QString names[] = {tr("Select points (1)"), tr("Select edges (2)"), tr("Select faces (3)")};
+  const char *ids[] = {"meshUVPoint", "meshUVEdge", "meshUVFace"};
   for(int i = 0; i < 3; ++i)
   {
-    QToolButton *button = new QToolButton(m_UVPanel);
-    button->setText(names[i]);
+    QToolButton *button = tool(UVTool(i), names[i], ids[i]);
     button->setCheckable(true);
     button->setChecked(i == int(m_UVData->mode));
     modes->addButton(button, i);
-    selection->addWidget(button);
   }
   connect(modes, QOverload<int>::of(&QButtonGroup::buttonClicked), this, [this](int mode) {
-    m_UVData->mode = MeshUVData::Selection(mode);
-    m_UVCanvas->clearSelection();
+    if(m_UVData->mode != MeshUVData::Selection(mode))
+    {
+      m_UVData->mode = MeshUVData::Selection(mode);
+      m_UVCanvas->clearSelection();
+    }
   });
-  QToolButton *select = new QToolButton(m_UVPanel);
-  select->setText(tr("Select"));
-  select->setPopupMode(QToolButton::InstantPopup);
-  QMenu *menu = new QMenu(select);
-  QAction *box = menu->addAction(tr("Box select (B)"));
-  box->setCheckable(true);
-  connect(box, &QAction::toggled, m_UVCanvas, &MeshUVView::setBoxSelect);
-  menu->addAction(tr("Select all (A)"), m_UVCanvas, &MeshUVView::selectAll);
-  menu->addAction(tr("Select linked (L)"), m_UVCanvas, &MeshUVView::selectLinked);
-  menu->addAction(tr("Clear selection (Alt+A)"), m_UVCanvas, &MeshUVView::clearSelection);
-  menu->addAction(tr("Focus selection (F)"), m_UVCanvas, &MeshUVView::focusSelection);
-  select->setMenu(menu);
-  selection->addWidget(select);
-  QToolButton *flip = new QToolButton(m_UVPanel);
-  flip->setText(tr("Flip Y"));
+  m_UVCanvas->modeShortcut = [modes](int mode) { modes->button(mode)->click(); };
+
+  selection->addSpacing(4);
+  m_UVBox = tool(UVTool::Box, tr("Box select (B)"), "meshUVBox");
+  m_UVBox->setCheckable(true);
+  connect(m_UVBox, &QToolButton::toggled, m_UVCanvas, &MeshUVView::setBoxSelect);
+  m_UVCanvas->boxShortcut = [this]() { m_UVBox->toggle(); };
+  connect(tool(UVTool::All, tr("Select all (A)"), "meshUVAll"), &QToolButton::clicked, m_UVCanvas,
+          &MeshUVView::selectAll);
+  connect(tool(UVTool::Linked, tr("Select linked (L)"), "meshUVLinked"), &QToolButton::clicked,
+          m_UVCanvas, &MeshUVView::selectLinked);
+  connect(tool(UVTool::Clear, tr("Clear selection (Alt+A)"), "meshUVClear"), &QToolButton::clicked,
+          m_UVCanvas, &MeshUVView::clearSelection);
+  connect(tool(UVTool::Focus, tr("Focus selection (F)"), "meshUVFocus"), &QToolButton::clicked,
+          m_UVCanvas, &MeshUVView::focusSelection);
+  QToolButton *flip =
+      tool(UVTool::Flip, tr("Flip the UV background and mesh texture sampling"), "meshUVFlip");
   flip->setCheckable(true);
-  flip->setToolTip(tr("Flip the UV background and mesh texture sampling"));
-  selection->addWidget(flip);
-  panel->addLayout(selection);
+  selection->addStretch();
   m_UVStatus = new QLabel(m_UVPanel);
   m_UVStatus->setWordWrap(true);
   panel->addWidget(m_UVStatus);
@@ -4696,7 +4809,6 @@ void BufferViewer::SetupMeshUV()
   m_MeshSplit->setStretchFactor(0, 2);
   m_MeshSplit->setStretchFactor(1, 1);
   ui->renderContainerGridLayout->addWidget(m_MeshSplit, 1, 1);
-  m_UVPanel->hide();
 
   m_UVToggle = new QToolButton(ui->controlsToolbar);
   m_UVToggle->setText(tr("UV"));
@@ -4723,8 +4835,12 @@ void BufferViewer::SetupMeshUV()
       m_MeshSplit->setSizes({600, 360});
       UpdateMeshUV();
     }
-    else if(ui->visualisation->currentIndex() == UVTextureMode())
-      ui->visualisation->setCurrentIndex(0);
+    else
+    {
+      if(ui->visualisation->currentIndex() == UVTextureMode())
+        ui->visualisation->setCurrentIndex(int(m_Config.visualisationMode));
+      m_UVCanvas->clearSelection();
+    }
     UpdateMeshUVPreview();
   });
   connect(m_UVChannels, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
@@ -4736,9 +4852,11 @@ void BufferViewer::SetupMeshUV()
           &BufferViewer::UpdateMeshUVTexture);
   connect(flip, &QToolButton::toggled, this, [this](bool on) {
     m_UVData->flipTexture = on;
+    m_UVCanvas->textureChanged();
     UpdateMeshUVPreview();
   });
-  m_UVCanvas->selectionChanged = [this]() { UpdateMeshUVPreview(); };
+  m_UVCanvas->selectionChanged = [this]() { UpdateMeshUVSelection(); };
+  m_UVToggle->setChecked(true);
 }
 
 int BufferViewer::UVTextureMode() const
@@ -4756,8 +4874,10 @@ void BufferViewer::NavigateMeshUV(int stage, const QString &channel, int compone
   m_UVLinkComponent = component;
   m_UVLinkTexture = texture;
   ui->outputTabs->setCurrentIndex(stage);
-  m_UVToggle->setChecked(true);
-  UpdateMeshUV();
+  if(m_UVToggle->isChecked())
+    UpdateMeshUV();
+  else
+    m_UVToggle->setChecked(true);
 }
 
 void BufferViewer::UpdateMeshUV()
@@ -4894,123 +5014,284 @@ void BufferViewer::UpdateMeshUVGeometry()
 {
   if(!m_UVData)
     return;
-  m_UVData->vertices.clear();
-  m_UVData->triangles.clear();
-  m_UVData->selected.clear();
+  ++m_UVGeometrySerial;
+  m_UVData->geometry.reset();
+  m_UVCanvas->geometryChanged();
+  m_UVStatus->clear();
+  StartMeshUVGeometry();
+}
+
+void BufferViewer::StartMeshUVGeometry()
+{
   BufferItemModel *model = currentBufferModel();
-  if(!model || m_UVChannels->currentIndex() < 0 || m_UVEvent != m_Ctx.CurEvent())
-  {
-    UpdateMeshUVPreview();
+  if(m_UVGeometryRunning || !m_UVToggle->isChecked() || !model ||
+     m_UVChannels->currentIndex() < 0 || m_UVEvent != m_Ctx.CurEvent())
     return;
-  }
   const BufferConfiguration &config = model->getConfig();
+  if(config.topology != Topology::TriangleList && config.topology != Topology::TriangleList_Adj &&
+     config.topology != Topology::TriangleStrip && config.topology != Topology::TriangleFan)
+    return;
+
+  auto snapshot = std::make_shared<BufferConfiguration>();
+  *snapshot = config;
   const int channel = m_UVChannels->currentData().toInt();
-  const MeshFormat &format = m_CurStage == MeshDataStage::VSOut ? m_Out1Data : m_Out2Data;
-  const bool clip = m_CurStage != MeshDataStage::VSIn && format.unproject;
+  const int positionColumn = model->posColumn();
+  const uint32_t serial = m_UVGeometrySerial;
   const uint32_t count = qMin(180000U, config.numRows);
-  m_UVData->vertices.reserve(int(count));
-  QVector<int> run;
-  for(uint32_t row = 0; row < count; ++row)
-  {
-    if(config.topology == Topology::TriangleList && row % 3 == 0)
-      run.clear();
-    const uint32_t index = model->meshIndex(row);
-    const QVariantList coordinates = model->meshValues(row, channel / 4);
-    const QVariantList position = model->meshValues(row, model->posColumn());
-    if(index == ~0U || coordinates.size() <= channel % 4 + 1 || position.size() < 2)
+  const bool partial = count < config.numRows;
+  m_UVGeometryRunning = true;
+  QPointer<BufferViewer> self(this);
+  LambdaThread *thread = new LambdaThread([self, snapshot, channel, positionColumn, serial, count,
+                                           partial]() {
+    auto mesh = std::make_shared<MeshUVGeometry>();
+    mesh->vertices.reserve(int(count));
+    QHash<uint32_t, int> decoded;
+    QVector<int> run;
+    const int listSize = snapshot->topology == Topology::TriangleList_Adj ? 6
+                         : snapshot->topology == Topology::TriangleList   ? 3
+                                                                          : 0;
+    for(uint32_t row = 0; row < count; ++row)
     {
-      run.clear();
-      continue;
+      if(listSize == 6 && row % 2 == 1)
+        continue;
+      if(listSize > 0 && row % listSize == 0)
+        run.clear();
+      const uint32_t index = MeshIndex(*snapshot, row);
+      if(index == ~0U)
+      {
+        run.clear();
+        continue;
+      }
+      int vertex = decoded.value(index, -1);
+      if(vertex < 0)
+      {
+        const QVariantList coords = MeshValues(*snapshot, index, channel / 4);
+        const QVariantList pos = MeshValues(*snapshot, index, positionColumn);
+        if(coords.size() <= channel % 4 + 1 || pos.size() < 2)
+        {
+          run.clear();
+          continue;
+        }
+        const QPointF uv(coords[channel % 4].toDouble(), coords[channel % 4 + 1].toDouble());
+        const QVector4D position(pos[0].toFloat(), pos[1].toFloat(), pos.value(2).toFloat(),
+                                 pos.size() >= 4 ? pos[3].toFloat() : 1.0f);
+        if(!std::isfinite(uv.x()) || !std::isfinite(uv.y()) || std::abs(uv.x()) > 1e6 ||
+           std::abs(uv.y()) > 1e6 || !std::isfinite(position.x()) || !std::isfinite(position.y()) ||
+           !std::isfinite(position.z()) || !std::isfinite(position.w()))
+        {
+          run.clear();
+          continue;
+        }
+        vertex = mesh->vertices.size();
+        decoded.insert(index, vertex);
+        mesh->vertices.push_back({position, uv, index});
+      }
+      run.push_back(vertex);
+      if(run.size() < 3)
+        continue;
+      const int a = snapshot->topology == Topology::TriangleFan ? run.first() : run[run.size() - 3];
+      const int b = run[run.size() - 2], c = run.last();
+      if(a != b && a != c && b != c)
+      {
+        mesh->triangles.push_back({{a, b, c}});
+        mesh->wire.moveTo(mesh->vertices[a].uv);
+        mesh->wire.lineTo(mesh->vertices[b].uv);
+        mesh->wire.lineTo(mesh->vertices[c].uv);
+        mesh->wire.closeSubpath();
+      }
+      if(listSize > 0)
+        run.clear();
     }
-    const double u = coordinates[channel % 4].toDouble(), v = coordinates[channel % 4 + 1].toDouble();
-    const double x = position[0].toDouble();
-    const double y = position[1].toDouble() * (clip && format.flipY ? -1 : 1);
-    const double z =
-        clip && position.size() > 3 ? position[3].toDouble() : position.value(2).toDouble();
-    if(!std::isfinite(u) || !std::isfinite(v) || std::abs(u) > 1e6 || std::abs(v) > 1e6 ||
-       !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) ||
-       qMax(std::abs(x), qMax(std::abs(y), std::abs(z))) > 1e12)
-    {
-      run.clear();
-      continue;
-    }
-    const int vertex = m_UVData->vertices.size();
-    m_UVData->vertices.push_back({QVector3D(float(x), float(y), float(z)), QPointF(u, v), index});
-    run.push_back(vertex);
-    if(config.topology == Topology::TriangleList && row % 3 == 2 && run.size() == 3)
-    {
-      m_UVData->triangles.push_back({{run[0], run[1], run[2]}});
-      run.clear();
-    }
-    else if(config.topology == Topology::TriangleStrip && run.size() >= 3)
-    {
-      const int end = run.size();
-      m_UVData->triangles.push_back({{run[end - 3], run[end - 2], run[end - 1]}});
-    }
-    else if(config.topology == Topology::TriangleFan && run.size() >= 3)
-      m_UVData->triangles.push_back({{run[0], run[run.size() - 2], run.last()}});
-  }
-  m_UVStatus->setText(count < config.numRows ? tr("Partial mesh: preview triangle limit reached.")
-                                             : QString());
-  m_UVCanvas->setProperty("uvTriangleCount", m_UVData->triangles.size());
-  m_UVCanvas->resetView();
-  m_UVModel->resetView();
-  UpdateMeshUVPreview();
+    mesh->bounds = mesh->wire.boundingRect().adjusted(-1e-6, -1e-6, 1e-6, 1e-6);
+    GUIInvoke::call(qApp, [self, mesh, serial, partial]() {
+      if(!self)
+        return;
+      self->m_UVGeometryRunning = false;
+      if(self->m_UVGeometrySerial != serial)
+      {
+        self->StartMeshUVGeometry();
+        return;
+      }
+      self->m_UVData->geometry = mesh;
+      self->m_UVCanvas->geometryChanged();
+      self->m_UVCanvas->resetView();
+      self->m_UVStatus->setText(partial ? tr("Partial mesh: preview triangle limit reached.")
+                                        : QString());
+      self->UpdateMeshUVPreview();
+    });
+  });
+  thread->selfDelete(true);
+  thread->start();
 }
 
 void BufferViewer::UpdateMeshUVTexture()
 {
+  const int index = m_UVTextures->currentIndex() - 1;
+  Descriptor descriptor;
+  if(index >= 0 && index < m_UVTextureBindings.count())
+    descriptor = m_UVTextureBindings[index];
+  const uint32_t event = m_UVEvent;
+  if(event == m_UVTextureEvent && descriptor == m_UVTextureBinding)
+    return;
+  m_UVTextureEvent = event;
+  m_UVTextureBinding = descriptor;
   const uint32_t serial = ++m_UVTextureSerial;
   m_UVData->texture = QImage();
+  m_UVCanvas->textureChanged();
   UpdateMeshUVPreview();
-  const int index = m_UVTextures->currentIndex() - 1;
-  if(index < 0 || index >= m_UVTextureBindings.count() || m_UVEvent != m_Ctx.CurEvent())
+
+  const TextureDescription *texture = m_Ctx.GetTexture(descriptor.resource);
+  if(!texture || event != m_Ctx.CurEvent())
     return;
-  const Descriptor descriptor = m_UVTextureBindings[index];
+  const uint32_t mip = qMin(uint32_t(descriptor.firstMip), 31U);
+  const QSize source(qMax(1U, texture->width >> mip), qMax(1U, texture->height >> mip));
+  const QSize size =
+      source.scaled(QSize(1024, 1024), Qt::KeepAspectRatio).boundedTo(source).expandedTo(QSize(1, 1));
   QPointer<BufferViewer> self(this);
-  const uint32_t event = m_UVEvent;
-  m_Ctx.Replay().AsyncInvoke([self, descriptor, serial, event](IReplayController *controller) {
-    QTemporaryDir directory;
+  const rdcstr tag = QFormatStr("meshUVTexture-%1").arg(uintptr_t(this));
+  m_Ctx.Replay().AsyncInvoke(tag, [self, descriptor, serial, event, size](IReplayController *r) {
+    if(!self || self->m_UVTextureSerial != serial || r->GetCurrentEventID() != event)
+      return;
+    if(!self->m_UVThumbnailOutput)
+      self->m_UVThumbnailOutput = r->CreateOutput(WindowingData(), ReplayOutputType::Texture);
+    if(!self->m_UVThumbnailOutput)
+      return;
+    const bytebuf pixels = self->m_UVThumbnailOutput->DrawThumbnail(
+        size.width(), size.height(), descriptor.resource,
+        Subresource(descriptor.firstMip, descriptor.firstSlice, 0), descriptor.format.compType);
     QImage image;
-    if(directory.isValid())
-    {
-      CBufferReplayEventScope selectedEvent(controller, event);
-      const QString path = directory.filePath(QStringLiteral("uv-texture.png"));
-      TextureSave save;
-      save.resourceId = descriptor.resource;
-      save.destType = FileType::PNG;
-      save.mip = descriptor.firstMip;
-      save.slice.sliceIndex = descriptor.firstSlice;
-      save.alpha = AlphaMapping::Discard;
-      if(controller->SaveTexture(save, path.toUtf8().data()).code == ResultCode::Succeeded)
-      {
-        QImageReader reader(path, "PNG");
-        const QSize size = reader.size();
-        reader.setScaledSize(size.scaled(QSize(1024, 1024), Qt::KeepAspectRatio).boundedTo(size));
-        image = reader.read().convertToFormat(QImage::Format_RGB32);
-      }
-    }
-    if(self)
-      GUIInvoke::call(self, [self, image, serial, event]() {
-        if(!self || self->m_UVTextureSerial != serial || self->m_UVEvent != event)
-          return;
-        self->m_UVData->texture = image;
-        self->m_UVCanvas->setProperty("uvTextureReady", !image.isNull());
-        self->UpdateMeshUVPreview();
-      });
+    if(pixels.size() == size_t(size.width()) * size_t(size.height()) * 3)
+      image =
+          QImage(pixels.data(), size.width(), size.height(), size.width() * 3, QImage::Format_RGB888)
+              .copy();
+    GUIInvoke::call(qApp, [self, image, serial, event]() {
+      if(!self || self->m_UVTextureSerial != serial || self->m_UVEvent != event)
+        return;
+      self->m_UVData->texture = image;
+      self->m_UVCanvas->textureChanged();
+      self->UpdateMeshUVPreview();
+    });
   });
+}
+
+QMatrix4x4 BufferViewer::MeshPreviewTransform() const
+{
+  MeshDisplay config = m_Config;
+  config.cam = m_CurrentCamera->camera();
+  float matrix[16];
+  const QSize size = m_MeshStack->size();
+  RENDERDOC_GetMeshPreviewTransform(config, m_Ctx.APIProps().pipelineType,
+                                    float(qMax(1, size.width())) / qMax(1, size.height()), matrix);
+  return QMatrix4x4(matrix).transposed();
 }
 
 void BufferViewer::UpdateMeshUVPreview()
 {
-  m_UVData->showTexture = ui->visualisation->currentIndex() == UVTextureMode();
-  const bool useUV =
-      m_UVToggle->isChecked() && (m_UVData->showTexture || !m_UVData->selected.isEmpty());
-  if(QStackedWidget *stack = qobject_cast<QStackedWidget *>(ui->render->parentWidget()))
-    stack->setCurrentWidget(useUV ? static_cast<QWidget *>(m_UVModel)
-                                  : static_cast<QWidget *>(ui->render));
-  m_UVModel->update();
-  m_UVCanvas->update();
+  const bool textured = m_UVToggle->isChecked() && m_UVData->geometry &&
+                        !m_UVData->geometry->triangles.isEmpty() && !m_UVData->texture.isNull() &&
+                        ui->visualisation->currentIndex() == UVTextureMode();
+  if(textured && !m_UVTextureView)
+  {
+    m_UVTextureView = new MeshUVTextureView(m_UVData);
+    m_UVTextureContainer = QWidget::createWindowContainer(m_UVTextureView, m_MeshStack);
+    m_UVTextureContainer->setObjectName(QStringLiteral("meshUVTextureView"));
+    m_UVTextureContainer->setFocusPolicy(Qt::StrongFocus);
+    m_UVTextureView->rendered = [this](bool texture, bool wireframe) {
+      m_UVTextureContainer->setProperty("uvTextureRendered", texture);
+      m_UVTextureContainer->setProperty("uvWireframeRendered", wireframe);
+    };
+    m_UVTextureView->installEventFilter(this);
+    m_UVTextureView->unavailable = [this]() {
+      QTimer::singleShot(0, this, [this]() {
+        if(ui->visualisation->currentIndex() == UVTextureMode())
+          ui->visualisation->setCurrentIndex(int(m_Config.visualisationMode));
+        m_UVStatus->setText(tr("The GPU texture preview is unavailable."));
+      });
+    };
+    m_MeshStack->addWidget(m_UVTextureContainer);
+    m_UVTextureView->setSelection(m_UVTexturedSelection, m_UVSelectionPrimitive);
+  }
+  if(textured && m_MeshStack->currentWidget() != m_UVTextureContainer)
+    m_MeshStack->setCurrentWidget(m_UVTextureContainer);
+  else if(!textured && m_MeshStack->currentWidget() != ui->render)
+    m_MeshStack->setCurrentWidget(ui->render);
+  if(textured)
+    m_UVTextureView->setTransform(MeshPreviewTransform(), m_Config.position.unproject,
+                                  m_Config.wireframeDraw);
+}
+
+void BufferViewer::UpdateMeshUVSelection()
+{
+  auto highlight = std::make_shared<MeshUVHighlight>();
+  QVector<QVector4D> texturedSelection;
+  const auto mode = m_UVData->mode;
+  const int count = mode == MeshUVData::Selection::Face   ? 3
+                    : mode == MeshUVData::Selection::Edge ? 2
+                                                          : 1;
+  const unsigned int glPrimitive = count == 3 ? GL_TRIANGLES : count == 2 ? GL_LINES : GL_POINTS;
+  highlight->topology = count == 3   ? Topology::TriangleList
+                        : count == 2 ? Topology::LineList
+                                     : Topology::PointList;
+  bool partial = false;
+  if(m_UVData->geometry && !m_UVData->selected.isEmpty())
+  {
+    const auto &mesh = *m_UVData->geometry;
+    QSet<quint64> included;
+    for(int i = 0; i < mesh.triangles.size(); ++i)
+    {
+      const auto &face = mesh.triangles[i];
+      for(int corner = 0; corner < m_UVData->elementCount(); ++corner)
+      {
+        const quint64 key = m_UVData->key(i, corner);
+        if(!m_UVData->selected.contains(key) || included.contains(key))
+          continue;
+        included.insert(key);
+        const size_t vertexCount = count == 1 ? 6 : count;
+        if(highlight->positions.size() + vertexCount > MaxMeshComponentHighlightVertices)
+        {
+          partial = true;
+          continue;
+        }
+        for(int vertex = 0; vertex < count; ++vertex)
+        {
+          const QVector4D &p = mesh.vertices[face[(corner + vertex) % 3]].position;
+          texturedSelection.push_back(p);
+          for(size_t j = 0; j < (count == 1 ? 6U : 1U); ++j)
+            highlight->positions.push_back(FloatVector(p.x(), p.y(), p.z(), p.w()));
+        }
+      }
+    }
+  }
+  ui->render->setProperty("uvHighlightedVertices", int(highlight->positions.size()));
+  if(partial)
+    m_UVStatus->setText(tr("Partial highlight for a large selection."));
+  else if(m_UVHighlightPartial)
+    m_UVStatus->clear();
+  m_UVHighlightPartial = partial;
+  m_UVTexturedSelection = texturedSelection;
+  m_UVSelectionPrimitive = glPrimitive;
+  if(m_UVTextureView)
+    m_UVTextureView->setSelection(m_UVTexturedSelection, m_UVSelectionPrimitive);
+  std::atomic_store(&m_UVHighlight, std::shared_ptr<const MeshUVHighlight>(highlight));
+  QueueMeshPreview();
+}
+
+void BufferViewer::QueueMeshPreview()
+{
+  if(!m_Ctx.IsCaptureLoaded())
+    return;
+  if(m_UVTextureView && m_MeshStack->currentWidget() == m_UVTextureContainer)
+  {
+    m_UVTextureView->setTransform(MeshPreviewTransform(), m_Config.position.unproject,
+                                  m_Config.wireframeDraw);
+    return;
+  }
+  const rdcstr tag = QFormatStr("mesh-preview-%1").arg(uintptr_t(this));
+  QPointer<BufferViewer> self(this);
+  m_Ctx.Replay().AsyncInvoke(tag, [self](IReplayController *r) {
+    if(self)
+      self->RT_UpdateAndDisplay(r);
+  });
 }
 
 void BufferViewer::SetupMeshView()
@@ -5091,6 +5372,7 @@ void BufferViewer::SetupMeshView()
     UI_ConfigureFormats();
     on_resetCamera_clicked();
     UpdateCurrentMeshConfig();
+    UpdateMeshUVGeometry();
     INVOKE_MEMFN(RT_UpdateAndDisplay);
   });
   QObject::connect(m_SelectPosColumn, &QAction::triggered, [this]() {
@@ -5101,6 +5383,7 @@ void BufferViewer::SetupMeshView()
     UI_ConfigureFormats();
     on_resetCamera_clicked();
     UpdateCurrentMeshConfig();
+    UpdateMeshUVGeometry();
     INVOKE_MEMFN(RT_UpdateAndDisplay);
   });
   QObject::connect(m_SelectSecondColumn, &QAction::triggered, [this]() {
@@ -5756,9 +6039,14 @@ void BufferViewer::stageRowMenu(MeshDataStage stage, QMenu *menu, const QPoint &
 BufferViewer::~BufferViewer()
 {
   UI_InvalidateCBufferLiveEdit();
-  if(m_Output)
+  if(m_Output || m_UVThumbnailOutput)
   {
-    m_Ctx.Replay().BlockInvoke([this](IReplayController *r) { m_Output->Shutdown(); });
+    m_Ctx.Replay().BlockInvoke([this](IReplayController *) {
+      if(m_UVThumbnailOutput)
+        m_UVThumbnailOutput->Shutdown();
+      if(m_Output)
+        m_Output->Shutdown();
+    });
   }
 
   delete m_Arcball;
@@ -5798,12 +6086,15 @@ void BufferViewer::OnCaptureClosed()
     const QSignalBlocker channels(m_UVChannels);
     const QSignalBlocker textures(m_UVTextures);
     m_UVEvent = 0;
+    m_UVThumbnailOutput = NULL;
     m_UVManualChannel.clear();
     ++m_UVTextureSerial;
-    m_UVData->vertices.clear();
-    m_UVData->triangles.clear();
-    m_UVData->selected.clear();
+    ++m_UVGeometrySerial;
+    m_UVTextureEvent = 0;
+    m_UVData->geometry.reset();
     m_UVData->texture = QImage();
+    m_UVCanvas->geometryChanged();
+    m_UVCanvas->textureChanged();
     m_UVChannels->clear();
     m_UVTextures->clear();
   }
@@ -5877,10 +6168,12 @@ void BufferViewer::OnEventChanged(uint32_t eventId)
   if(m_UVData && m_UVEvent != eventId)
   {
     ++m_UVTextureSerial;
-    m_UVData->vertices.clear();
-    m_UVData->triangles.clear();
-    m_UVData->selected.clear();
+    ++m_UVGeometrySerial;
+    m_UVTextureEvent = 0;
+    m_UVData->geometry.reset();
     m_UVData->texture = QImage();
+    m_UVCanvas->geometryChanged();
+    m_UVCanvas->textureChanged();
     UpdateMeshUVPreview();
   }
   // A pinned viewer owns its binding snapshot. Event navigation must not replace it or
@@ -8423,6 +8716,24 @@ void BufferViewer::render_mouseMove(QMouseEvent *e)
   if(!m_Ctx.IsCaptureLoaded())
     return;
 
+  if(m_UVMeshSelecting && e->buttons() == Qt::LeftButton)
+  {
+    m_UVMeshDragged |=
+        (e->pos() - m_UVMeshPress).manhattanLength() >= QApplication::startDragDistance();
+    if(m_UVBox->isChecked())
+    {
+      if(m_UVMeshDragged)
+      {
+        m_UVMeshBox->setGeometry(QRect(m_UVMeshPress, e->pos()).normalized());
+        m_UVMeshBox->show();
+        m_UVMeshBox->raise();
+      }
+      return;
+    }
+    if(!m_UVMeshDragged)
+      return;
+  }
+
   if(m_CurrentCamera)
     m_CurrentCamera->MouseMove(e);
 
@@ -8432,7 +8743,7 @@ void BufferViewer::render_mouseMove(QMouseEvent *e)
   // display if any mouse buttons are held while moving.
   if(e->buttons() != Qt::NoButton)
   {
-    INVOKE_MEMFN(RT_UpdateAndDisplay);
+    QueueMeshPreview();
   }
 }
 
@@ -8446,6 +8757,7 @@ void BufferViewer::render_clicked(QMouseEvent *e)
   curpos *= ui->render->devicePixelRatioF();
 
   if((e->buttons() & Qt::RightButton) && m_Output &&
+     (!m_MeshStack || m_MeshStack->currentWidget() == ui->render) &&
      meshCameraGesture(m_Ctx.Config().MeshViewer_CameraNavigation, e->buttons(), e->modifiers()) !=
          MeshCameraGesture::Dolly)
   {
@@ -8483,12 +8795,27 @@ void BufferViewer::render_clicked(QMouseEvent *e)
     });
   }
 
+  if(e->button() == Qt::LeftButton)
+  {
+    m_UVMeshSelecting = m_UVToggle && m_UVToggle->isChecked() && m_UVData->geometry &&
+                        !m_UVData->geometry->triangles.isEmpty() && e->buttons() == Qt::LeftButton &&
+                        !(e->modifiers() & (Qt::AltModifier | Qt::ControlModifier)) &&
+                        m_Config.visualisationMode != Visualisation::Explode;
+    m_UVMeshPress = e->pos();
+    m_UVMeshDragged = false;
+  }
+
+  if(m_MeshStack)
+    m_MeshStack->currentWidget()->setFocus();
+  else
+    ui->render->setFocus();
+
+  if(m_UVMeshSelecting && m_UVBox->isChecked())
+    return;
   if(m_CurrentCamera)
     m_CurrentCamera->MouseClick(e);
 
-  ui->render->setFocus();
-
-  INVOKE_MEMFN(RT_UpdateAndDisplay);
+  QueueMeshPreview();
 }
 
 void BufferViewer::render_unclicked(QMouseEvent *e)
@@ -8496,10 +8823,23 @@ void BufferViewer::render_unclicked(QMouseEvent *e)
   if(!m_Ctx.IsCaptureLoaded())
     return;
 
+  if(m_UVMeshSelecting && e->button() == Qt::LeftButton)
+  {
+    m_UVMeshSelecting = false;
+    m_UVMeshBox->hide();
+    const bool extend = (e->modifiers() & Qt::ShiftModifier) != 0;
+    const QSize size = m_MeshStack->size();
+    if(m_UVBox->isChecked() && m_UVMeshDragged)
+      m_UVCanvas->selectMeshBox(QRectF(m_UVMeshPress, e->localPos()).normalized(), size,
+                                MeshPreviewTransform(), extend);
+    else if(!m_UVMeshDragged)
+      m_UVCanvas->selectMesh(e->localPos(), size, MeshPreviewTransform(), extend);
+  }
+
   if(m_CurrentCamera)
     m_CurrentCamera->MouseUnclick(e);
 
-  INVOKE_MEMFN(RT_UpdateAndDisplay);
+  QueueMeshPreview();
 }
 
 void BufferViewer::ScrollToRow(RDTableView *view, int row)
@@ -8720,6 +9060,22 @@ void BufferViewer::ScrollToColumn(int32_t column, MeshDataStage stage)
 
 bool BufferViewer::eventFilter(QObject *watched, QEvent *event)
 {
+  if(m_UVTextureView && watched == m_UVTextureView)
+  {
+    switch(event->type())
+    {
+      case QEvent::MouseButtonPress: render_clicked(static_cast<QMouseEvent *>(event)); return true;
+      case QEvent::MouseButtonRelease:
+        render_unclicked(static_cast<QMouseEvent *>(event));
+        return true;
+      case QEvent::MouseMove: render_mouseMove(static_cast<QMouseEvent *>(event)); return true;
+      case QEvent::Wheel: render_mouseWheel(static_cast<QWheelEvent *>(event)); return true;
+      case QEvent::KeyPress: render_keyPress(static_cast<QKeyEvent *>(event)); return true;
+      case QEvent::KeyRelease: render_keyRelease(static_cast<QKeyEvent *>(event)); return true;
+      case QEvent::Resize: QueueMeshPreview(); break;
+      default: break;
+    }
+  }
   if(watched == m_CBufferSearch && event->type() == QEvent::KeyPress &&
      static_cast<QKeyEvent *>(event)->key() == Qt::Key_Escape)
   {
@@ -9056,7 +9412,7 @@ void BufferViewer::render_mouseWheel(QWheelEvent *e)
   if(m_CurrentCamera)
     m_CurrentCamera->MouseWheel(e);
 
-  INVOKE_MEMFN(RT_UpdateAndDisplay);
+  QueueMeshPreview();
 }
 
 void BufferViewer::render_keyPress(QKeyEvent *e)
@@ -9082,13 +9438,16 @@ void BufferViewer::render_keyPress(QKeyEvent *e)
                                    m_Config.axisMapping.zAxis.z * z,
                                1.0f);
       m_Arcball->setLookAtPos(center);
-      INVOKE_MEMFN(RT_UpdateAndDisplay);
+      QueueMeshPreview();
     }
     else
       on_resetCamera_clicked();
     e->accept();
     return;
   }
+  if(m_UVToggle && m_UVToggle->isChecked() && m_CurrentCamera == m_Arcball &&
+     m_UVCanvas->handleSelectionShortcut(e))
+    return;
   m_CurrentCamera->KeyDown(e);
 }
 
@@ -9100,18 +9459,35 @@ void BufferViewer::render_keyRelease(QKeyEvent *e)
 void BufferViewer::render_timer()
 {
   if(m_CurrentCamera && m_CurrentCamera->Update(ui->render->rect()))
-    INVOKE_MEMFN(RT_UpdateAndDisplay);
+    QueueMeshPreview();
 }
 
 void BufferViewer::RT_UpdateAndDisplay(IReplayController *)
 {
   if(m_Output)
   {
-    m_Config.cam = m_CurrentCamera->camera();
-    m_Output->SetMeshDisplay(m_Config);
+    MeshDisplay config = m_Config;
+    config.cam = m_CurrentCamera->camera();
+    const auto highlight = std::atomic_load(&m_UVHighlight);
+    if(highlight && !highlight->positions.empty() &&
+       config.visualisationMode != Visualisation::Explode)
+    {
+      config.highlightVert = ~0U;
+      RENDERDOC_SetMeshComponentHighlight(m_Output, highlight->positions.data(),
+                                          uint32_t(highlight->positions.size()), highlight->topology);
+    }
+    else
+      RENDERDOC_SetMeshComponentHighlight(m_Output, nullptr, 0, Topology::Unknown);
+    m_Output->SetMeshDisplay(config);
   }
 
-  GUIInvoke::call(this, [this]() { ui->render->update(); });
+  GUIInvoke::call(this, [this]() {
+    if(m_UVTextureView && m_MeshStack->currentWidget() == m_UVTextureContainer)
+      m_UVTextureView->setTransform(MeshPreviewTransform(), m_Config.position.unproject,
+                                    m_Config.wireframeDraw);
+    else
+      ui->render->update();
+  });
 }
 
 QPushButton *BufferViewer::MakePreviousPageButton()
@@ -10704,8 +11080,10 @@ void BufferViewer::on_exploderScale_valueChanged(double value)
 void BufferViewer::on_wireframeRender_toggled(bool checked)
 {
   m_Config.wireframeDraw = checked;
+  if(!checked && ui->visualisation->currentIndex() == int(Visualisation::NoSolid))
+    ui->visualisation->setCurrentIndex(int(Visualisation::Solid));
 
-  INVOKE_MEMFN(RT_UpdateAndDisplay);
+  QueueMeshPreview();
 }
 
 void BufferViewer::on_visualisation_currentIndexChanged(int index)
@@ -10716,15 +11094,10 @@ void BufferViewer::on_visualisation_currentIndexChanged(int index)
     UpdateMeshUVPreview();
     return;
   }
-  if(m_UVData)
-    UpdateMeshUVPreview();
-  ui->wireframeRender->setEnabled(index > 0);
 
-  if(!ui->wireframeRender->isEnabled())
-  {
+  ui->wireframeRender->setEnabled(true);
+  if(index == int(Visualisation::NoSolid))
     ui->wireframeRender->setChecked(true);
-    m_Config.wireframeDraw = true;
-  }
 
   bool explodeHidden = (index != (int)Visualisation::Explode);
   ui->vtxExploderLabel->setHidden(explodeHidden);
@@ -10753,7 +11126,9 @@ void BufferViewer::on_visualisation_currentIndexChanged(int index)
                                   m_Config.visualisationMode == Visualisation::Secondary,
                                   m_ModelOut2->secondaryAlpha());
 
-  INVOKE_MEMFN(RT_UpdateAndDisplay);
+  if(m_UVData)
+    UpdateMeshUVPreview();
+  QueueMeshPreview();
 }
 
 void BufferViewer::on_drawRange_currentIndexChanged(int index)

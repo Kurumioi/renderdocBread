@@ -44,7 +44,7 @@ static int VisModeToMeshDisplayFormat(const MeshDisplay &cfg)
 }
 
 void GLReplay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secondaryDraws,
-                          const MeshDisplay &cfg)
+                          const MeshDisplay &cfg, const MeshComponentHighlight &components)
 {
   WrappedOpenGL &drv = *m_pDriver;
 
@@ -624,6 +624,29 @@ void GLReplay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secondar
 
   if(!IsGLES)
     drv.glPolygonMode(eGL_FRONT_AND_BACK, eGL_FILL);
+
+  if(!components.vertices.empty())
+  {
+    const bool points = components.topology == Topology::PointList;
+    const Topology topology = points ? Topology::TriangleList : components.topology;
+    MeshUBOData component = uboParams;
+    component.mvp = components.DepthBiasedTransform(
+        projMat.Mul(camMat.Mul(cfg.position.unproject ? guessProjInv : axisMapMat)));
+    component.homogenousInput = cfg.position.unproject;
+    component.color = Vec4f(1.0f, 0.36f, 0.035f, 1.0f);
+    if(points)
+      component.pointSpriteSize = Vec2f(-500.0f / DebugData.outWidth, 500.0f / DebugData.outHeight);
+    drv.glBufferSubData(eGL_UNIFORM_BUFFER, 0, sizeof(component), &component);
+    drv.glBindVertexArray(DebugData.triHighlightVAO);
+    drv.glBindBuffer(eGL_ARRAY_BUFFER, DebugData.triHighlightBuffer);
+    if(components.vertices.size() > 24)
+      drv.glBufferData(eGL_ARRAY_BUFFER, components.vertices.byteSize(), NULL, eGL_DYNAMIC_DRAW);
+    drv.glBufferSubData(eGL_ARRAY_BUFFER, 0, components.vertices.byteSize(),
+                        components.vertices.data());
+    drv.glDepthFunc(eGL_LEQUAL);
+    drv.glDrawArrays(MakeGLPrimitiveTopology(topology), 0, (GLsizei)components.vertices.size());
+    drv.glDepthFunc(eGL_ALWAYS);
+  }
 
   // show highlighted vertex
   if(cfg.highlightVert != ~0U)
