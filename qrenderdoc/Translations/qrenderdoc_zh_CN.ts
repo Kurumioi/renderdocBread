@@ -20108,19 +20108,19 @@ Documentation is available: https://renderdoc.org/docs/python_api/index.html</so
     <name>QRDUtils</name>
     <message>
         <location filename="../Code/QRDUtils.cpp" line="+447"/>
-        <location line="+43"/>
+        <location line="+44"/>
         <source>Error running program as root</source>
         <translation>以 root 身份运行程序时出错</translation>
     </message>
     <message>
-        <location line="-42"/>
+        <location line="-43"/>
         <source>Couldn&apos;t find graphical or terminal sudo program!
 Please run &apos;%1&apos; with args &apos;%2&apos; manually.</source>
         <translation>找不到图形界面或终端 sudo 程序！
 请手动运行 &apos;%1&apos;，参数为 &apos;%2&apos;。</translation>
     </message>
     <message>
-        <location line="+43"/>
+        <location line="+44"/>
         <source>Couldn&apos;t find graphical or terminal emulator to launch sudo!
 Please manually run: sudo &quot;%1&quot; %2</source>
         <translation>找不到可用于启动 sudo 的图形界面或终端模拟器！
@@ -20130,7 +20130,7 @@ Please manually run: sudo &quot;%1&quot; %2</source>
 <context>
     <name>RDDialog</name>
     <message>
-        <location line="-792"/>
+        <location line="-793"/>
         <source>Executables (*.exe);;All Files (*)</source>
         <translation>可执行文件 (*.exe);;所有文件 (*)</translation>
     </message>
@@ -32743,7 +32743,7 @@ The buffer is %3 bytes in length.
         </translation>
     </message>
     <message>
-        <location line="+3821"/>
+        <location line="+3822"/>
         <source>%1 seconds</source>
         <translation>%1 秒</translation>
     </message>

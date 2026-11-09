@@ -3984,8 +3984,8 @@ void WrappedID3D12GraphicsCommandList::FinaliseExecuteIndirectEvents(BakedCmdLis
   // without also invalidating the already-published EIDs for its first execution.
   if(exec.countResolved && count != exec.reservedCount)
   {
-    m_pDevice->ReportFatalError(RDResult(
-        ResultCode::APIReplayFailed, "ExecuteIndirect count changed between list executions"));
+    m_pDevice->ReportFatalError(RDResult(ResultCode::APIReplayFailed,
+                                         "ExecuteIndirect count changed between list executions"));
     return;
   }
 
