@@ -273,6 +273,14 @@ UpdateDialog::UpdateDialog(const QString &installedVersion, const BreadRelease &
 
 UpdateDialog::~UpdateDialog()
 {
+  m_ProgressTimer->stop();
+  QObject::disconnect(m_Download, nullptr, this, nullptr);
+  // Stop the downloader before the staging directory is destroyed on window close.
+  if(m_Download->state() != QProcess::NotRunning)
+  {
+    m_Download->kill();
+    m_Download->waitForFinished();
+  }
   delete ui;
 }
 

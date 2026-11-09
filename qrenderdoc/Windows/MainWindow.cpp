@@ -407,7 +407,7 @@ MainWindow::MainWindow(ICaptureContext &ctx) : QMainWindow(NULL), ui(new Ui::Mai
   PopulateRecentCaptureSettings();
   PopulateReportedBugs();
 
-  CheckUpdates();
+  QTimer::singleShot(0, this, [this]() { CheckUpdates(); });
 
   rdcarray<BugReport> bugs = m_Ctx.Config().CrashReport_ReportedBugs;
   LambdaThread *bugupdate = new LambdaThread([this, bugs]() {
@@ -1500,8 +1500,12 @@ void MainWindow::CheckUpdates(bool forceCheck)
     return;
   }
 
-  if(HandleMismatchedVersions())
+  if(IsVersionMismatched())
+  {
+    if(forceCheck)
+      HandleMismatchedVersions();
     return;
+  }
 
   PersistantConfig &config = m_Ctx.Config();
   // Invalidate the old upstream response and checks for a different Bread version.
@@ -1525,14 +1529,17 @@ void MainWindow::CheckUpdates(bool forceCheck)
 
   m_CheckingForUpdates = true;
   ui->action_Check_for_Updates->setEnabled(false);
-  statusText->setText(tr("Checking for updates..."));
+  const QString updateStatus = forceCheck ? tr("Checking for updates...") : QString();
+  if(!updateStatus.isEmpty())
+    statusText->setText(updateStatus);
 
   QProcess *request = new QProcess(this);
-  auto finish = [this, request]() {
+  auto finish = [this, request, updateStatus]() {
     request->deleteLater();
     m_CheckingForUpdates = false;
     ui->action_Check_for_Updates->setEnabled(true);
-    statusText->clear();
+    if(!updateStatus.isEmpty() && statusText->text() == updateStatus)
+      statusText->clear();
   };
   QObject::connect(request, &QProcess::errorOccurred, this,
                    [this, request, finish, forceCheck](QProcess::ProcessError error) {
@@ -1573,7 +1580,7 @@ void MainWindow::CheckUpdates(bool forceCheck)
         updateAction->setVisible(cfg.CheckUpdate_UpdateAvailable);
 
         if(newer)
-          UpdatePopup(version, data);
+          UpdatePopup(version, data, !forceCheck);
         else if(forceCheck)
           RDDialog::information(this, tr("Latest version"),
                                 tr("You are running the latest version."));
@@ -1604,29 +1611,46 @@ void MainWindow::SetUpdateAvailable()
     updateAction->setVisible(true);
 }
 
-void MainWindow::UpdatePopup(const QString &version, const QByteArray &response)
+void MainWindow::UpdatePopup(const QString &version, const QByteArray &response, bool automatic)
 {
+  if(m_UpdateDialog)
+  {
+    if(!automatic)
+    {
+      m_UpdateDialog->raise();
+      m_UpdateDialog->activateWindow();
+    }
+    return;
+  }
+
   const BreadRelease release = BreadRelease::FromGitHub(response);
   if(version.isEmpty() || release.version.isEmpty() ||
      QVersionNumber::fromString(release.version) <= QVersionNumber::fromString(version))
     return;
 
-  UpdateDialog dialog(version, release, this);
-  if(RDDialog::show(&dialog) != QDialog::Accepted)
-    return;
+  UpdateDialog *dialog = new UpdateDialog(version, release, this);
+  m_UpdateDialog = dialog;
+  dialog->setAttribute(Qt::WA_ShowWithoutActivating, automatic);
+  QObject::connect(dialog, &QDialog::finished, this, [this, dialog, version, release](int result) {
+    m_UpdateDialog = nullptr;
+    dialog->deleteLater();
+    if(result != QDialog::Accepted)
+      return;
 
-  std::unique_ptr<QTemporaryDir> staging = dialog.TakeStaging();
-  if(!close())
-    return;
+    std::unique_ptr<QTemporaryDir> staging = dialog->TakeStaging();
+    if(!staging || !close())
+      return;
 
-  if(UpdateDialog::StartInstaller(*staging, version, release))
-    staging->setAutoRemove(false);
-  else
-  {
-    show();
-    RDDialog::critical(this, tr("Could not start the update"),
-                       tr("RenderDocBread could not start the update installer."));
-  }
+    if(UpdateDialog::StartInstaller(*staging, version, release))
+      staging->setAutoRemove(false);
+    else
+    {
+      show();
+      RDDialog::critical(this, tr("Could not start the update"),
+                         tr("RenderDocBread could not start the update installer."));
+    }
+  });
+  dialog->show();
 }
 
 void MainWindow::ShowLiveCapture(LiveCapture *live)

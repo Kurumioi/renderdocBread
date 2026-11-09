@@ -17422,7 +17422,7 @@ Close the capture or save to another location.</source>
     </message>
     <message>
         <location line="+46"/>
-        <location line="+1873"/>
+        <location line="+1897"/>
         <location line="+119"/>
         <location line="+13"/>
         <location line="+112"/>
@@ -17431,8 +17431,8 @@ Close the capture or save to another location.</source>
         <translation>重放上下文：%1</translation>
     </message>
     <message>
-        <location line="-2279"/>
-        <location line="+1873"/>
+        <location line="-2303"/>
+        <location line="+1897"/>
         <location line="+60"/>
         <location line="+59"/>
         <location line="+125"/>
@@ -17441,7 +17441,7 @@ Close the capture or save to another location.</source>
         <translation>本地</translation>
     </message>
     <message>
-        <location line="-2195"/>
+        <location line="-2219"/>
         <source>vkconfig detected - possible incompatibility</source>
         <translation>检测到 vkconfig——可能不兼容</translation>
     </message>
@@ -17471,13 +17471,13 @@ If this program is not active check the path below for any leftover files:
     </message>
     <message>
         <location line="+105"/>
-        <location line="+1952"/>
+        <location line="+1976"/>
         <location line="+43"/>
         <source>Resolve Symbols</source>
         <translation>解析符号</translation>
     </message>
     <message>
-        <location line="-1981"/>
+        <location line="-2005"/>
         <source>Start Self-hosted Capture</source>
         <translation>开始自托管捕获</translation>
     </message>
@@ -17820,12 +17820,12 @@ Would you like to open the downloads page to reinstall?</source>
         <translation>标准便携版支持自动安装更新。是否打开 GitHub 发布页面？</translation>
     </message>
     <message>
-        <location line="+32"/>
+        <location line="+36"/>
         <source>Checking for updates...</source>
         <translation>正在检查更新...</translation>
     </message>
     <message>
-        <location line="+32"/>
+        <location line="+35"/>
         <source>GitHub returned invalid release information.</source>
         <translation>GitHub 返回的发布信息无效。</translation>
     </message>
@@ -17840,7 +17840,7 @@ Would you like to open the downloads page to reinstall?</source>
         <translation>RenderDocBread 无法在 GitHub 上检查更新。是否打开发布页面？</translation>
     </message>
     <message>
-        <location line="+31"/>
+        <location line="+46"/>
         <source>Could not start the update</source>
         <translation>无法启动更新</translation>
     </message>
@@ -17850,7 +17850,7 @@ Would you like to open the downloads page to reinstall?</source>
         <translation>RenderDocBread 无法启动更新安装程序。</translation>
     </message>
     <message>
-        <location line="+271"/>
+        <location line="+273"/>
         <location line="+19"/>
         <source>File not found</source>
         <translation>找不到文件</translation>
@@ -18055,7 +18055,7 @@ Check remote server connection.</source>
         <translation>正在更新可用设备，请稍候...</translation>
     </message>
     <message>
-        <location line="-1603"/>
+        <location line="-1620"/>
         <source>Latest version</source>
         <translation>最新版本</translation>
     </message>
@@ -18065,7 +18065,7 @@ Check remote server connection.</source>
         <translation>您正在运行最新版本。</translation>
     </message>
     <message>
-        <location line="+1749"/>
+        <location line="+1766"/>
         <source>Global hook active</source>
         <translation>全局挂钩处于活动状态</translation>
     </message>
@@ -23382,7 +23382,7 @@ The project folder and every local file will remain on disk.</source>
     </message>
     <message>
         <location line="+3"/>
-        <location filename="../Windows/MainWindow.cpp" line="-3526"/>
+        <location filename="../Windows/MainWindow.cpp" line="-3550"/>
         <source>Frame Rendering Flow</source>
         <translation>帧渲染流程图</translation>
     </message>
@@ -29829,12 +29829,12 @@ If these parameters are incorrect - e.g. you are using an orthographic projectio
     </message>
     <message>
         <location/>
-        <location filename="../Windows/Dialogs/UpdateDialog.cpp" line="+304"/>
+        <location filename="../Windows/Dialogs/UpdateDialog.cpp" line="+312"/>
         <source>Close</source>
         <translation>关闭</translation>
     </message>
     <message>
-        <location filename="../Windows/Dialogs/UpdateDialog.cpp" line="-111"/>
+        <location filename="../Windows/Dialogs/UpdateDialog.cpp" line="-119"/>
         <source>Update Available - v%1</source>
         <translation>有可用更新 - v%1</translation>
     </message>
@@ -29869,7 +29869,7 @@ If these parameters are incorrect - e.g. you are using an orthographic projectio
         <translation>下载包的大小与发布信息不符。</translation>
     </message>
     <message>
-        <location line="+36"/>
+        <location line="+44"/>
         <source>Download failed.
 %1</source>
         <translation>下载失败。
@@ -29896,8 +29896,8 @@ If these parameters are incorrect - e.g. you are using an orthographic projectio
         <translation>取消</translation>
     </message>
     <message>
-        <location line="-89"/>
-        <location line="+88"/>
+        <location line="-97"/>
+        <location line="+96"/>
         <source>Downloading update...</source>
         <translation>正在下载更新...</translation>
     </message>
