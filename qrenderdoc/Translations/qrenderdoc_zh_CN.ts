@@ -4367,7 +4367,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
 <context>
     <name>AIConversationView</name>
     <message>
-        <location filename="../Windows/AI/AIConversationView.cpp" line="+1557"/>
+        <location filename="../Windows/AI/AIConversationView.cpp" line="+1554"/>
         <source>Edited %1 files</source>
         <translation>已编辑 %1 个文件</translation>
     </message>
@@ -4382,12 +4382,12 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>……该文件夹内还有更多文件</translation>
     </message>
     <message>
-        <location line="-1049"/>
+        <location line="-1046"/>
         <source>Code</source>
         <translation>代码</translation>
     </message>
     <message>
-        <location line="+247"/>
+        <location line="+244"/>
         <location line="+38"/>
         <source>queued</source>
         <translation>排队中</translation>

@@ -569,9 +569,8 @@ QString safeMarkdown(QString text)
   int listKind = 0;
   bool listItemOpen = false;
   auto closeLists = [&]() {
-    // i18n-ignore: closing HTML list-item tag, no user-visible prose.
     if(listItemOpen)
-      html += lit("</li>");
+      html += lit("</li>");    // i18n-ignore: closing HTML list-item tag.
     listItemOpen = false;
     closeList(html, listKind);
   };
@@ -670,9 +669,8 @@ QString safeMarkdown(QString text)
         html += lit("<ul>");
         listKind = 1;
       }
-      // i18n-ignore: structural list-item HTML contains model-authored text separately.
       if(listItemOpen)
-        html += lit("</li>");
+        html += lit("</li>");    // i18n-ignore: closing HTML list-item tag.
       // i18n-ignore: opening HTML list-item tag, no user-visible prose.
       html += lit("<li>") + inlineMarkdown(line.mid(2));
       listItemOpen = true;
@@ -688,9 +686,8 @@ QString safeMarkdown(QString text)
         html += lit("<ol>");
         listKind = 2;
       }
-      // i18n-ignore: closing HTML list-item tag, no user-visible prose.
       if(listItemOpen)
-        html += lit("</li>");
+        html += lit("</li>");    // i18n-ignore: closing HTML list-item tag.
       // i18n-ignore: opening HTML list-item tag, no user-visible prose.
       html += lit("<li>") + inlineMarkdown(line.mid(orderedStart));
       listItemOpen = true;
