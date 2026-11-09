@@ -27,6 +27,7 @@
 #include <stdint.h>
 #include <QMainWindow>
 #include <QMutex>
+#include <QPointer>
 #include <QSemaphore>
 #include <QThread>
 #include <QTimer>
@@ -48,6 +49,7 @@ class QShortcut;
 class QToolButton;
 class CaptureDialog;
 class LiveCapture;
+class UpdateDialog;
 class QNetworkAccessManager;
 
 class NetworkWorker : public QObject
@@ -235,17 +237,6 @@ private:
   void MakeNetworkRequest(QUrl url, std::function<void(QByteArray)> success,
                           std::function<void(QString)> failure = {});
 
-  enum class UpdateResult
-  {
-    Disabled,
-    Unofficial,
-    Toosoon,
-    Latest,
-    Upgrade,
-  };
-
-  typedef std::function<void(UpdateResult)> UpdateResultMethod;
-
   Ui::MainWindow *ui;
   ICaptureContext &m_Ctx;
 
@@ -262,6 +253,7 @@ private:
   QToolButton *contextChooser;
 
   QAction *updateAction = NULL;
+  QPointer<UpdateDialog> m_UpdateDialog;
 
   QTimer m_MessageTick;
   // UI-thread owned. Debug message polling is single-flight so a slow replay/remote call cannot
@@ -288,10 +280,11 @@ private:
 
   QString m_LastSaveCapturePath;
 
-  void CheckUpdates(bool forceCheck = false, UpdateResultMethod callback = UpdateResultMethod());
+  void CheckUpdates(bool forceCheck = false);
+  void ReportUpdateCheckFailure(const QString &error, bool manual);
+  bool m_CheckingForUpdates = false;
   void SetUpdateAvailable();
-  void SetNoUpdate();
-  void UpdatePopup();
+  void UpdatePopup(const QString &version, const QByteArray &response, bool automatic = false);
   bool HandleMismatchedVersions();
   bool IsVersionMismatched();
 

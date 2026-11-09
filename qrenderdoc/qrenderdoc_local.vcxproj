@@ -1847,7 +1847,7 @@
           Exclude="..\replaylab\renderdoc_mcp_bridge\**\__pycache__\**" />
     <None Include="..\replaylab\renderdoc_mcp_bridge\integration.json" />
     <CustomBuild Include="Resources\resources.qrc">
-      <AdditionalInputs>Resources\resources.qrc;Translations\qrenderdoc_zh_CN.qm;Translations\qt_zh_CN.qm;$(QtBinDir)\rcc.exe;%(AdditionalInputs)</AdditionalInputs>
+      <AdditionalInputs>Resources\resources.qrc;Resources\ApplyBreadUpdate.ps1;Translations\qrenderdoc_zh_CN.qm;Translations\qt_zh_CN.qm;$(QtBinDir)\rcc.exe;%(AdditionalInputs)</AdditionalInputs>
       <Command>"$(QtBinDir)\rcc.exe" -name resources Resources\resources.qrc -o "$(IntDir)generated\qrc_resources.cpp"</Command>
       <Message>RCC resources.qrc</Message>
       <Outputs>$(IntDir)generated\qrc_resources.cpp</Outputs>
