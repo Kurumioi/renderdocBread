@@ -235,17 +235,6 @@ private:
   void MakeNetworkRequest(QUrl url, std::function<void(QByteArray)> success,
                           std::function<void(QString)> failure = {});
 
-  enum class UpdateResult
-  {
-    Disabled,
-    Unofficial,
-    Toosoon,
-    Latest,
-    Upgrade,
-  };
-
-  typedef std::function<void(UpdateResult)> UpdateResultMethod;
-
   Ui::MainWindow *ui;
   ICaptureContext &m_Ctx;
 
@@ -288,10 +277,11 @@ private:
 
   QString m_LastSaveCapturePath;
 
-  void CheckUpdates(bool forceCheck = false, UpdateResultMethod callback = UpdateResultMethod());
+  void CheckUpdates(bool forceCheck = false);
+  void ReportUpdateCheckFailure(const QString &error, bool manual);
+  bool m_CheckingForUpdates = false;
   void SetUpdateAvailable();
-  void SetNoUpdate();
-  void UpdatePopup();
+  void UpdatePopup(const QString &version, const QByteArray &response);
   bool HandleMismatchedVersions();
   bool IsVersionMismatched();
 

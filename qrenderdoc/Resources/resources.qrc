@@ -1,6 +1,7 @@
 <RCC>
     <qresource prefix="/">
         <file>logo.svg</file>
+        <file>ApplyBreadUpdate.ps1</file>
         <file>topologies/topo_linelist.svg</file>
         <file>topologies/topo_linelist_adj.svg</file>
         <file>topologies/topo_linestrip.svg</file>
