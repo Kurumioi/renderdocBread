@@ -28,6 +28,7 @@
 #include <QElapsedTimer>
 #include <QTemporaryDir>
 #include <QUrl>
+#include <functional>
 #include <memory>
 
 namespace Ui
@@ -48,10 +49,12 @@ struct BreadRelease
   QString sha256;
   qint64 size = 0;
 
+  static QUrl RepositoryPage();
   static QUrl ReleasesPage();
   static QString InstalledVersion();
   static BreadRelease FromGitHub(const QByteArray &json);
-  static void Request(QProcess *process, const QUrl &url, const QStringList &options);
+  static void Check(QObject *owner, const QString &installedVersion,
+                    std::function<void(QByteArray, QString)> completed);
 };
 
 class UpdateDialog : public QDialog
@@ -72,6 +75,7 @@ private slots:
 private:
   void reject() override;
   void DownloadFailed(const QString &error);
+  void StartDownload();
 
   Ui::UpdateDialog *ui;
   BreadRelease m_Release;
@@ -80,4 +84,5 @@ private:
   QElapsedTimer m_DownloadTimer;
   std::unique_ptr<QTemporaryDir> m_Staging;
   bool m_Cancelled = false;
+  int m_DownloadAttempts = 0;
 };
