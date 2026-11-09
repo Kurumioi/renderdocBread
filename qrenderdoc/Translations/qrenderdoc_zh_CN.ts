@@ -5193,12 +5193,12 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>版权所有 &amp;copy; Baldur Karlsson 2026</translation>
     </message>
     <message>
-        <location filename="../Windows/Dialogs/AboutDialog.cpp" line="+42"/>
+        <location filename="../Windows/Dialogs/AboutDialog.cpp" line="+43"/>
         <source>Version %1 (built from unknown source)</source>
         <translation>版本 %1（构建自未知源）</translation>
     </message>
     <message>
-        <location line="+4"/>
+        <location line="+5"/>
         <source>Version %1 (built from &lt;a href=&apos;%2&apos;&gt;%3&lt;/a&gt;)</source>
         <translation>版本 %1（构建自 &lt;a href=&apos;%2&apos;&gt;%3&lt;/a&gt;）</translation>
     </message>
@@ -17589,7 +17589,7 @@ Close the capture or save to another location.</source>
     </message>
     <message>
         <location line="+46"/>
-        <location line="+1951"/>
+        <location line="+1928"/>
         <location line="+119"/>
         <location line="+13"/>
         <location line="+112"/>
@@ -17598,8 +17598,8 @@ Close the capture or save to another location.</source>
         <translation>重放上下文：%1</translation>
     </message>
     <message>
-        <location line="-2357"/>
-        <location line="+1951"/>
+        <location line="-2334"/>
+        <location line="+1928"/>
         <location line="+60"/>
         <location line="+59"/>
         <location line="+125"/>
@@ -17608,7 +17608,7 @@ Close the capture or save to another location.</source>
         <translation>本地</translation>
     </message>
     <message>
-        <location line="-2238"/>
+        <location line="-2215"/>
         <source>vkconfig detected - possible incompatibility</source>
         <translation>检测到 vkconfig——可能不兼容</translation>
     </message>
@@ -17638,13 +17638,13 @@ If this program is not active check the path below for any leftover files:
     </message>
     <message>
         <location line="+105"/>
-        <location line="+1994"/>
+        <location line="+1971"/>
         <location line="+43"/>
         <source>Resolve Symbols</source>
         <translation>解析符号</translation>
     </message>
     <message>
-        <location line="-2023"/>
+        <location line="-2000"/>
         <source>Start Self-hosted Capture</source>
         <translation>开始自托管捕获</translation>
     </message>
@@ -18019,12 +18019,12 @@ Would you like to open the downloads page to reinstall?</source>
         <translation>正在检查更新...</translation>
     </message>
     <message>
-        <location line="+35"/>
+        <location line="+20"/>
         <source>GitHub returned invalid release information.</source>
         <translation>GitHub 返回的发布信息无效。</translation>
     </message>
     <message>
-        <location line="+35"/>
+        <location line="+27"/>
         <source>Could not check for updates</source>
         <translation>无法检查更新</translation>
     </message>
@@ -18249,7 +18249,7 @@ Check remote server connection.</source>
         <translation>正在更新可用设备，请稍候...</translation>
     </message>
     <message>
-        <location line="-1620"/>
+        <location line="-1612"/>
         <source>Latest version</source>
         <translation>最新版本</translation>
     </message>
@@ -18259,7 +18259,7 @@ Check remote server connection.</source>
         <translation>您正在运行最新版本。</translation>
     </message>
     <message>
-        <location line="+1766"/>
+        <location line="+1758"/>
         <source>Global hook active</source>
         <translation>全局挂钩处于活动状态</translation>
     </message>
@@ -23954,7 +23954,7 @@ The project folder and every local file will remain on disk.</source>
     </message>
     <message>
         <location line="+3"/>
-        <location filename="../Windows/MainWindow.cpp" line="-3615"/>
+        <location filename="../Windows/MainWindow.cpp" line="-3592"/>
         <source>Frame Rendering Flow</source>
         <translation>帧渲染流程图</translation>
     </message>
@@ -30497,12 +30497,12 @@ If these parameters are incorrect - e.g. you are using an orthographic projectio
     </message>
     <message>
         <location/>
-        <location filename="../Windows/Dialogs/UpdateDialog.cpp" line="+312"/>
+        <location filename="../Windows/Dialogs/UpdateDialog.cpp" line="+522"/>
         <source>Close</source>
         <translation>关闭</translation>
     </message>
     <message>
-        <location filename="../Windows/Dialogs/UpdateDialog.cpp" line="-119"/>
+        <location filename="../Windows/Dialogs/UpdateDialog.cpp" line="-134"/>
         <source>Update Available - v%1</source>
         <translation>有可用更新 - v%1</translation>
     </message>
@@ -30517,12 +30517,12 @@ If these parameters are incorrect - e.g. you are using an orthographic projectio
         <translation>此版本没有发布说明。</translation>
     </message>
     <message>
-        <location line="+7"/>
+        <location line="+16"/>
         <source>See release page</source>
         <translation>请参阅发布页面</translation>
     </message>
     <message>
-        <location line="+1"/>
+        <location line="-9"/>
         <source>This release does not have a verifiable Windows x64 package.</source>
         <translation>此版本没有可校验的 Windows x64 安装包。</translation>
     </message>
@@ -30532,7 +30532,7 @@ If these parameters are incorrect - e.g. you are using an orthographic projectio
         <translation>%1 MB</translation>
     </message>
     <message>
-        <location line="+37"/>
+        <location line="+53"/>
         <source>The downloaded package has an unexpected size.</source>
         <translation>下载包的大小与发布信息不符。</translation>
     </message>
@@ -30564,8 +30564,8 @@ If these parameters are incorrect - e.g. you are using an orthographic projectio
         <translation>取消</translation>
     </message>
     <message>
-        <location line="-97"/>
-        <location line="+96"/>
+        <location line="-109"/>
+        <location line="+108"/>
         <source>Downloading update...</source>
         <translation>正在下载更新...</translation>
     </message>

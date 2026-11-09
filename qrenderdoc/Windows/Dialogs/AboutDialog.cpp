@@ -28,6 +28,7 @@
 #include <QString>
 #include "Code/QRDUtils.h"
 #include "Code/pyrenderdoc/PythonContext.h"
+#include "UpdateDialog.h"
 #include "ui_AboutDialog.h"
 #include "version.h"
 
@@ -43,10 +44,11 @@ AboutDialog::AboutDialog(QWidget *parent) : QDialog(parent), ui(new Ui::AboutDia
   }
   else
   {
-    ui->version->setText(tr("Version %1 (built from <a href='%2'>%3</a>)")
-                             .arg(lit(FULL_VERSION_STRING))
-                             .arg(lit("https://github.com/baldurk/renderdoc/commit/%1").arg(hash))
-                             .arg(hash.left(8)));
+    ui->version->setText(
+        tr("Version %1 (built from <a href='%2'>%3</a>)")
+            .arg(lit(FULL_VERSION_STRING))
+            .arg(BreadRelease::RepositoryPage().toString() + QFormatStr("/commit/%1").arg(hash))
+            .arg(hash.left(8)));
   }
 
   ui->version->setText(tr("%1 (Qt %2) (Python %3)")

@@ -168,8 +168,9 @@ Native/绑定构建、冻结 Host、UEX 自包含发布及最终组包。
    Windows x64 更新命名的 ZIP，确保应用能唯一选择安装包。
 3. 先创建草稿并上传。使用 GitHub Releases API 核对两个附件的名称、字节数和
    `state: uploaded`，以及 GitHub 计算的 `digest: sha256:<hash>` 与本地一致。
-   应用使用 ZIP 附件的 GitHub SHA-256 验证下载，单独上传校验文件也须保留 ZIP 的
-   `digest` 元数据。发布正文写明此次更新内容，应用会在弹窗内展示它。
+   应用优先使用 ZIP 附件的 GitHub `digest` 元数据验证下载。API 受限时，应用通过
+   公开发布页面和同名 `.sha256` 附件确认更新。校验文件须包含一行 `SHA-256  ZIP文件名`，
+   其中散列和文件名都与上传的 ZIP 一致。发布正文写明此次更新内容，应用会在弹窗内展示它。
 4. 校验通过后将草稿发布为正式版并设为 Latest。复查
    `GET /repos/Straw1997/renderdocBread/releases/latest` 返回本次标签和已核验的 ZIP，
    且 `draft` 与 `prerelease` 均为 `false`。

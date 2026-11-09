@@ -1338,7 +1338,7 @@ bool MainWindow::HandleMismatchedVersions()
         QMessageBox::Yes | QMessageBox::No);
 
     if(res == QMessageBox::Yes)
-      QDesktopServices::openUrl(QUrl(lit("https://renderdoc.org/builds")));
+      QDesktopServices::openUrl(BreadRelease::ReleasesPage());
 
     SetUpdateAvailable();
 #endif
@@ -1566,7 +1566,7 @@ void MainWindow::CheckUpdates(bool forceCheck)
   PersistentConfig &config = m_Ctx.Config();
   // Invalidate the old upstream response and checks for a different Bread version.
   const QString cacheVersion =
-      lit("bread/github/") + version;    // i18n-ignore: update cache identity prefix.
+      lit("bread/github/v2/") + version;    // i18n-ignore: update cache identity prefix.
   const bool sameVersion = QString(config.CheckUpdate_CurrentVersion) == cacheVersion;
   if(!sameVersion)
   {
@@ -1589,35 +1589,20 @@ void MainWindow::CheckUpdates(bool forceCheck)
   if(!updateStatus.isEmpty())
     statusText->setText(updateStatus);
 
-  QProcess *request = new QProcess(this);
-  auto finish = [this, request, updateStatus]() {
-    request->deleteLater();
-    m_CheckingForUpdates = false;
-    ui->action_Check_for_Updates->setEnabled(true);
-    if(!updateStatus.isEmpty() && statusText->text() == updateStatus)
-      statusText->clear();
-  };
-  QObject::connect(request, &QProcess::errorOccurred, this,
-                   [this, request, finish, forceCheck](QProcess::ProcessError error) {
-                     if(error != QProcess::FailedToStart)
-                       return;
-                     const QString reason = request->errorString();
-                     finish();
-                     ReportUpdateCheckFailure(reason, forceCheck);
-                   });
-  QObject::connect(
-      request, OverloadedSlot<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
-      [this, request, finish, forceCheck, version](int code, QProcess::ExitStatus status) {
-        const QByteArray data = request->readAllStandardOutput();
-        const QString error = QString::fromLocal8Bit(request->readAllStandardError()).trimmed();
-        finish();
+  BreadRelease::Check(
+      this, version,
+      [this, updateStatus, forceCheck, version](const QByteArray &response, const QString &error) {
+        m_CheckingForUpdates = false;
+        ui->action_Check_for_Updates->setEnabled(true);
+        if(!updateStatus.isEmpty() && statusText->text() == updateStatus)
+          statusText->clear();
 
-        if(status != QProcess::NormalExit || code != 0)
+        if(response.isEmpty())
         {
           ReportUpdateCheckFailure(error, forceCheck);
           return;
         }
-        const BreadRelease release = BreadRelease::FromGitHub(data);
+        const BreadRelease release = BreadRelease::FromGitHub(response);
         if(release.version.isEmpty())
         {
           ReportUpdateCheckFailure(tr("GitHub returned invalid release information."), forceCheck);
@@ -1631,24 +1616,16 @@ void MainWindow::CheckUpdates(bool forceCheck)
             QVersionNumber::fromString(release.version) > QVersionNumber::fromString(version);
         cfg.CheckUpdate_LastUpdate = QDateTime::currentDateTimeUtc();
         cfg.CheckUpdate_UpdateAvailable = newer && cfg.CheckUpdate_AllowChecks;
-        cfg.CheckUpdate_UpdateResponse = cfg.CheckUpdate_UpdateAvailable ? data.constData() : "";
+        cfg.CheckUpdate_UpdateResponse = cfg.CheckUpdate_UpdateAvailable ? response.constData() : "";
         cfg.Save();
         updateAction->setVisible(cfg.CheckUpdate_UpdateAvailable);
 
         if(newer)
-          UpdatePopup(version, data, !forceCheck);
+          UpdatePopup(version, response, !forceCheck);
         else if(forceCheck)
           RDDialog::information(this, tr("Latest version"),
                                 tr("You are running the latest version."));
       });
-
-  BreadRelease::Request(
-      request, QUrl(lit("https://api.github.com/repos/Straw1997/renderdocBread/releases/latest")),    // i18n-ignore: GitHub release API endpoint.
-      {lit("--max-time"), lit("30"), lit("--max-filesize"),
-       lit("2097152"),     // i18n-ignore: update protocol.
-       lit("--header"),    // i18n-ignore: curl request option or GitHub media type.
-       lit("Accept: application/vnd.github.full+json")});    // i18n-ignore: curl request option
-                                                             // or GitHub media type.
 }
 
 void MainWindow::ReportUpdateCheckFailure(const QString &error, bool manual)
@@ -3283,12 +3260,12 @@ void MainWindow::on_action_View_Documentation_triggered()
 
 void MainWindow::on_action_Source_on_GitHub_triggered()
 {
-  QDesktopServices::openUrl(QUrl::fromUserInput(lit("https://github.com/baldurk/renderdoc")));
+  QDesktopServices::openUrl(BreadRelease::RepositoryPage());
 }
 
 void MainWindow::on_action_Build_Release_Downloads_triggered()
 {
-  QDesktopServices::openUrl(QUrl::fromUserInput(lit("https://renderdoc.org/builds")));
+  QDesktopServices::openUrl(BreadRelease::ReleasesPage());
 }
 
 void MainWindow::on_action_Show_Tips_triggered()
