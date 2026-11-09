@@ -209,9 +209,6 @@ private:
   QList<ChildProcess> m_Children;
   QMap<QString, APIStatus> m_APIs;
 
-  int m_ButtonColorHue = 0;
-  QTimer *m_ButtonColorTimer;
-
   // API Monitor support
   QString m_MonitorScriptPath;
   QSemaphore m_SendMonitorScript;

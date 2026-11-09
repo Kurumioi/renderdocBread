@@ -181,46 +181,6 @@ LiveCapture::LiveCapture(ICaptureContext &ctx, const QString &hostname, const QS
 
     ui->mainLayout->addWidget(bottomTools);
   }
-
-  {
-    m_ButtonColorTimer = new QTimer(this);
-    connect(m_ButtonColorTimer, &QTimer::timeout, this, [this]() {
-      // Advance hue while keeping saturation and lightness unchanged.
-      this->m_ButtonColorHue = (this->m_ButtonColorHue + 1) % 360;    // hue range is 0..359
-      QColor color;
-      color.setHsl(this->m_ButtonColorHue, 255, 128);
-
-      QColor inverseColor;
-      inverseColor.setHsl((this->m_ButtonColorHue + 180) % 360, 255, 128);
-      // i18n-ignore: Qt stylesheet program data; it contains no user-visible text.
-      this->ui->triggerImmediateCapture->setStyleSheet(
-          lit(R"(QPushButton {
-                            background: %1;
-                            color: %2;
-                            font-size: 18px;
-                            font-weight: bold;
-                            border-radius: 10px;
-                            border: 2px solid %2;
-                            padding: 10px 20px;
-                        }
-
-                        QPushButton:hover {
-                            background: %2;
-                            border: 2px solid %1;
-                            color: %1;
-                        }
-
-                        QPushButton:pressed {
-                            background: #FF8C00; /* orange-red while pressed */
-                            border: 2px solid #FF4500; /* darker pressed border */
-                        }
-
-        )")
-          .arg(color.name())
-          .arg(inverseColor.name()));
-    });
-    m_ButtonColorTimer->start(16);
-  }
 }
 
 LiveCapture::~LiveCapture()
@@ -231,7 +191,6 @@ LiveCapture::~LiveCapture()
   killThread();
 
   delete ui;
-  delete m_ButtonColorTimer;
 }
 
 void LiveCapture::QueueCapture(int frameNumber, int numFrames)
@@ -350,7 +309,7 @@ void LiveCapture::on_triggerDelayedCapture_clicked()
     m_CaptureCounter = (int)ui->captureDelay->value();
     countdownTimer.start();
     ui->triggerDelayedCapture->setEnabled(false);
-    ui->triggerDelayedCapture->setText(tr("Triggering in %1s").arg(m_CaptureCounter));
+    ui->triggerDelayedCapture->setText(tr("Capturing in %1s").arg(m_CaptureCounter));
   }
 }
 
@@ -592,13 +551,13 @@ void LiveCapture::captureCountdownTick()
   {
     m_CaptureNumFrames = (int)ui->numFrames->value();
     ui->triggerDelayedCapture->setEnabled(true);
-    ui->triggerDelayedCapture->setText(tr("Trigger After Delay"));
+    ui->triggerDelayedCapture->setText(tr("Capture After Delay"));
     m_TriggerCapture.release();
   }
   else
   {
     countdownTimer.start();
-    ui->triggerDelayedCapture->setText(tr("Triggering in %1s").arg(m_CaptureCounter));
+    ui->triggerDelayedCapture->setText(tr("Capturing in %1s").arg(m_CaptureCounter));
   }
 }
 

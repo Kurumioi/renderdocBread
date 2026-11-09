@@ -16618,7 +16618,7 @@ but this is inverted by the upper-left clip origin.</source>
     </message>
     <message>
         <location/>
-        <location filename="../Windows/Dialogs/LiveCapture.cpp" line="+1434"/>
+        <location filename="../Windows/Dialogs/LiveCapture.cpp" line="+1393"/>
         <source>None</source>
         <translation>无</translation>
     </message>
@@ -16645,13 +16645,14 @@ but this is inverted by the upper-left clip origin.</source>
     </message>
     <message>
         <location/>
-        <source>Capture Frame(s) Immediately ($1)</source>
-        <translation>立即捕获帧（$1）</translation>
+        <source>Capture Frame(s) Immediately</source>
+        <translation>立即捕获帧</translation>
     </message>
     <message>
         <location/>
-        <source>Capture After Delay: (Subscription only)</source>
-        <translation>延迟后捕获：（仅限订阅版）</translation>
+        <location filename="../Windows/Dialogs/LiveCapture.cpp" line="-856"/>
+        <source>Capture After Delay</source>
+        <translation>延迟后捕获</translation>
     </message>
     <message>
         <location/>
@@ -16660,8 +16661,8 @@ but this is inverted by the upper-left clip origin.</source>
     </message>
     <message>
         <location/>
-        <source>Capture Specific Frame(s):($100)</source>
-        <translation>捕获指定帧：（$100）</translation>
+        <source>Capture Specific Frame(s)</source>
+        <translation>捕获指定帧</translation>
     </message>
     <message>
         <location/>
@@ -16684,30 +16685,30 @@ but this is inverted by the upper-left clip origin.</source>
         <translation>已收集的捕获：</translation>
     </message>
     <message>
-        <location filename="../Windows/Dialogs/LiveCapture.cpp" line="-1304"/>
+        <location filename="../Windows/Dialogs/LiveCapture.cpp" line="-407"/>
         <source>Preview</source>
         <translation>预览</translation>
     </message>
     <message>
         <location line="+5"/>
-        <location line="+109"/>
+        <location line="+68"/>
         <source>&amp;Open in...</source>
         <translation>打开方式(&amp;O)...</translation>
     </message>
     <message>
-        <location line="-108"/>
-        <location line="+109"/>
+        <location line="-67"/>
+        <location line="+68"/>
         <source>This instance</source>
         <translation>此实例</translation>
     </message>
     <message>
-        <location line="-108"/>
-        <location line="+109"/>
+        <location line="-67"/>
+        <location line="+68"/>
         <source>New instance</source>
         <translation>新实例</translation>
     </message>
     <message>
-        <location line="-103"/>
+        <location line="-62"/>
         <source>Open</source>
         <translation>打开</translation>
     </message>
@@ -16722,7 +16723,7 @@ but this is inverted by the upper-left clip origin.</source>
         <translation>删除</translation>
     </message>
     <message>
-        <location line="+101"/>
+        <location line="+60"/>
         <source>&amp;Rename capture</source>
         <translation>重命名捕获(&amp;R)</translation>
     </message>
@@ -16749,8 +16750,8 @@ but this is inverted by the upper-left clip origin.</source>
     <message>
         <location line="+67"/>
         <location line="+248"/>
-        <source>Triggering in %1s</source>
-        <translation>将在 %1 秒后触发</translation>
+        <source>Capturing in %1s</source>
+        <translation>将在 %1 秒后捕获</translation>
     </message>
     <message>
         <location line="-228"/>
@@ -16784,13 +16785,8 @@ but this is inverted by the upper-left clip origin.</source>
         <source>Unknown Process</source>
         <translation>未知进程</translation>
     </message>
-    <message>
-        <location line="+44"/>
-        <source>Trigger After Delay</source>
-        <translation>延迟后触发</translation>
-    </message>
     <message numerus="yes">
-        <location line="+86"/>
+        <location line="+130"/>
         <source>Unsaved capture(s)</source>
         <translation>
             <numerusform>未保存的捕获</numerusform>
