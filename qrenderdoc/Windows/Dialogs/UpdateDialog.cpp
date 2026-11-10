@@ -602,6 +602,27 @@ bool UpdateDialog::StartInstaller(const QTemporaryDir &staging, const QString &i
   if(!script.copy(path))
     return false;
 
+  // Pass the active UI language to the independent Windows installer.
+  const QJsonObject progress{
+      {QLatin1String("title"), tr("Installing RenderDocBread update")},
+      {QLatin1String("waiting"), tr("Waiting for RenderDocBread to close...")},
+      {QLatin1String("verify"), tr("Verifying the downloaded package...")},
+      {QLatin1String("extract"), tr("Extracting and verifying update files...")},
+      {QLatin1String("close"), tr("Closing background processes...")},
+      {QLatin1String("check"), tr("Checking files in the current installation...")},
+      {QLatin1String("replace"), tr("Installing the new version...")},
+      {QLatin1String("restart"), tr("Opening the updated application...")},
+      {QLatin1String("clean"), tr("Cleaning up temporary update files...")},
+      {QLatin1String("rollback"), tr("Restoring the previous installation...")},
+      {QLatin1String("restore"), tr("Opening the previous version...")},
+      {QLatin1String("failed"), tr("The update could not complete. See the installer log at %1.")},
+  };
+  const QByteArray progressText = QJsonDocument(progress).toJson(QJsonDocument::Compact);
+  QFile labels(staging.filePath(QLatin1String("progress.json")));
+  if(!labels.open(QIODevice::WriteOnly) || labels.write(progressText) != progressText.size())
+    return false;
+  labels.close();
+
   const QString shell = SystemProgram(
       lit("WindowsPowerShell/v1.0/powershell.exe"));    // i18n-ignore: Installer resource path or
                                                         // PowerShell argument.
