@@ -7,6 +7,9 @@
 #include <QUrl>
 #include <QWidget>
 #include <functional>
+#include <memory>
+
+struct AIVisualReplyLayoutState;
 
 // A native, offline visual answer. Only a hash-addressed Host manifest and its
 // verified PNG/geometry blobs are loaded; model HTML/URLs never enter a renderer.
@@ -26,6 +29,8 @@ public:
   static int inlineHeight(const QString &identity);
 
 private:
+  AIVisualReply(const QString &identity, Navigate navigate, QWidget *parent,
+                std::shared_ptr<AIVisualReplyLayoutState> layouts);
   void setComparisonMode(int mode);
   int m_ComparisonMode = 2;
 };

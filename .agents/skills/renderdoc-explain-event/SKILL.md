@@ -3,7 +3,7 @@ name: renderdoc-explain-event
 description: Explain captured rendering effects, objects and calculations with evidence and appropriate visual explanations; investigate missing output or organize a requested EID, pass or frame flow in Bread.
 metadata:
   replaylab-category: event-pipeline
-  replaylab-version: "54"
+  replaylab-version: "55"
 ---
 
 # Explain captured events

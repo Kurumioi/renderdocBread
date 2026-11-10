@@ -33738,6 +33738,9 @@ def publish_visual_reply(title: str, cards: list[VisualReplyCard],
     Each picture supports its own annotations/secondAnnotations. Supply actual
     source images for calculation/output nodes when that visual explains the
     question; an empty node does not generate its missing picture automatically.
+    Add short // comments to the node's calculation. In each node codeBlocks
+    entry, notes:[{sourceLine:...,text:'...'}] explains key groups immediately above
+    their displayed, verified source lines without editing the source or its links.
     Nodes also accept links:[{label:'...',url:'rdoc://shader/...'}] to code,
     textures (rdoc://texture/<ResourceId>?eid=<EID>&kind=srv) or get_cbuffer_parameter_link
     URLs. Use the actual consuming or producing EID and attachment kind (srv, uav,
