@@ -38,6 +38,7 @@
 #include "Code/TranslationManager.h"
 #include "Code/pyrenderdoc/PythonContext.h"
 #include "Windows/Dialogs/CrashDialog.h"
+#include "Windows/Dialogs/UpdateDialog.h"
 #include "Windows/MainWindow.h"
 #include "version.h"
 
@@ -184,6 +185,12 @@ int main(int argc, char *argv[])
   QCoreApplication::setAttribute(Qt::AA_X11InitThreads);
 
   qInstallMessageHandler(sharedLogOutput);
+
+  if(BreadRelease::InstallationInProgress())
+  {
+    qInfo() << "RenderDocBread is applying an update. The installer will restart it.";
+    return 0;
+  }
 
   // there seems to be a persistent crash in QWidgetPrivate::subtractOpaqueSiblings where a widget
   // has no parent but is not a window. Try to work around it by setting this env var, as it's only

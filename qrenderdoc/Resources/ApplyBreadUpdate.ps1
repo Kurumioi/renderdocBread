@@ -82,15 +82,87 @@ function Test-PackageFile([string]$path, $record) {
     }
 }
 
+function Get-InstallProcesses {
+    $prefix = $app + [IO.Path]::DirectorySeparatorChar
+    $session = [Diagnostics.Process]::GetCurrentProcess().SessionId
+    foreach ($process in Get-Process) {
+        try {
+            $image = $process.Path
+            if (!$image -and $process.ProcessName -in @('RenderDocBread', 'BreadMCP',
+                'ReplayLabInternal', 'replaylab-ai', 'ReplayLabShaderTools')) {
+                $image = [BreadUpdateProcess]::ImagePath($process.Id)
+            }
+            if ($image -and $image.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+                @{ Process = $process; Image = $image; SameSession = ($process.SessionId -eq $session) }
+            }
+        } catch [InvalidOperationException] {
+            # The process exited during enumeration.
+        }
+    }
+}
+
+function Close-InstallProcesses {
+    # Only close the exact GUI and stop known, package-owned sidecars in this session.
+    $workers = @('replaylab\BreadMCP.exe', 'replaylab\ReplayLabInternal.exe',
+                 'replaylab\replaylab-ai.exe', 'replaylab\ReplayLabShaderTools.exe')
+    $running = @(Get-InstallProcesses)
+    foreach ($entry in $running | Where-Object { $_.Image -eq $exe }) {
+        $process = $entry.Process
+        if ($process.HasExited) { continue }
+        if ($entry.SameSession -and $process.CloseMainWindow() -and $process.WaitForExit(30000)) {
+            continue
+        }
+        if (!$process.HasExited) { throw "Close this RenderDocBread window to install the update: $($entry.Image) (PID $($process.Id))" }
+    }
+    foreach ($entry in Get-InstallProcesses) {
+        $process = $entry.Process
+        $relative = $entry.Image.Substring($app.Length + 1)
+        if ($process.HasExited) { continue }
+        if (!$entry.SameSession -or $relative -notin $workers -or !$old.ContainsKey($relative.Replace('\', '/'))) {
+            throw "Close the process using this installation before updating: $($entry.Image) (PID $($process.Id))"
+        }
+        try {
+            $process.Kill()
+            if (!$process.WaitForExit(10000)) { throw 'The process did not exit.' }
+        } catch {
+            if (!$process.HasExited) { throw "Could not stop $($entry.Image) (PID $($process.Id)): $_" }
+        }
+    }
+}
+
+function Move-UpdatePath([string]$from, [string]$to) {
+    for ($attempt = 0; ; $attempt++) {
+        try {
+            [IO.File]::Move($from, $to)
+            return
+        } catch {
+            $reason = $_.Exception.GetBaseException()
+            if ($attempt -ge 5 -or ($reason.HResult -band 0xffff) -notin 5, 32, 33) {
+                throw "Could not move '$from' to '$to': $($reason.Message)"
+            }
+            Start-Sleep -Milliseconds 300
+        }
+    }
+}
+
 $journal = [Collections.Generic.List[object]]::new()
 function Move-UpdateFile([string]$from, [string]$to) {
     [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($to))
-    try {
-        [IO.File]::Move($from, $to)
-    } catch {
-        throw "Could not move '$from' to '$to': $($_.Exception.Message)"
-    }
+    Move-UpdatePath $from $to
     $journal.Add(@{ From = $from; To = $to })
+}
+
+function Remove-UpdateDirectory([string]$path) {
+    Assert-RegularPath $path
+    for ($attempt = 0; [IO.Directory]::Exists($path); $attempt++) {
+        try {
+            Remove-Item -LiteralPath $path -Recurse -Force
+            return
+        } catch {
+            if ($attempt -ge 5) { throw }
+            Start-Sleep -Milliseconds 300
+        }
+    }
 }
 
 function Expand-Update {
@@ -141,6 +213,7 @@ $lock = $null
 $failed = $false
 $rollbackFailed = $false
 $validStage = $false
+$ownsInstall = $false
 try {
     if ([IO.Path]::GetFileName($stage) -notmatch '^\.bread-update-[a-z0-9]+$') {
         throw 'Invalid update staging folder.'
@@ -150,27 +223,45 @@ try {
     $validStage = $true
     Assert-RegularPath $exe
 
-    $parent = Get-Process -Id $ParentProcessId -ErrorAction SilentlyContinue
-    if ($parent -and $parent.Path -eq $exe -and !$parent.WaitForExit(60000)) {
-        throw 'RenderDocBread did not exit before the update timeout.'
-    }
-
+    # Hold the startup gate through validation, rollback and failure cleanup.
     $lockPath = Resolve-PackagePath $app '.bread-update.lock'
     $lock = [IO.FileStream]::new($lockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite,
         [IO.FileShare]::None, 1,
         [IO.FileOptions]::DeleteOnClose)
+    $ownsInstall = $true
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class BreadUpdateProcess {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool QueryFullProcessImageName(IntPtr process, int flags, StringBuilder path, ref int length);
+    [DllImport("kernel32.dll")]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    public static string ImagePath(int pid) {
+        IntPtr process = OpenProcess(0x1000, false, pid); // PROCESS_QUERY_LIMITED_INFORMATION
+        if (process == IntPtr.Zero) return null;
+        try {
+            int length = 32768;
+            var path = new StringBuilder(length);
+            return QueryFullProcessImageName(process, 0, path, ref length) ? path.ToString() : null;
+        } finally { CloseHandle(process); }
+    }
+}
+'@
+    $parent = Get-Process -Id $ParentProcessId -ErrorAction SilentlyContinue
+    if ($parent -and [BreadUpdateProcess]::ImagePath($ParentProcessId) -eq $exe -and !$parent.WaitForExit(60000)) {
+        throw 'RenderDocBread did not exit before the update timeout.'
+    }
     $oldManifest = Resolve-PackagePath $app $manifestName
     $old = Read-Manifest $oldManifest $InstalledVersion
     if ($TargetVersion -le $InstalledVersion) { throw 'The update must be a newer release.' }
     $new = Expand-Update
-
-    $appPrefix = $app + [IO.Path]::DirectorySeparatorChar
-    foreach ($process in Get-Process) {
-        $image = $process.Path
-        if ($image -and $image.StartsWith($appPrefix, [StringComparison]::OrdinalIgnoreCase)) {
-            throw "Close other processes from this installation before updating: $image"
-        }
-    }
+    Close-InstallProcesses
 
     # Only replace files that still match the installed package. Leave other files
     # untouched, including local edits to files removed from the newer release.
@@ -193,6 +284,8 @@ try {
         if (Test-PackageFile $target $old[$relative]) { $remove.Add($relative) }
     }
 
+    # A legacy executable could be opened during extraction or hash checks.
+    Close-InstallProcesses
     foreach ($relative in $remove) {
         Move-UpdateFile (Join-Path $app $relative) (Join-Path $backup $relative)
     }
@@ -208,7 +301,7 @@ try {
     $errors = @($_)
     for ($i = $journal.Count - 1; $i -ge 0; $i--) {
         try {
-            [IO.File]::Move($journal[$i].To, $journal[$i].From)
+            Move-UpdatePath $journal[$i].To $journal[$i].From
         } catch {
             $rollbackFailed = $true
             $errors += $_
@@ -217,28 +310,32 @@ try {
     if ($validStage) {
         $errors | Out-String | Set-Content -LiteralPath $log -Encoding UTF8 -ErrorAction Continue
     }
+    if ($validStage -and !$rollbackFailed) {
+        try {
+            foreach ($directory in @($payload, $backup)) {
+                Remove-UpdateDirectory $directory
+            }
+            [IO.File]::Delete($archivePath)
+        } catch {
+            $_ | Out-String | Add-Content -LiteralPath $log -Encoding UTF8 -ErrorAction Continue
+        }
+    }
 } finally {
     if ($lock) { $lock.Dispose() }
 }
 
 # Keep the backup when rollback was blocked. In every other case remove the
 # transient payload and archive. The error log stays available to the user.
-if (!$validStage) { exit 1 }
+if (!$ownsInstall -or $rollbackFailed) { exit 1 }
 try {
+    if (![IO.Directory]::Exists($restartDirectory)) { $restartDirectory = $app }
     if (!$failed) {
         Start-Process -FilePath $exe -WorkingDirectory $restartDirectory
         # Qt preserves the read-only resource permissions when it copies this script.
-        Remove-Item -LiteralPath $stage -Recurse -Force
+        Remove-UpdateDirectory $stage
         exit 0
     }
-    if (!$rollbackFailed) {
-        foreach ($directory in @($payload, $backup)) {
-            if ([IO.Directory]::Exists($directory)) { Remove-Item -LiteralPath $directory -Recurse -Force }
-        }
-        [IO.File]::Delete($archivePath)
-    }
-    if (!$rollbackFailed -and !(Get-Process -Name RenderDocBread -ErrorAction SilentlyContinue |
-               Where-Object { $_.Path -eq $exe })) {
+    if (!(Get-InstallProcesses | Where-Object { $_.Image -eq $exe })) {
         Start-Process -FilePath $exe -WorkingDirectory $restartDirectory -ArgumentList @('--updatefailed', ('"{0}"' -f $log))
     }
 } catch {
