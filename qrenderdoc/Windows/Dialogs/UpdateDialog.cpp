@@ -38,6 +38,10 @@
 #include "Code/QRDUtils.h"
 #include "ui_UpdateDialog.h"
 
+#if defined(Q_OS_WIN)
+#include <windows.h>
+#endif
+
 namespace
 {
 bool IsReleaseVersion(const QString &version)
@@ -75,6 +79,22 @@ QUrl BreadRelease::RepositoryPage()
 QUrl BreadRelease::ReleasesPage()
 {
   return QUrl(RepositoryPage().toString() + lit("/releases"));    // i18n-ignore: GitHub URL path.
+}
+
+bool BreadRelease::InstallationInProgress()
+{
+#if defined(Q_OS_WIN)
+  wchar_t image[32768];
+  const DWORD length = GetModuleFileNameW(nullptr, image, ARRAY_COUNT(image));
+  if(length == 0 || length == ARRAY_COUNT(image))
+    return false;
+
+  const QDir app = QFileInfo(QString::fromWCharArray(image, int(length))).dir();
+  const QString lock = app.filePath(QLatin1String(".bread-update.lock"));
+  return GetFileAttributesW(reinterpret_cast<LPCWSTR>(lock.utf16())) != INVALID_FILE_ATTRIBUTES;
+#else
+  return false;
+#endif
 }
 
 QString BreadRelease::InstalledVersion()

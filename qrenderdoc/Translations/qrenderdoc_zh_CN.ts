@@ -8446,7 +8446,7 @@ Open settings window to configure path?</source>
         <translation>无法从远程主机复制捕获。</translation>
     </message>
     <message>
-        <location filename="../Code/qrenderdoc.cpp" line="+561"/>
+        <location filename="../Code/qrenderdoc.cpp" line="+568"/>
         <source>Error loading config</source>
         <translation>加载配置时出错</translation>
     </message>
@@ -30568,7 +30568,7 @@ If these parameters are incorrect - e.g. you are using an orthographic projectio
     </message>
     <message>
         <location/>
-        <location filename="../Windows/Dialogs/UpdateDialog.cpp" line="+522"/>
+        <location filename="../Windows/Dialogs/UpdateDialog.cpp" line="+542"/>
         <source>Close</source>
         <translation>关闭</translation>
     </message>

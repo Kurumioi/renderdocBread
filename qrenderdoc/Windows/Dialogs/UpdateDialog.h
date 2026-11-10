@@ -52,6 +52,7 @@ struct BreadRelease
   static QUrl RepositoryPage();
   static QUrl ReleasesPage();
   static QString InstalledVersion();
+  static bool InstallationInProgress();
   static BreadRelease FromGitHub(const QByteArray &json);
   static void Check(QObject *owner, const QString &installedVersion,
                     std::function<void(QByteArray, QString)> completed);
