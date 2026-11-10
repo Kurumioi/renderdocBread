@@ -30635,7 +30635,67 @@ If these parameters are incorrect - e.g. you are using an orthographic projectio
         <translation>取消</translation>
     </message>
     <message>
-        <location line="-109"/>
+        <location line="+39"/>
+        <source>Installing RenderDocBread update</source>
+        <translation>正在安装 RenderDocBread 更新</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Waiting for RenderDocBread to close...</source>
+        <translation>正在等待 RenderDocBread 退出...</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Verifying the downloaded package...</source>
+        <translation>正在校验下载的安装包...</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Extracting and verifying update files...</source>
+        <translation>正在解压并校验更新文件...</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Closing background processes...</source>
+        <translation>正在关闭后台进程...</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Checking files in the current installation...</source>
+        <translation>正在核对当前安装的文件...</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Installing the new version...</source>
+        <translation>正在替换文件并安装新版本...</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Opening the updated application...</source>
+        <translation>正在启动更新后的应用...</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Cleaning up temporary update files...</source>
+        <translation>正在清理更新暂存文件...</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Restoring the previous installation...</source>
+        <translation>正在恢复原有安装...</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Opening the previous version...</source>
+        <translation>正在启动更新前的版本...</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>The update could not complete. See the installer log at %1.</source>
+        <translation>更新未能完成。详情请查看安装日志 %1。</translation>
+    </message>
+    <message>
+        <location line="-159"/>
         <location line="+108"/>
         <source>Downloading update...</source>
         <translation>正在下载更新...</translation>

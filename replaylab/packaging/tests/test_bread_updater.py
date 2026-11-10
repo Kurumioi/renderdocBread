@@ -107,7 +107,7 @@ def test_update_preserves_data_and_recovers_from_failure(tmp_path, launcher, fai
         result = subprocess.run(
             [shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
              stage / SCRIPT.name, "-ParentProcessId", str(os.getpid()), "-InstalledVersion",
-             "1.13.127", "-TargetVersion", "1.13.128", "-Sha256", digest],
+             "1.13.127", "-TargetVersion", "1.13.128", "-Sha256", digest, "-NoProgressWindow"],
             cwd=app, capture_output=True, timeout=60, creationflags=subprocess.CREATE_NO_WINDOW,
         )
 
@@ -176,7 +176,8 @@ def test_update_closes_only_workers_from_the_installation(tmp_path, launcher):
         result = subprocess.run(
             [shell, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
              stage / SCRIPT.name, '-ParentProcessId', str(os.getpid()), '-InstalledVersion',
-             '1.13.127', '-TargetVersion', '1.13.128', '-Sha256', hashlib.sha256(archive.read_bytes()).hexdigest()],
+             '1.13.127', '-TargetVersion', '1.13.128', '-Sha256', hashlib.sha256(archive.read_bytes()).hexdigest(),
+             '-NoProgressWindow'],
             cwd=app, capture_output=True, timeout=60, creationflags=subprocess.CREATE_NO_WINDOW,
         )
         log = stage / 'update-error.txt'

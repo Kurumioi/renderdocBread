@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory = $true)][int]$ParentProcessId,
     [Parameter(Mandatory = $true)][version]$InstalledVersion,
     [Parameter(Mandatory = $true)][version]$TargetVersion,
-    [Parameter(Mandatory = $true)][ValidatePattern('^[a-f0-9]{64}$')][string]$Sha256
+    [Parameter(Mandatory = $true)][ValidatePattern('^[a-f0-9]{64}$')][string]$Sha256,
+    [switch]$NoProgressWindow
 )
 
 $ErrorActionPreference = 'Stop'
@@ -17,6 +18,149 @@ $backup = Join-Path $stage 'backup'
 $log = Join-Path $stage 'update-error.txt'
 $manifestName = 'RenderDocBread.manifest.json'
 $zipPrefix = 'RenderDocBread/'
+$progress = $null
+$progressPercent = 0
+$progressLabels = @{
+    title = 'Installing RenderDocBread update'
+    waiting = 'Waiting for RenderDocBread to close...'
+    verify = 'Verifying the downloaded package...'
+    extract = 'Extracting and verifying update files...'
+    close = 'Closing background processes...'
+    check = 'Checking files in the current installation...'
+    replace = 'Installing the new version...'
+    restart = 'Opening the updated application...'
+    clean = 'Cleaning up temporary update files...'
+    rollback = 'Restoring the previous installation...'
+    restore = 'Opening the previous version...'
+    failed = 'The update could not complete. See the installer log at %1.'
+}
+
+function New-UpdateProgress {
+    # PowerShell performs the installation while the window owns a separate message loop.
+    Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @'
+using System;
+using System.Drawing;
+using System.Threading;
+using System.Windows.Forms;
+
+public sealed class BreadUpdateProgress : IDisposable
+{
+    private readonly Thread thread;
+    private readonly ManualResetEvent shown = new ManualResetEvent(false);
+    private readonly object sync = new object();
+    private Form window;
+    private string status;
+    private int progress;
+    private volatile bool closing;
+
+    public BreadUpdateProgress(string title, string initial)
+    {
+        status = initial;
+        thread = new Thread(() => Run(title));
+        thread.IsBackground = true;
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        if (!shown.WaitOne(5000) || window == null)
+        {
+            Dispose();
+            throw new InvalidOperationException("The installer progress window could not open.");
+        }
+    }
+
+    private void Run(string title)
+    {
+        try
+        {
+            Application.EnableVisualStyles();
+            using (var form = new Form())
+            using (var timer = new System.Windows.Forms.Timer())
+            {
+                form.Text = title;
+                form.StartPosition = FormStartPosition.CenterScreen;
+                form.FormBorderStyle = FormBorderStyle.FixedDialog;
+                form.MaximizeBox = false;
+                form.MinimizeBox = false;
+                form.ControlBox = false;
+                form.AutoScaleMode = AutoScaleMode.Dpi;
+                form.AutoScaleDimensions = new SizeF(96, 96);
+                form.ClientSize = new Size(460, 106);
+
+                var label = new Label { Dock = DockStyle.Top, Height = 27, Text = status };
+                var bar = new ProgressBar { Dock = DockStyle.Top, Height = 17, Maximum = 100 };
+                var value = new Label { Dock = DockStyle.Top, Height = 24, Text = "0%",
+                                        TextAlign = ContentAlignment.MiddleRight };
+                form.Padding = new Padding(16);
+                form.Controls.AddRange(new Control[] { value, bar, label });
+                timer.Interval = 80;
+                timer.Tick += delegate
+                {
+                    lock (sync)
+                    {
+                        label.Text = status;
+                        bar.AccessibleName = status;
+                        bar.Value = progress;
+                        value.Text = progress + "%";
+                    }
+                };
+                form.FormClosing += (sender, args) =>
+                    args.Cancel = !closing && args.CloseReason == CloseReason.UserClosing;
+                form.Shown += delegate { window = form; shown.Set(); };
+                if (closing) return;
+                timer.Start();
+                Application.Run(form);
+            }
+        }
+        catch (Exception)
+        {
+            // Presentation must never interrupt the installation or rollback.
+        }
+        finally { shown.Set(); }
+    }
+
+    public void Report(string text, int percent)
+    {
+        lock (sync) { status = text; progress = percent; }
+    }
+
+    public void Dispose()
+    {
+        closing = true;
+        try
+        {
+            if (window != null && window.IsHandleCreated)
+                window.BeginInvoke((Action)window.Close);
+        }
+        catch (InvalidOperationException) { }
+        if (thread.Join(2000)) shown.Dispose();
+    }
+}
+'@
+    return [BreadUpdateProgress]::new($progressLabels.title, $progressLabels.waiting)
+}
+
+function Show-UpdateProgress([string]$phase, [int]$percent) {
+    $script:progressPercent = $percent
+    if ($progress) { $progress.Report($progressLabels[$phase], $percent) }
+}
+
+function Show-UpdateFailure {
+    if ($progress) {
+        [void][Windows.Forms.MessageBox]::Show($progressLabels.failed.Replace('%1', $log), $progressLabels.title,
+            [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Error)
+    }
+}
+
+function Wait-ApplicationWindow([Diagnostics.Process]$process) {
+    # Installer-only tests use a windowless launcher. Interactive updates wait for the real window.
+    if ($NoProgressWindow) { return }
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        if ($process.WaitForExit(150)) { throw "RenderDocBread exited during restart ($($process.ExitCode))." }
+        $process.Refresh()
+        if ($process.MainWindowHandle -ne [IntPtr]::Zero) { return }
+    } while ($timer.Elapsed.TotalSeconds -lt 90)
+    throw 'RenderDocBread did not open a window before the restart timeout.'
+}
 
 function Assert-RegularPath([string]$path) {
     try {
@@ -167,12 +311,14 @@ function Remove-UpdateDirectory([string]$path) {
 
 function Expand-Update {
     Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    Show-UpdateProgress 'verify' 5
     $stream = [IO.File]::Open($archivePath, 'Open', 'Read', 'Read')
     try {
         if ((Get-StreamHash $stream) -ne $Sha256) {
             throw 'The downloaded ZIP does not match the GitHub release SHA-256.'
         }
         $stream.Position = 0
+        Show-UpdateProgress 'extract' 15
         $zip = [IO.Compression.ZipArchive]::new($stream, 'Read')
         try {
             [void][IO.Directory]::CreateDirectory($payload)
@@ -197,6 +343,9 @@ function Expand-Update {
                 [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $destination)
                 if (!(Test-PackageFile $destination $files[$relative])) {
                     throw "Extracted file failed verification: $relative"
+                }
+                if ($progress -and $seen.Count % 64 -eq 0) {
+                    Show-UpdateProgress 'extract' (15 + [int](40 * $seen.Count / $zip.Entries.Count))
                 }
             }
             if ($seen.Count -ne $files.Count + 1) { throw 'The release ZIP is incomplete.' }
@@ -229,6 +378,23 @@ try {
         [IO.FileShare]::None, 1,
         [IO.FileOptions]::DeleteOnClose)
     $ownsInstall = $true
+    if (!$NoProgressWindow) {
+        try {
+            $labels = Join-Path $stage 'progress.json'
+            Assert-RegularPath $labels
+            if ([IO.File]::Exists($labels)) {
+                $translated = Get-Content -LiteralPath $labels -Raw -Encoding UTF8 | ConvertFrom-Json
+                foreach ($label in @($progressLabels.Keys)) {
+                    if ($translated.$label -is [string] -and $translated.$label) {
+                        $progressLabels[$label] = $translated.$label
+                    }
+                }
+            }
+            $progress = New-UpdateProgress
+        } catch {
+            Write-Warning "Could not show installer progress: $_"
+        }
+    }
     Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -261,12 +427,20 @@ public static class BreadUpdateProcess {
     $old = Read-Manifest $oldManifest $InstalledVersion
     if ($TargetVersion -le $InstalledVersion) { throw 'The update must be a newer release.' }
     $new = Expand-Update
+    Show-UpdateProgress 'close' 55
     Close-InstallProcesses
 
     # Only replace files that still match the installed package. Leave other files
     # untouched, including local edits to files removed from the newer release.
     $replace = [Collections.Generic.List[string]]::new()
+    Show-UpdateProgress 'check' 60
+    $scanned = 0
+    $totalChecks = $new.Count + $old.Count
     foreach ($relative in $new.Keys) {
+        $scanned++
+        if ($progress -and $scanned % 64 -eq 0) {
+            Show-UpdateProgress 'check' (60 + [int](15 * $scanned / $totalChecks))
+        }
         $target = Resolve-PackagePath $app $relative
         if (Test-Path -LiteralPath $target) {
             if (!$old.ContainsKey($relative)) { throw "An existing file would be overwritten: $target" }
@@ -279,26 +453,39 @@ public static class BreadUpdateProcess {
     }
     $remove = [Collections.Generic.List[string]]::new()
     foreach ($relative in $old.Keys) {
+        $scanned++
+        if ($progress -and $scanned % 64 -eq 0) {
+            Show-UpdateProgress 'check' (60 + [int](15 * $scanned / $totalChecks))
+        }
         if ($new.ContainsKey($relative)) { continue }
         $target = Resolve-PackagePath $app $relative
         if (Test-PackageFile $target $old[$relative]) { $remove.Add($relative) }
     }
 
     # A legacy executable could be opened during extraction or hash checks.
+    Show-UpdateProgress 'close' 75
     Close-InstallProcesses
-    foreach ($relative in $remove) {
-        Move-UpdateFile (Join-Path $app $relative) (Join-Path $backup $relative)
-    }
     # Record the new version only after the entire payload has been installed.
     $replace.Add($manifestName)
+    $totalMoves = $remove.Count + $replace.Count
+    $moved = 0
+    Show-UpdateProgress 'replace' 75
+    foreach ($relative in $remove) {
+        Move-UpdateFile (Join-Path $app $relative) (Join-Path $backup $relative)
+        $moved++
+        if ($progress -and $moved % 32 -eq 0) { Show-UpdateProgress 'replace' (75 + [int](20 * $moved / $totalMoves)) }
+    }
     foreach ($relative in $replace) {
         $target = Join-Path $app $relative
         if ([IO.File]::Exists($target)) { Move-UpdateFile $target (Join-Path $backup $relative) }
         Move-UpdateFile (Join-Path $payload $relative) $target
+        $moved++
+        if ($progress -and $moved % 32 -eq 0) { Show-UpdateProgress 'replace' (75 + [int](20 * $moved / $totalMoves)) }
     }
 } catch {
     $failed = $true
     $errors = @($_)
+    Show-UpdateProgress 'rollback' $progressPercent
     for ($i = $journal.Count - 1; $i -ge 0; $i--) {
         try {
             Move-UpdatePath $journal[$i].To $journal[$i].From
@@ -326,20 +513,33 @@ public static class BreadUpdateProcess {
 
 # Keep the backup when rollback was blocked. In every other case remove the
 # transient payload and archive. The error log stays available to the user.
-if (!$ownsInstall -or $rollbackFailed) { exit 1 }
 try {
+    if (!$ownsInstall) { exit 1 }
+    if ($rollbackFailed) {
+        Show-UpdateFailure
+        exit 1
+    }
     if (![IO.Directory]::Exists($restartDirectory)) { $restartDirectory = $app }
     if (!$failed) {
-        Start-Process -FilePath $exe -WorkingDirectory $restartDirectory
+        Show-UpdateProgress 'restart' 96
+        $newApp = Start-Process -FilePath $exe -WorkingDirectory $restartDirectory -PassThru
+        Wait-ApplicationWindow $newApp
+        Show-UpdateProgress 'clean' 99
         # Qt preserves the read-only resource permissions when it copies this script.
         Remove-UpdateDirectory $stage
         exit 0
     }
     if (!(Get-InstallProcesses | Where-Object { $_.Image -eq $exe })) {
-        Start-Process -FilePath $exe -WorkingDirectory $restartDirectory -ArgumentList @('--updatefailed', ('"{0}"' -f $log))
+        Show-UpdateProgress 'restore' 96
+        $previousApp = Start-Process -FilePath $exe -WorkingDirectory $restartDirectory -PassThru `
+            -ArgumentList @('--updatefailed', ('"{0}"' -f $log))
+        Wait-ApplicationWindow $previousApp
     }
 } catch {
-    $_ | Out-String | Add-Content -LiteralPath $log -Encoding UTF8
+    $_ | Out-String | Add-Content -LiteralPath $log -Encoding UTF8 -ErrorAction Continue
     $failed = $true
+    Show-UpdateFailure
+} finally {
+    if ($progress) { $progress.Dispose() }
 }
 if ($failed) { exit 1 }
