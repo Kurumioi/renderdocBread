@@ -1028,6 +1028,7 @@
     <ClInclude Include="Windows\AI\AIFileThumbnail.h" />
     <ClInclude Include="Windows\AI\AITextureAnnotation.h" />
     <ClInclude Include="Windows\AI\AIVisualReply.h" />
+    <ClInclude Include="Windows\AI\AIVisualFlowLayout.h" />
     <ClInclude Include="Windows\AI\AICodeFormatting.h" />
     <ClInclude Include="Windows\AI\AIAgentMonitorWindow.h" />
     <ClInclude Include="Windows\AI\AIAgentTraceStore.h" />

@@ -1211,6 +1211,9 @@
     <ClInclude Include="Windows\AI\AIVisualReply.h">
       <Filter>Windows\AI</Filter>
     </ClInclude>
+    <ClInclude Include="Windows\AI\AIVisualFlowLayout.h">
+      <Filter>Windows\AI</Filter>
+    </ClInclude>
     <ClInclude Include="Windows\AI\AICodeFormatting.h">
       <Filter>Windows\AI</Filter>
     </ClInclude>

@@ -4876,17 +4876,17 @@ Additional direction from the user (re-plan and continue from the preserved cont
 <context>
     <name>AIVisualReply</name>
     <message>
-        <location filename="../Windows/AI/AIVisualReply.cpp" line="+1102"/>
+        <location filename="../Windows/AI/AIVisualReply.cpp" line="+1375"/>
         <source>Image data is unavailable or changed.</source>
         <translation>图片数据不可用或已发生变化。</translation>
     </message>
     <message>
-        <location line="+467"/>
+        <location line="+533"/>
         <source>Geometry data is unavailable or changed.</source>
         <translation>几何数据不可用或已发生变化。</translation>
     </message>
     <message>
-        <location line="+202"/>
+        <location line="+209"/>
         <source>Visual explanation unavailable. Its saved data is missing or changed.</source>
         <translation>视觉说明不可用。保存的数据已丢失或发生变化。</translation>
     </message>
@@ -5022,7 +5022,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>拖动旋转，滚轮缩放。材质控件仅影响此示意。</translation>
     </message>
     <message>
-        <location line="+24"/>
+        <location line="+32"/>
         <source>Wheel to zoom; drag to move the image or comparison divider.</source>
         <translation>滚轮缩放；拖动移动图片或对比分割线。</translation>
     </message>
@@ -5032,7 +5032,17 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>翻转 Y 轴</translation>
     </message>
     <message>
-        <location line="-559"/>
+        <location line="+96"/>
+        <source>Drag nodes to arrange them. Select a node or wire for details. Double-click a node to navigate or a wire to add a reroute point.</source>
+        <translation>拖动节点可调整布局。单击节点或连线查看说明。双击节点跳转，双击连线添加拐点。</translation>
+    </message>
+    <message>
+        <location line="+5"/>
+        <source>Reset layout</source>
+        <translation>重置布局</translation>
+    </message>
+    <message>
+        <location line="-675"/>
         <source>Before</source>
         <translation>之前</translation>
     </message>
@@ -5042,13 +5052,13 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>之后</translation>
     </message>
     <message>
-        <location line="+572"/>
+        <location line="+587"/>
         <source>Wipe</source>
         <translation>滑动对比</translation>
     </message>
     <message>
-        <location line="-122"/>
-        <location line="+122"/>
+        <location line="-130"/>
+        <location line="+130"/>
         <source>Side by side</source>
         <translation>并排对比</translation>
     </message>
@@ -5058,14 +5068,14 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>聚焦区域</translation>
     </message>
     <message>
-        <location line="-1249"/>
-        <location line="+1320"/>
+        <location line="-1281"/>
+        <location line="+1360"/>
         <location line="+80"/>
         <source>EID %1</source>
         <translation>EID %1</translation>
     </message>
     <message>
-        <location line="-2246"/>
+        <location line="-2585"/>
         <source>Restored</source>
         <translation>已恢复</translation>
     </message>
@@ -5075,7 +5085,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>复用现有重建源码</translation>
     </message>
     <message>
-        <location line="+420"/>
+        <location line="+479"/>
         <source>No visible difference</source>
         <translation>未见可见差异</translation>
     </message>
@@ -5090,12 +5100,17 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>修改后</translation>
     </message>
     <message>
-        <location line="+381"/>
+        <location line="+607"/>
         <source>Choose display channels. A single channel is shown in grayscale.</source>
         <translation>选择显示通道。单个通道以灰度显示。</translation>
     </message>
     <message>
-        <location line="+875"/>
+        <location line="+37"/>
+        <source>Remove reroute point</source>
+        <translation>移除拐点</translation>
+    </message>
+    <message>
+        <location line="+876"/>
         <source>Code: %1</source>
         <translation>代码：%1</translation>
     </message>
@@ -5125,7 +5140,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>材质预览</translation>
     </message>
     <message>
-        <location line="+241"/>
+        <location line="+249"/>
         <source>Before / After</source>
         <translation>之前 / 之后</translation>
     </message>
@@ -5145,12 +5160,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>比较同一位置的像素。黑色表示无变化，越亮表示变化越大。</translation>
     </message>
     <message>
-        <location line="+61"/>
-        <source>Select a stage or connection for its calculation; double-click a stage to navigate.</source>
-        <translation>单击阶段或连线查看计算说明；双击阶段跳转。</translation>
-    </message>
-    <message>
-        <location line="+9"/>
+        <location line="+78"/>
         <source>Select a stage or connection to see how it is calculated.</source>
         <translation>选择阶段或连线，查看它的计算方式。</translation>
     </message>
@@ -5160,7 +5170,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>查看阶段代码</translation>
     </message>
     <message>
-        <location line="-1701"/>
+        <location line="-1981"/>
         <source>A: %1</source>
         <translation>A: %1</translation>
     </message>
